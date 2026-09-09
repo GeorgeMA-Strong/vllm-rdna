@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,10 +19,22 @@ from vllm.v1.worker.startup_plan import (
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
 
 
-def _plan_worker(config_hash="abc123", free_memory=78 * GiB_bytes, kv_bytes=None):
+def _plan_worker(
+    config_hash="abc123",
+    free_memory=78 * GiB_bytes,
+    kv_bytes=None,
+    gpu_memory_utilization=0.9,
+    max_num_seqs=4,
+    device_id=0,
+):
     """The minimal Worker surface the startup-plan entry points touch."""
     return SimpleNamespace(
-        vllm_config=SimpleNamespace(compute_hash=lambda: config_hash),
+        vllm_config=SimpleNamespace(
+            compute_hash=lambda: config_hash,
+            cache_config=SimpleNamespace(gpu_memory_utilization=gpu_memory_utilization),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        ),
+        device=SimpleNamespace(index=device_id),
         rank=0,
         parallel_config=SimpleNamespace(world_size=1),
         init_snapshot=SimpleNamespace(free_memory=free_memory),
@@ -77,3 +91,77 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"gpu_memory_utilization": 0.5}, {"max_num_seqs": 16}]
+)
+def test_startup_plan_reprofiles_when_memory_requirements_change(plan_env, overrides):
+    """A graph-cache match must not override a changed memory budget or capacity."""
+    maybe_save_startup_plan(_plan_worker(), 50 * GiB_bytes)
+    worker = _plan_worker(**overrides)
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
+
+
+def test_startup_plan_reprofiles_after_rocm_upgrade(plan_env, monkeypatch):
+    monkeypatch.setattr(startup_plan.torch.version, "hip", "7.14.0")
+    maybe_save_startup_plan(_plan_worker(), 50 * GiB_bytes)
+    monkeypatch.setattr(startup_plan.torch.version, "hip", "7.15.0")
+    worker = _plan_worker()
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
+
+
+def test_startup_plan_uses_worker_device(plan_env):
+    """The same rank can be assigned to a different local device on restart."""
+    platform = _plan_platform()
+    platform.get_device_total_memory = lambda device_id=0: (
+        (80, 32)[device_id] * GiB_bytes
+    )
+    with patch.object(startup_plan, "current_platform", platform):
+        settings = {"free_memory": 28 * GiB_bytes, "gpu_memory_utilization": 0.3}
+        maybe_save_startup_plan(_plan_worker(device_id=0, **settings), 20 * GiB_bytes)
+        worker = _plan_worker(device_id=1, **settings)
+        maybe_apply_startup_plan(worker)
+        assert worker.cache_config.kv_cache_memory_bytes is None
+
+
+@pytest.mark.parametrize("payload", [[], None, True, "broken"])
+def test_startup_plan_ignores_non_object_json(plan_env, payload):
+    maybe_save_startup_plan(_plan_worker(), 50 * GiB_bytes)
+    path = next(Path(startup_plan.envs.VLLM_CACHE_ROOT).rglob("startup_plan_*.json"))
+    path.write_text(json.dumps(payload))
+    worker = _plan_worker()
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
+
+
+@pytest.mark.parametrize(
+    "kv_bytes,baseline",
+    [
+        (True, 78 * GiB_bytes),
+        (1, True),
+        (1, -1),
+        (0, 78 * GiB_bytes),
+        (79 * GiB_bytes, 78 * GiB_bytes),
+    ],
+)
+def test_startup_plan_rejects_invalid_memory_values(plan_env, kv_bytes, baseline):
+    maybe_save_startup_plan(_plan_worker(), 50 * GiB_bytes)
+    path = next(Path(startup_plan.envs.VLLM_CACHE_ROOT).rglob("startup_plan_*.json"))
+    payload = json.loads(path.read_text())
+    payload.update(kv_cache_memory_bytes=kv_bytes, free_memory_baseline=baseline)
+    path.write_text(json.dumps(payload))
+    worker = _plan_worker()
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
+
+
+def test_startup_plan_ignores_invalid_utf8(plan_env):
+    maybe_save_startup_plan(_plan_worker(), 50 * GiB_bytes)
+    path = next(Path(startup_plan.envs.VLLM_CACHE_ROOT).rglob("startup_plan_*.json"))
+    path.write_bytes(b"\xff")
+    worker = _plan_worker()
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
