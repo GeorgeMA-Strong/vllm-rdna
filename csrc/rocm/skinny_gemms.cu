@@ -26,8 +26,8 @@
   #define __HIP__GFX9__
 #endif
 
-// Combined RDNA macro (gfx11 + gfx12) - both use 32-wide wavefronts
-#if defined(__GFX11__) || defined(__GFX12__)
+// The supported RDNA targets use 32-wide wavefronts.
+#if defined(__gfx1030__) || defined(__GFX11__) || defined(__GFX12__)
   #define __HIP__GFX1X__
 #endif
 
@@ -55,7 +55,8 @@ bool on_gfx1x() {
   static const bool result = [] {
     const auto* dprops = at::cuda::getCurrentDeviceProperties();
     const std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx11") != std::string::npos ||
+    return device_arch.find("gfx1030") != std::string::npos ||
+           device_arch.find("gfx11") != std::string::npos ||
            device_arch.find("gfx12") != std::string::npos;
   }();
   return result;
@@ -328,7 +329,7 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
       V0 += (s.x + s.y);                                             \
     }
 #elif defined(__HIP__GFX1X__)
-  // gfx1x: v_dot2_f32_f16 (VOP3-P, dot10-insts, available on gfx11+gfx12)
+  // RDNA FP16 dot products; BF16 operands retain FP32 arithmetic below.
   #define DOT2C(V0, V2, V3)                                               \
     if constexpr (std::is_same_v<scalar_t, half>) {                       \
       asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
@@ -1247,7 +1248,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   }
 
 // WVSPLITK_CFG arguments are: (THRDS, WVPRGRP, YTILE, UNRL, N).
-//   THRDS  = wavefront width (32 on GFX11/GFX12, 64 on GFX9)
+//   THRDS  = wavefront width (32 on supported RDNA targets, 64 on GFX9)
 //   WVPRGRP= waves per group (always 16)
 //   YTILE  = output rows per thread tile
 //   UNRL   = K-loop unroll factor
@@ -1278,7 +1279,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
       else                                                                  \
         WVSPLITK_CFG(/*THRDS=*/32, /*WVPRGRP=*/16, /*YTILE=*/1, /*UNRL=*/1, \
                      __N)                                                   \
-    } else if (on_gfx1x()) { /* gfx1100/gfx1150/GFX12, wave32 */            \
+    } else if (on_gfx1x()) { /* supported RDNA targets, wave32 */           \
       WVSPLIT_TILE_CFG(/*THRDS=*/32, /*WVPRGRP=*/16, _sYT, __N)             \
     } else { /* GFX9, wave64 */                                             \
       WVSPLIT_TILE_CFG(/*THRDS=*/64, /*WVPRGRP=*/16, _sYT, __N)             \

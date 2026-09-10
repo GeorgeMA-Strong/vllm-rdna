@@ -791,6 +791,140 @@ def test_fused_moe_wn16(
     torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="RDNA2 BF16 decode kernel")
+@pytest.mark.parametrize(
+    "m,topk,n,k",
+    [
+        (1, 10, 1280, 2560),
+        (2, 10, 1280, 2560),
+        (8, 10, 1280, 2560),
+        (80, 1, 2560, 640),
+        (4, 2, 130, 4096),
+        (81, 1, 128, 128),
+    ],
+)
+@pytest.mark.parametrize(
+    "has_zp,mul_weight", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_fused_moe_wna16_bf16_decode(m, topk, n, k, has_zp, mul_weight, strided):
+    """Decode preserves BF16 dequantization, EP zeros and changing graph inputs."""
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.platforms.rocm import on_gfx1030
+
+    if not on_gfx1030():
+        pytest.skip("Requires gfx1030")
+    set_random_seed(83)
+    device = DEVICE_TYPE
+    e, global_e, group_size = 4, 16, 128
+
+    def padded(t):
+        if not strided:
+            return t
+        storage = torch.empty(
+            (*t.shape[:-1], t.shape[-1] * 2), dtype=t.dtype, device=device
+        )
+        view = storage[..., ::2]
+        view.copy_(t)
+        return view
+
+    a = padded(torch.randn(m, k, device=device, dtype=torch.bfloat16))
+    q = torch.randint(0, 16, (e, n, k), device=device, dtype=torch.uint8)
+    b = padded(q[..., ::2] | (q[..., 1::2] << 4))
+    scales = padded(
+        (torch.rand(e, n, k // group_size, device=device) * 0.004 + 0.001).to(
+            torch.float16 if strided else torch.bfloat16
+        )
+    )
+    zero = torch.randint(
+        0, 16, (e, n, k // group_size), device=device, dtype=torch.uint8
+    )
+    zp = padded(zero[:, ::2] | (zero[:, 1::2] << 4)) if has_zp else None
+    dequant = (
+        (q.float() - (zero.float().repeat_interleave(group_size, -1) if has_zp else 8))
+        * scales.float().repeat_interleave(group_size, -1)
+    ).bfloat16()
+    ids = (
+        (
+            torch.arange(m, device=device)[:, None]
+            + torch.arange(topk, device=device)[None, :]
+        )
+        % global_e
+    ).int()
+    expert_map = torch.full((global_e,), -1, device=device, dtype=torch.int32)
+    expert_map[:e] = torch.arange(e, device=device, dtype=torch.int32)
+    weights = torch.rand((m, topk), device=device)
+    out = padded(
+        torch.full((m, topk, n), float("nan"), device=device, dtype=torch.bfloat16)
+    )
+    config = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "SPLIT_K": 1,
+        "num_warps": 4,
+    }
+
+    def launch():
+        order, experts, count = moe_align_block_size(ids, 16, global_e, expert_map)
+        fused_moe_module.invoke_fused_moe_wna16_triton_kernel(
+            a,
+            b,
+            out,
+            scales,
+            zp,
+            weights,
+            order,
+            experts,
+            count,
+            mul_weight,
+            topk,
+            config,
+            tl.bfloat16,
+            False,
+            True,
+            [0, group_size],
+        )
+
+    def check():
+        expected = torch.zeros((m * topk, n), device=device, dtype=torch.float32)
+        routed = expert_map[ids.flatten()]
+        for expert in range(e):
+            slots = torch.where(routed == expert)[0]
+            values = a[slots // topk].float() @ dequant[expert].float().T
+            if mul_weight:
+                values *= weights.flatten()[slots, None]
+            expected[slots] = values
+        expected = expected.reshape(m, topk, n).bfloat16()
+        torch.testing.assert_close(out, expected, atol=1e-3, rtol=8e-3)
+        assert torch.count_nonzero(out.reshape(-1, n)[routed == -1]) == 0
+
+    launch()
+    check()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    # Reuse captured storage while changing routing, inputs and routing weights.
+    for shift in (3, 11):
+        ids.add_(shift).remainder_(global_e)
+        a.mul_(0.75)
+        weights.mul_(0.5)
+        out.fill_(float("nan"))
+        graph.replay()
+        check()
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="RDNA2 BF16 decode kernel")
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+@pytest.mark.parametrize("has_zp", [False, True])
+def test_fused_moe_wn16_flash_next_decode(m, has_zp):
+    test_fused_moe_wn16(m, 640, 2560, 16, 10, 4, torch.bfloat16, 128, has_zp, 4)
+
+
 MARLIN_MOE_SCENARIOS = [
     # (m, n, k, e, topk, ep_size)
     # N>=256 required for Marlin kernel thread config for MXFP8.

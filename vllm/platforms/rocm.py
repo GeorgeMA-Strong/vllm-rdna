@@ -312,6 +312,10 @@ def on_gfx10x() -> bool:
     return _ON_GFX10X
 
 
+def on_gfx1030() -> bool:
+    return _GCN_ARCH.split(":", 1)[0] == "gfx1030"
+
+
 def on_gfx11() -> bool:
     return _ON_GFX11
 
@@ -772,7 +776,7 @@ class RocmPlatform(Platform):
             logger.info_once("Using Flash Attention backend for ViT model.")
             return AttentionBackendEnum.FLASH_ATTN
 
-        # RDNA2/RDNA3/RDNA4 (gfx10xx/gfx11xx/gfx12xx): Use Flash Attention Triton backend
+        # RDNA2/RDNA3/RDNA4 use the Flash Attention Triton backend.
         if (
             (on_gfx1x() or on_gfx10x())
             and flash_attn_triton_available()

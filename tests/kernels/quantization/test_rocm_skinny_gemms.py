@@ -69,6 +69,11 @@ NKM_FACTORS_LLMM1 = [
 ]
 
 NKM_FACTORS_WVSPLITK = [
+    # Flash-Next hyperconnection and attention projections on four V620s.
+    (2, 10240, 336),
+    (4, 10240, 320),
+    (2, 2560, 4096),
+    (2, 320, 10240),
     # Different batch sizes with key dimensions
     (1, 32, 16),
     (1, 64, 64),
@@ -274,6 +279,50 @@ def test_rocm_wvsplitk_kernel(
     # Accumulation error in fp16 GEMM scales with sqrt(K)
     atol = torch.finfo(dtype).eps * math.sqrt(k)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm dispatch")
+@pytest.mark.parametrize(
+    "gfx1030,dtype,tokens,strided_weight,expected_skinny",
+    [
+        (True, torch.bfloat16, 2, False, True),
+        (True, torch.bfloat16, 4, False, True),
+        (True, torch.bfloat16, 8, False, False),
+        (True, torch.bfloat16, 2, True, False),
+        (True, torch.float16, 2, False, False),
+        (False, torch.bfloat16, 2, False, False),
+    ],
+)
+def test_gfx1030_bf16_decode_dispatch(
+    monkeypatch, gfx1030, dtype, tokens, strided_weight, expected_skinny
+):
+    """Use the port only for supported BF16 decode operands on gfx1030."""
+    from vllm.model_executor.layers import utils
+    from vllm.platforms import rocm
+
+    for name in ("on_gfx9", "on_gfx1x", "on_gfx950", "on_gfx1250"):
+        monkeypatch.setattr(rocm, name, lambda: False)
+    monkeypatch.setattr(rocm, "on_gfx1030", lambda: gfx1030, raising=False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr(utils, "num_compute_units", lambda: 72)
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.rocm_aiter_ops, "is_tgemm_enabled", lambda: False)
+    calls = []
+
+    def skinny(weight, x, cu_count, bias):
+        calls.append((tuple(x.shape), cu_count))
+        return torch.nn.functional.linear(x, weight, bias)
+
+    monkeypatch.setattr(utils.ops, "wvSplitK", skinny)
+    x = torch.randn(tokens, 32, dtype=dtype)
+    weight = torch.randn(64, 32, dtype=dtype)
+    if strided_weight:
+        weight = weight.T.contiguous().T
+    bias = torch.randn(64, dtype=dtype)
+    expected = torch.nn.functional.linear(x, weight, bias)
+    actual = utils.rocm_unquantized_gemm_impl(x, weight, bias)
+    torch.testing.assert_close(actual, expected)
+    assert bool(calls) is expected_skinny
 
 
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK_FP8)

@@ -40,6 +40,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx1030
+
+    _USE_RDNA2_BF16_GEMV = on_gfx1030()
+else:
+    _USE_RDNA2_BF16_GEMV = False
+
 
 @triton.jit
 def write_zeros_to_output(
@@ -293,6 +300,108 @@ def fused_moe_kernel_gptq_awq(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.jit
+def fused_moe_kernel_w4a16_bf16_decode(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    scale_ptr,
+    zp_ptr,
+    routed_weight_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    num_valid_tokens: tl.constexpr,
+    top_k: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_be: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sn: tl.constexpr,
+    stride_sk: tl.constexpr,
+    stride_ze: tl.constexpr,
+    stride_zn: tl.constexpr,
+    stride_zk: tl.constexpr,
+    group_size: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    has_zp: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+):
+    """Reuse dequantized weights across the valid rows of a sparse decode block."""
+    block_start = tl.program_id(0) * BLOCK_SIZE_M
+    if block_start >= tl.load(num_tokens_post_padded_ptr):
+        return
+    expert = tl.load(expert_ids_ptr + tl.program_id(0)).to(tl.int64)
+    ns = tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    ks = tl.arange(0, BLOCK_SIZE_K)
+    weight_mask = (ns[:, None] < N) & (ks[None, :] < K)
+    if expert >= 0:
+        packed = tl.load(
+            b_ptr
+            + expert * stride_be
+            + ns[:, None] * stride_bn
+            + (ks[None, :] // 2) * stride_bk,
+            weight_mask,
+            other=0,
+        )
+        quant = ((packed >> ((ks[None, :] % 2) * 4)) & 15).to(tl.float32)
+        scale = tl.load(
+            scale_ptr
+            + expert * stride_se
+            + ns[:, None] * stride_sn
+            + (ks[None, :] // group_size) * stride_sk,
+            weight_mask,
+            other=0,
+        ).to(tl.float32)
+        if has_zp:
+            packed_zp = tl.load(
+                zp_ptr
+                + expert * stride_ze
+                + (ns[:, None] // 2) * stride_zn
+                + (ks[None, :] // group_size) * stride_zk,
+                weight_mask,
+                other=0,
+            )
+            zero = ((packed_zp >> ((ns[:, None] % 2) * 4)) & 15).to(tl.float32)
+        else:
+            zero = 8.0
+        # Match WNA16's BF16 dequantization before FP32 accumulation.
+        weight = ((quant - zero) * scale).to(tl.bfloat16).to(tl.float32)
+    else:
+        weight = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K), 0, tl.float32)
+
+    slot = 0
+    token = tl.load(sorted_token_ids_ptr + block_start)
+    # moe_align_block_size places padding after each expert's valid rows.
+    while slot < BLOCK_SIZE_M and token < num_valid_tokens:
+        if expert >= 0:
+            activation = tl.load(
+                a_ptr + (token // top_k) * stride_am + ks * stride_ak,
+                ks < K,
+                other=0,
+            ).to(tl.float32)
+            accumulator = tl.sum(weight * activation[None, :], axis=1)
+            if MUL_ROUTED_WEIGHT:
+                accumulator *= tl.load(routed_weight_ptr + token).to(tl.float32)
+        else:
+            accumulator = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+        tl.store(c_ptr + token * stride_cm + ns * stride_cn, accumulator, ns < N)
+        slot += 1
+        token = tl.load(
+            sorted_token_ids_ptr + block_start + slot,
+            slot < BLOCK_SIZE_M,
+            other=num_valid_tokens,
+        )
 
 
 @triton.jit
@@ -694,6 +803,54 @@ def invoke_fused_moe_wna16_triton_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
+
+    if (
+        _USE_RDNA2_BF16_GEMV
+        and use_int4_w4a16
+        and not use_int8_w8a16
+        and A.dtype == C.dtype == torch.bfloat16
+        and B.dtype == torch.uint8
+        and compute_type == tl.bfloat16
+        and 0 < num_tokens <= 80
+        and block_shape[1] == 128
+        and 0 < A.size(1) <= 4096
+        and A.size(1) % 128 == 0
+    ):
+        block_n = 8 if A.size(1) <= 1024 else 4
+        block_m = config["BLOCK_SIZE_M"]
+        decode_grid = (
+            triton.cdiv(sorted_token_ids.numel(), block_m),
+            triton.cdiv(B.size(1), block_n),
+        )
+        fused_moe_kernel_w4a16_bf16_decode[decode_grid](
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.size(1),
+            A.size(1),
+            num_tokens,
+            top_k,
+            *A.stride(),
+            *B.stride(),
+            C.stride(1),
+            C.stride(2),
+            *B_scale.stride(),
+            *(B_zp.stride() if B_zp is not None else (0, 0, 0)),
+            block_shape[1],
+            block_m,
+            block_n,
+            triton.next_power_of_2(A.size(1)),
+            B_zp is not None,
+            mul_routed_weight,
+            num_warps=4,
+        )
+        return
 
     EM = sorted_token_ids.size(0)
     if A.size(0) < config["BLOCK_SIZE_M"]:
