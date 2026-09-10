@@ -9,12 +9,12 @@ This document records development state, not a validated serving recipe.
 
 Text, basic vision and one-token MTP serve on all four GPUs with the original
 BF16 PLE table in RAM and decode-only full graphs. The latest matched short
-benchmark measures **24.83 output tokens/s**, about **41.1 tokens/s after the
-first token**, with 1.044-second mean TTFT. Uncached 1,024-token requests
-measure **253.41 prompt tokens/s**. Twenty-four elementary text checks pass
+benchmark measures **26.12 output tokens/s**, about **41.4 tokens/s after the
+first token**, with 0.928-second mean TTFT. Uncached 1,024-token requests
+measure **337.66 prompt tokens/s**. Twenty-four elementary text checks pass
 at concurrency one/two/four, as do two synthetic vision checks. Six fixed
-greedy responses match the previous version's text, with different token
-probabilities. The user's 60–90 tokens/s target, broad model quality and
+greedy responses and their returned token probabilities exactly match the
+previous version. The user's 60–90 tokens/s target, broad model quality and
 actual native-context generation remain unverified. Large-context tests
 remain deferred at the user's direction.
 
@@ -386,13 +386,15 @@ establish broad model quality or a guaranteed production throughput.
 | BF16 skinny GEMM, graphs, MTP one | 16.48 | 1.076 s | 44.54 ms | 50.00% |
 | BF16 expert GEMV plus skinny GEMM | 21.59 | 1.037 s | 30.58 ms | 53.01% |
 | Small-output BF16 gate dispatch | 24.83 | 1.044 s | 24.34 ms | 53.01% |
+| Four-warp TP4 QSA prefill | 26.12 | 0.928 s | 24.17 ms | 53.01% |
 
-The last row corresponds to about 41.1 tokens/s after the first token and
-36.94 ms mean inter-response interval; MTP can return multiple tokens together.
+The last row corresponds to about 41.4 tokens/s after the first token and
+36.69 ms mean inter-response interval; MTP can return multiple tokens together.
 All 24 elementary text checks at concurrency one/two/four and both synthetic
-vision checks pass. Six fixed greedy responses match the preceding version's
-text, but token log probabilities differ by up to 0.1245. No broad evaluation
-against the BF16 checkpoint has run on this host.
+vision checks pass. Six fixed greedy responses and their returned token log
+probabilities exactly match the preceding scalar-gate version. Earlier expert
+kernel changes altered log probabilities by up to 0.1245 on these prompts.
+No broad evaluation against the BF16 checkpoint has run on this host.
 
 The narrow gfx1030 skinny GEMM port keeps BF16 operands and FP32 accumulation.
 It passed 132 isolated reference comparisons across four GPUs and 138 native
@@ -413,8 +415,20 @@ and two synthetic vision checks pass; six greedy responses retain exactly
 the previous version's text. This change retains BF16 and leaves other GPU
 architectures' dispatch unchanged.
 
+Raw tracing of four decode steps and one 1,024-token prefill identified severe
+register spilling in the NVIDIA-tuned QSA launch profile. Increasing two warps
+to four while preserving the tile, splits and BF16 arithmetic improves the
+isolated 1,024-row kernel from 86.63 to 13.43 ms at 1,024 cached tokens, and
+88.23 to 14.02 ms at 16,384 cached tokens. Outputs in both probes are identical.
+The change is gated to exact gfx1030, six query heads per KV head and head
+dimension 256. All seven sparse-attention reference cases pass before/after,
+including the added 1,024- and 2,048-row cases; scoped hooks and mypy 3.12 pass.
+The 16:33:06 UTC serving restart again verified all previous PIDs gone and
+16 MB/card before loading. It passes the complete short serving checks above.
+
 Uncached 1,024-token prompts with one output token and unique cache salts
-measure 253.41 prompt tokens/s across three warmed requests. This remains
+now measure 337.66 prompt tokens/s across three warmed requests, up from
+253.41 before the QSA launch change (about 33% faster). This remains
 well below an optimized prefill target. Actual PyNccl/RCCL reductions measure
 about 73–79 microseconds for small BF16 tensors on this topology. Exact dyadic
 results and changing graph inputs pass on all four ranks. Explicit Tree/LL

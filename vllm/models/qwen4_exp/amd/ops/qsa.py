@@ -15,6 +15,13 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx1030
+
+    _IS_GFX1030 = on_gfx1030()
+else:
+    _IS_GFX1030 = False
+
 
 @triton.jit
 def _qsa_mqa_paged_kernel(
@@ -881,6 +888,9 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+    if _IS_GFX1030 and group_size == 6 and head_dim == 256 and partial_warps == 2:
+        # Four warps avoid severe register spilling in the TP4 prefill tile.
+        partial_warps = 4
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
