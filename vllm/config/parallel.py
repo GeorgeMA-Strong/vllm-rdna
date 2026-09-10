@@ -344,6 +344,9 @@ class ParallelConfig:
     Set to be private as it's not intended to be configured by users.
     """
 
+    _ple_offload_ipc_path: str = ""
+    """Node-local IPC address for the shared ROCm PLE CPU worker."""
+
     _coord_store_port: int = 0
     """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
@@ -842,6 +845,7 @@ class ParallelConfig:
             "worker_cls",
             "sd_worker_cls",
             "worker_extension_cls",
+            "_ple_offload_ipc_path",
             "_api_process_count",
             "_api_process_rank",
             # NUMA binding is per-rank host-side memory locality; it does

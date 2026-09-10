@@ -9,6 +9,7 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -104,7 +105,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if not is_flash_attn_varlen_func_available():
+        # ROCm QSA uses its own Triton kernels; the FlashAttention base classes
+        # supply metadata only. gfx1030 does not have a FlashAttention build.
+        if not is_flash_attn_varlen_func_available() and not current_platform.is_rocm():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(
@@ -113,6 +116,29 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if self.kv_cache_dtype not in ("auto", "bfloat16"):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
         self.supports_quant_query_input = False
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+        # The native ROCm cache writer does not require FlashAttention imports.
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        ops.reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
 
     def forward_qsa(
         self,

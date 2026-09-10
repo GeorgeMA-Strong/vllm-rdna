@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, call, patch
@@ -10,9 +11,24 @@ import pytest
 from vllm.model_executor.warmup.kernel_warmup import (
     _flashinfer_autotune_token_counts,
     _run_flashinfer_autotune_dummy_runs,
+    _warmup_bf16x3_router_gemm,
+    _warmup_ll_bf16_router_gemm,
 )
+from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_router_warmup_needs_no_nvidia_dependencies_on_other_platforms(monkeypatch):
+    """ROCm device capability numbers must not trigger NVIDIA-only imports."""
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    for module in (
+        "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16",
+        "vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl",
+    ):
+        monkeypatch.setitem(sys.modules, module, None)
+    _warmup_ll_bf16_router_gemm(Mock())
+    _warmup_bf16x3_router_gemm(Mock(), 128)
 
 
 class _FakeMoERunner:

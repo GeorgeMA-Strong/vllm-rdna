@@ -79,6 +79,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.block_table import get_block_table_width
@@ -183,8 +184,13 @@ logger = init_logger(__name__)
 
 # --- DEBUG: per-step phase timing (gated by DBG_VLLM_STEP_TIMING=1) ---
 _DBG_STEP_TIMING = os.environ.get("DBG_VLLM_STEP_TIMING") == "1"
-_dbg_phase_ns = {}
-print(f"[DIAG_GMR_SUB] gpu/model_runner.py imported: _DBG_STEP_TIMING={_DBG_STEP_TIMING}, DBG_VLLM_STEP_TIMING env={os.environ.get('DBG_VLLM_STEP_TIMING')!r}", flush=True)
+_dbg_phase_ns: dict[str, float] = {}
+print(
+    f"[DIAG_GMR_SUB] gpu/model_runner.py imported: "
+    f"_DBG_STEP_TIMING={_DBG_STEP_TIMING}, "
+    f"DBG_VLLM_STEP_TIMING env={os.environ.get('DBG_VLLM_STEP_TIMING')!r}",
+    flush=True,
+)
 
 
 class _DbgPhase:
@@ -208,9 +214,7 @@ class _DbgPhase:
 def _dbg_flush_step(rank: int, step: int) -> None:
     if not _DBG_STEP_TIMING or not _dbg_phase_ns:
         return
-    parts = " ".join(
-        f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items()
-    )
+    parts = " ".join(f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items())
     print(f"[STEP_TIMING rank={rank} step={step}] {parts}", flush=True)
     _dbg_phase_ns.clear()
 
@@ -387,6 +391,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._ple_offload_connector: PleOffloadConnector | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -417,6 +422,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # on the last PP rank.
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
+
+    def _setup_ple_offload(self, ipc_addr: str) -> None:
+        """Initialize PLE offload after the model state is available."""
+        # PLE placeholders are created by model loading, so CUDA output
+        # registration cannot happen in the runner constructor.
+        query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
+        ngram_context_source = getattr(self.model_state, "ngram_context", None)
+        if not isinstance(query_start_loc_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires a query_start_loc source")
+        if not isinstance(ngram_context_source, torch.Tensor):
+            raise RuntimeError("PLE offload requires an ngram_context source")
+        self._ple_offload_connector = PleOffloadConnector(
+            self.vllm_config,
+            self.model,
+            self.device,
+            ipc_addr,
+            input_ids_source=self.input_buffers.input_ids,
+            query_start_loc_source=query_start_loc_source,
+            ngram_context_source=ngram_context_source,
+        )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
@@ -991,6 +1016,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             return 0
 
+        if self._ple_offload_connector is not None and capture_decoder:
+            self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
+
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
@@ -1033,6 +1061,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.adaptive_verification.set_initial_cost_curves(timings)
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+
+        if self._ple_offload_connector is not None and capture_decoder:
+            self._ple_offload_connector.release_outputs()
 
         if not profile_only:
             # Lock workspace to prevent resizing during execution. A resize after
@@ -1849,6 +1880,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.forward_start()
         _dbg_forward_t0 = time.perf_counter_ns() if _DBG_STEP_TIMING else 0.0
 
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.prepare_forward(
+                input_batch.num_reqs,
+                input_batch.num_tokens_after_padding,
+                dummy_run,
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1896,6 +1934,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2182,6 +2223,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.close()
+            self._ple_offload_connector = None
         self.cudagraph_manager = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()

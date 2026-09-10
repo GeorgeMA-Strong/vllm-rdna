@@ -8,11 +8,13 @@ from typing import Any
 import pytest
 import torch
 
+from vllm.model_executor.layers import ple_offload_layer as offload_layer_module
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.models.qwen4_exp.amd import (
     model as _qwen4_exp_model,  # noqa: F401
 )
 from vllm.models.qwen4_exp.amd import ple_layer as ple_layer_module
+from vllm.models.qwen4_exp.amd import qsa as qsa_module
 from vllm.models.qwen4_exp.amd.indexer_qsa import (
     apply_qsa_rmsnorm,
     apply_qsa_rope,
@@ -20,6 +22,7 @@ from vllm.models.qwen4_exp.amd.indexer_qsa import (
 from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.ple_offload import hip_driver
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_rocm(),
@@ -30,6 +33,69 @@ requires_qsa_kernels = pytest.mark.skipif(
     not HAS_TRITON,
     reason="AMD QSA kernels require Triton",
 )
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16"])
+@pytest.mark.parametrize("head_size", [128, 256])
+def test_rocm_qsa_updates_cache_without_flash_attention(
+    monkeypatch, num_kv_heads, kv_cache_dtype, head_size
+):
+    """Padded QSA writes must preserve cache values without FlashAttention."""
+    monkeypatch.setattr(
+        qsa_module, "is_flash_attn_varlen_func_available", lambda: False
+    )
+    impl = qsa_module.Qwen4ExpQSAFlashAttentionImpl(
+        num_heads=4,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+    # QKV projections produce strided inputs; slots omit trailing graph padding.
+    projection = torch.randn(
+        8, 3, num_kv_heads, head_size, device="cuda", dtype=torch.bfloat16
+    )
+    key, value = projection[:, 1], projection[:, 2]
+    cache = torch.randn(
+        3, num_kv_heads, 16, 2 * head_size, device="cuda", dtype=torch.bfloat16
+    )
+    expected = cache.clone()
+    slots = [33, -1, 0, 18, 15]
+    for row, slot in enumerate(slots):
+        if slot >= 0:
+            expected[slot // 16, :, slot % 16, :head_size] = key[row]
+            expected[slot // 16, :, slot % 16, head_size:] = value[row]
+    scale = torch.ones((), device="cuda")
+    layer = SimpleNamespace(_k_scale=scale, _v_scale=scale)
+    impl.do_kv_cache_update(
+        layer, key, value, cache, torch.tensor(slots, device="cuda")
+    )
+    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+def test_ple_hip_registration_is_visible_to_pytorch():
+    """HIP host registration and PyTorch copies must use the same runtime."""
+    for device in range(torch.accelerator.device_count()):
+        with torch.accelerator.device_index(device):
+            host = torch.arange(5, dtype=torch.int32).share_memory_()
+            result = hip_driver.cuMemHostRegister(
+                host.data_ptr(),
+                host.numel() * host.element_size(),
+                hip_driver.CU_MEMHOSTREGISTER_PORTABLE,
+            )
+            assert result.value == 0
+            try:
+                assert host.is_pinned()
+                gpu = torch.empty_like(host, device=f"cuda:{device}")
+                gpu.copy_(host, non_blocking=True)
+                host.copy_(gpu + 1, non_blocking=True)
+                torch.accelerator.synchronize()
+                torch.testing.assert_close(host, torch.arange(1, 6, dtype=torch.int32))
+            finally:
+                assert hip_driver.cuMemHostUnregister(host.data_ptr()).value == 0
 
 
 def test_ple_ngram_embedding_custom_op_uses_resident_weight(
@@ -53,6 +119,67 @@ def test_ple_ngram_embedding_custom_op_uses_resident_weight(
 
     expected = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.parametrize("padding", [0, 3])
+def test_cpu_ple_batched_hashing_matches_scalar_reference(monkeypatch, padding):
+    """EOS, request boundaries and graph padding must select the correct rows."""
+    monkeypatch.setattr(offload_layer_module, "_offload_worker_flag", True)
+    monkeypatch.setattr(offload_layer_module.envs, "VLLM_PLE_QUANT_DIR", "")
+    monkeypatch.setattr(offload_layer_module.envs, "VLLM_PLE_DISK_OFFLOAD_DIR", "")
+
+    def embedding(rows, width, **kwargs):
+        result = torch.nn.Embedding(rows, width)
+        result.params_dtype = result.weight.dtype
+        return result
+
+    monkeypatch.setattr(ple_layer_module, "PLEVocabParallelEmbedding", embedding)
+    config = SimpleNamespace(
+        ngram_size=4,
+        heads_per_ngram=1,
+        eos_token_id=2,
+        vocab_size=128,
+        split_ngram_parts=1,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=8,
+    )
+    layer = ple_layer_module.Qwen4ExpNGramEmbedding(config, 6, 0, 16, 4, "test", "test")
+    requests = [[3, 4, 2, 5], [9, 10]]
+    contexts = [[2, 2, 7], [1, 2, 8]]
+    expected = []
+    for tokens, context in zip(requests, contexts):
+        history = context + tokens
+        for pos in range(3, len(history)):
+            last_eos = max((i for i in range(pos) if history[i] == 2), default=-1)
+            rows = []
+            for head, ngram in enumerate(range(2, 5)):
+                mixed = 0
+                for shift in range(ngram):
+                    index = pos - shift
+                    token = history[index] if index > last_eos else 2
+                    mixed ^= (token * int(layer.layer_multipliers[shift])) % (1 << 64)
+                if mixed >= 1 << 63:
+                    mixed -= 1 << 64
+                row = mixed % int(layer.ngram_heads_vocab_sizes[head])
+                row += int(layer.ngram_heads_offsets[head])
+                rows.append(layer.ngram_embedding.weight[row])
+            expected.append(torch.cat(rows))
+
+    actual = layer.forward_impl(
+        torch.empty(0),
+        torch.tensor(sum(requests, []) + [127] * padding),
+        torch.tensor([0, 4, 6]),
+        torch.tensor(contexts),
+    )
+    torch.testing.assert_close(actual[:6], torch.stack(expected), rtol=0, atol=0)
+    # Chunking must carry only the last n-1 original token IDs as context.
+    second_chunk = layer.forward_impl(
+        torch.empty(0),
+        torch.tensor(requests[0][2:]),
+        torch.tensor([0, 2]),
+        torch.tensor([(contexts[0] + requests[0][:2])[-3:]]),
+    )
+    torch.testing.assert_close(second_chunk, actual[2:4], rtol=0, atol=0)
 
 
 def _qsa_sparse_paged_attention_reference(

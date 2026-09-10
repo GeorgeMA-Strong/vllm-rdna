@@ -5,13 +5,22 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
-import numpy as np
 import os
+
+import numpy as np
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+
+def _promote_bf16_math(x: torch.Tensor) -> bool:
+    if current_platform.is_rocm() and x.dtype == torch.bfloat16:
+        from vllm.platforms.rocm import on_gfx10x
+
+        return on_gfx10x()
+    return False
 
 
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
@@ -60,6 +69,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PROMOTE_BF16: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     conv_states_ptr = initial_states_ptr
@@ -453,7 +463,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
                     matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
-            acc += matrix_x * matrix_w  # [BLOCK_N]
+            if PROMOTE_BF16:
+                # RDNA2 cannot execute the compiler's packed BF16 dot product.
+                acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)
+            else:
+                acc += matrix_x * matrix_w  # [BLOCK_N]
 
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
@@ -739,22 +753,56 @@ def causal_conv1d_fn(
         and hasattr(torch.ops._rocm_C, "causal_conv1d_fwd_rdna2")
     ):
         import os as _os
-        if _os.environ.get("VLLM_CONV1D_DEBUG") == "1" and not getattr(causal_conv1d_fn, "_logged", False):
-            print(f"[CONV1D-DEBUG] x.shape={tuple(x.shape)} x.stride={x.stride()}", flush=True)
-            print(f"[CONV1D-DEBUG] weight.shape={tuple(weight.shape)} weight.stride={weight.stride()}", flush=True)
-            print(f"[CONV1D-DEBUG] conv_states.shape={tuple(conv_states.shape)} conv_states.stride={conv_states.stride()}", flush=True)
-            print(f"[CONV1D-DEBUG] out.shape={tuple(out.shape)} out.stride={out.stride()}", flush=True)
-            print(f"[CONV1D-DEBUG] query_start_loc={query_start_loc.tolist()}", flush=True)
-            print(f"[CONV1D-DEBUG] cache_indices={cache_indices.tolist()[:8]}...{cache_indices.tolist()[-4:]}", flush=True)
-            print(f"[CONV1D-DEBUG] bias={'None' if bias is None else tuple(bias.shape)}", flush=True)
-            print(f"[CONV1D-DEBUG] has_initial_state={'None' if has_initial_state is None else has_initial_state.tolist()[:8]}", flush=True)
-            print(f"[CONV1D-DEBUG] x.data_ptr={x.data_ptr()} conv_states.data_ptr={conv_states.data_ptr()}", flush=True)
-            print(f"[CONV1D-DEBUG] x.is_contiguous()={x.is_contiguous()} conv_states.is_contiguous()={conv_states.is_contiguous()}", flush=True)
-            causal_conv1d_fn._logged = True
+
+        if _os.environ.get("VLLM_CONV1D_DEBUG") == "1" and not getattr(
+            causal_conv1d_fn, "_logged", False
+        ):
+            print(
+                f"[CONV1D-DEBUG] x.shape={tuple(x.shape)} x.stride={x.stride()}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] weight.shape={tuple(weight.shape)} weight.stride={weight.stride()}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] conv_states.shape={tuple(conv_states.shape)} conv_states.stride={conv_states.stride()}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] out.shape={tuple(out.shape)} out.stride={out.stride()}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] query_start_loc={query_start_loc.tolist()}", flush=True
+            )
+            print(
+                f"[CONV1D-DEBUG] cache_indices={cache_indices.tolist()[:8]}...{cache_indices.tolist()[-4:]}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] bias={'None' if bias is None else tuple(bias.shape)}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] has_initial_state={'None' if has_initial_state is None else has_initial_state.tolist()[:8]}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] x.data_ptr={x.data_ptr()} conv_states.data_ptr={conv_states.data_ptr()}",
+                flush=True,
+            )
+            print(
+                f"[CONV1D-DEBUG] x.is_contiguous()={x.is_contiguous()} conv_states.is_contiguous()={conv_states.is_contiguous()}",
+                flush=True,
+            )
+            causal_conv1d_fn._logged = True  # type: ignore[attr-defined]
         torch.ops._rocm_C.causal_conv1d_fwd_rdna2(
             x,
             weight,
-            bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+            bias
+            if bias is not None
+            else torch.empty(0, device=x.device, dtype=x.dtype),
             conv_states,
             query_start_loc,
             cache_indices,
@@ -811,6 +859,7 @@ def causal_conv1d_fn(
         BLOCK_M=BLOCK_M,
         BLOCK_N=256,
         num_stages=2,
+        PROMOTE_BF16=_promote_bf16_math(x),
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out.to(original_x_dtype)
@@ -860,6 +909,7 @@ def _causal_conv1d_update_kernel(
     NP2_STATELEN: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PROMOTE_BF16: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     if launch_pdl:
@@ -1115,7 +1165,10 @@ def _causal_conv1d_update_kernel(
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
                     matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
-            acc += matrix_x * matrix_w  # [BLOCK_N]
+            if PROMOTE_BF16:
+                acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)
+            else:
+                acc += matrix_x * matrix_w  # [BLOCK_N]
 
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
@@ -1329,6 +1382,7 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
+        PROMOTE_BF16=_promote_bf16_math(x),
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
 
@@ -1363,7 +1417,9 @@ def causal_conv1d_update(
             x.contiguous() if not x.is_contiguous() else x,
             conv_state,
             weight,
-            bias if bias is not None else torch.empty(0, device=x.device, dtype=x.dtype),
+            bias
+            if bias is not None
+            else torch.empty(0, device=x.device, dtype=x.dtype),
             out,
             conv_state_indices,
             activation in ("silu", "swish"),

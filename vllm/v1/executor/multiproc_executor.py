@@ -670,6 +670,13 @@ class WorkerProc:
 
         # Load model
         self.worker.init_device()
+        ple_cpu_worker = (
+            current_platform.is_rocm()
+            and vllm_config.engram_config is not None
+            and vllm_config.engram_config.cpu_offload
+        )
+        if ple_cpu_worker:
+            self.worker.spawn_ple_offload()
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -678,6 +685,8 @@ class WorkerProc:
             self.worker.elastic_ep_execute("load_model")
         else:
             self.worker.load_model()
+        if ple_cpu_worker:
+            self.worker.wait_ple_offload_ready()
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling

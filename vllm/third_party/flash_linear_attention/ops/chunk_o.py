@@ -10,8 +10,11 @@
 # ruff: noqa: E501
 
 
+from typing import Any
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
@@ -20,6 +23,29 @@ from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+
+def _prune_rdna2_bf16_configs(
+    configs: list[triton.Config], named_args: dict[str, Any], **kwargs: Any
+) -> list[triton.Config]:
+    args = {**named_args, **kwargs}
+    if (
+        current_platform.is_rocm()
+        and args["k"].dtype == torch.bfloat16
+        and (args["K"], args["V"], args["BT"]) == (128, 128, 64)
+    ):
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x():
+            # Avoid pathological LLVM compilation in RDNA2 BF16 candidates.
+            return [
+                c
+                for c in configs
+                if c.kwargs == {"BK": 64, "BV": 64}
+                and c.num_warps == 8
+                and c.num_stages == 2
+            ]
+    return configs
 
 
 @triton.heuristics(
@@ -37,6 +63,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
     key=["H", "K", "V", "BT"],
+    prune_configs_by={"early_config_prune": _prune_rdna2_bf16_configs},
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(

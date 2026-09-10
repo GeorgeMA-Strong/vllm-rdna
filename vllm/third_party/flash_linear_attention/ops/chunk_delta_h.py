@@ -8,8 +8,11 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+from typing import Any
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
@@ -19,6 +22,24 @@ from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
+
+
+def _prune_rdna2_bf16_configs(
+    configs: list[triton.Config], named_args: dict[str, Any], **kwargs: Any
+) -> list[triton.Config]:
+    args = {**named_args, **kwargs}
+    if (
+        current_platform.is_rocm()
+        and args["k"].dtype == torch.bfloat16
+        and (args["K"], args["V"], args["BT"]) == (128, 128, 64)
+    ):
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x():
+            # The generic candidates compile slowly for RDNA2 BF16 with FP32
+            # state. This reference-checked configuration compiles faster.
+            return [triton.Config({"BV": 32}, num_warps=8, num_stages=2)]
+    return configs
 
 
 @triton.heuristics(
@@ -40,6 +61,7 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
     ],
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
+    prune_configs_by={"early_config_prune": _prune_rdna2_bf16_configs},
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(

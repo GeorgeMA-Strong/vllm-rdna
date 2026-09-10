@@ -31,7 +31,7 @@ class EngramConfig:
     """Configuration for Engram embedding storage and sharding."""
 
     cpu_offload: bool = Field(default_factory=_default_cpu_offload)
-    """Store embedding weights in pinned CPU memory for UVA lookup.
+    """Store embedding weights in CPU memory (UVA on CUDA, CPU worker on ROCm).
     Defaults to False, or VLLM_PLE_CPU_OFFLOAD when set for compatibility.
     An explicit value takes precedence over the legacy environment variable."""
 
@@ -50,17 +50,23 @@ class EngramConfig:
         if (
             model_config is None
             or model_config.architecture not in supported_architectures
-            or not current_platform.is_cuda()
+            or not current_platform.is_cuda_alike()
             or not getattr(model_config.hf_text_config, "ple_layer_ids", None)
         ):
             raise ValueError(
                 "EngramConfig requires a model with supported Engram "
-                "embeddings. Currently only the CUDA Qwen4Exp implementation "
+                "embeddings. Currently only the CUDA/ROCm Qwen4Exp implementation "
                 "with non-empty ple_layer_ids is supported."
             )
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm() and self.embedding_across_dp:
+            raise ValueError(
+                "ROCm PLE offload uses a shared CPU table, not ETP sharding"
+            )
         if (
             self.embedding_across_dp
             and parallel_config.data_parallel_size > 1

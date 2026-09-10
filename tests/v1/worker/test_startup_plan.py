@@ -165,5 +165,3 @@ def test_startup_plan_ignores_invalid_utf8(plan_env):
     worker = _plan_worker()
     maybe_apply_startup_plan(worker)
     assert worker.cache_config.kv_cache_memory_bytes is None
-
-

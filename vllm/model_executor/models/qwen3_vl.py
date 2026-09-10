@@ -260,6 +260,18 @@ if HAS_TRITON:
         Returns a tensor of shape ``(t * h * w, hidden_dim)`` with the
         bilinearly-interpolated position embeddings in spatial-merge order.
         """
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm() and embed_weight.dtype == torch.bfloat16:
+            from vllm.platforms.rocm import on_gfx10x
+
+            if on_gfx10x():
+                # Triton lowers BF16 products to an unsupported fdot2.bf16
+                # instruction on RDNA2, even with FP fusion disabled.
+                return pos_embed_interpolate_native(
+                    embed_weight, t, h, w, num_grid_per_side, m_size, dtype
+                )
+
         assert h % m_size == 0 and w % m_size == 0, (
             f"h={h} and w={w} must be divisible by m_size={m_size}"
         )

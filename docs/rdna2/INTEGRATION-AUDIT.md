@@ -178,8 +178,11 @@ relative). This is a publisher result, not our evaluation or a general quality
 guarantee. Its configuration uses 4-bit symmetric groups of 128,
 `quant_method=auto-round`, `packing_format=auto_round:auto_gptq`, with
 16-bit exclusions for vision, MTP and PLE. MTP is declared in `text_config`.
-We have not inspected the weight tensors or proved that every required tensor
-is present. Absence of a separately named MTP file does not imply missing MTP.
+The September 10 download validation inspected every safetensor header and
+verified its index mapping, dtype/shape byte size, offsets and complete file
+size. BF16 MTP tensors are present in `model_extra_tensors.safetensors`.
+Full inference and MTP correctness remain unverified; current hardware
+evidence is recorded in [the server status](V620-SERVER-STATUS.md).
 
 The target already maps AutoRound through `INCConfig`, with GPTQ-compatible
 schemes. Preserve this metadata and validate expert zero-point/layout handling.

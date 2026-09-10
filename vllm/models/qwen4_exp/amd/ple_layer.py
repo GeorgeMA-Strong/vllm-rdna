@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GPU-resident Qwen4Exp position-learning enhancement layers."""
+"""Qwen4Exp PLE layers with optional CPU n-gram lookup."""
 
 import math
 from collections.abc import Iterable, Sequence
@@ -17,6 +17,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
+)
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+    is_ple_cpu_offload_enabled,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.qwen4_exp import (
@@ -66,7 +71,13 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+    positions_buffer: torch.Tensor
+    padded_buffer: torch.Tensor
+    ngram_heads_vocab_sizes: torch.Tensor
+    ngram_heads_offsets: torch.Tensor
+    layer_multipliers: torch.Tensor
+
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
     _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -230,6 +241,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
         )
+        self._max_total_tokens = int(max_total_tokens)
+        self._max_num_reqs = int(max_num_reqs)
+        # ngram_heads_vocab_sizes/offsets are derived from config (primes above),
+        # not learned. Keep the Python copies so they can be restored verbatim if
+        # the buffers are ever materialized from meta without checkpoint data.
+        self._ngram_sizes = list(sizes)
+        self._ngram_offsets = list(offsets)
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -244,6 +262,45 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ),
             persistent=False,
         )
+
+    def _materialize_workspace(self, device: torch.device) -> None:
+        """Rebuild the non-persistent workspace buffers off the meta device.
+
+        The PLE offload worker builds the whole model under ``torch.device("meta")``
+        and then materializes only what the checkpoint provides. These two buffers
+        are ``persistent=False`` -- they are workspace, not weights -- so nothing
+        brings them back, and the first forward fails with
+        "Tensor on device cpu is not on the expected device meta".
+        """
+        if (
+            not self.positions_buffer.is_meta
+            and not self.padded_buffer.is_meta
+            and not self.ngram_heads_vocab_sizes.is_meta
+            and int(self.ngram_heads_vocab_sizes.sum()) != 0
+        ):
+            return
+        self.positions_buffer = torch.arange(
+            self._max_total_tokens, dtype=torch.int64, device=device
+        )
+        self.padded_buffer = torch.full(
+            (self._max_num_reqs, self._max_total_tokens),
+            self.eos_token_id,
+            dtype=torch.int64,
+            device=device,
+        )
+        # These two are persistent buffers, so a to_empty() materialization
+        # leaves them uninitialized; a zeroed vocab-size table divides by zero
+        # in the n-gram hash. They are config-derived, so restore them exactly.
+        if (
+            self.ngram_heads_vocab_sizes.is_meta
+            or int(self.ngram_heads_vocab_sizes.sum()) == 0
+        ):
+            self.ngram_heads_vocab_sizes = torch.tensor(
+                self._ngram_sizes, dtype=torch.long, device=device
+            )
+            self.ngram_heads_offsets = torch.tensor(
+                self._ngram_offsets, dtype=torch.long, device=device
+            )
 
     @staticmethod
     def _shift_precompute(
@@ -280,12 +337,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def forward_impl(  # type: ignore[override]
         self,
+        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del hidden_states
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
         num_reqs = query_start_loc.numel() - 1
@@ -301,15 +361,36 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"at most {self.padded_buffer.shape[0]}"
             )
 
+        # The CPU-offload subprocess is never captured by a CUDA Graph, so its
+        # pack workspace can narrow to the actual maximum sequence length. The
+        # regular GPU path retains the static maximum-width buffer for capture.
+        if is_offload_process():
+            self._materialize_workspace(input_ids.device)
+            if num_reqs <= 0:
+                raise ValueError("PLE CPU offload requires at least one request")
+            max_seq_len = max(
+                1,
+                int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
+            )
+            # The model runner sends the CUDA-graph padded token count together
+            # with an unpadded query_start_loc. Stale padding must not enter the
+            # scatter: its clamped indices would overwrite the last real token.
+            num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
+        else:
+            max_seq_len = self.padded_buffer.shape[1]
+            num_valid_tokens = num_tokens
+
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs]
+        packed = self.padded_buffer[:num_reqs, :max_seq_len]
         packed.fill_(self.eos_token_id)
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
-        packed[request_indices, columns] = input_ids
+        packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
+            input_ids[:num_valid_tokens]
+        )
         ngram_context = ngram_context[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
@@ -348,15 +429,53 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             (ngram_ids.shape[0], self.embedding_dim),
             dtype=self.ngram_embedding.params_dtype,
         )
-        torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
-            ngram_ids,
-            output,
-            self.layer_name,
-        )
+        if is_offload_process():
+            # Two reasons the custom op cannot be used in the offload worker:
+            # direct_register_custom_op binds it to the platform dispatch key
+            # ("CUDA" on ROCm) while the worker runs on CPU, and the op resolves
+            # its layer through the forward context, which the worker never sets.
+            # Both are indirections the op only needs on the GPU side -- it
+            # exists to keep the embedding opaque to graph capture, which the
+            # offload process does not do -- and we are already inside the
+            # owning module, so do the lookup directly.
+            quant = getattr(self.ngram_embedding, "_ple_quant", None)
+            if quant is not None:
+                # Quantized sidecar: the checkpoint table was stubbed to an empty
+                # tensor, and gathers are dequantized straight out of the mmapped
+                # shards. ngram_ids is (tokens, heads) and output is
+                # (tokens, heads * head_dim), so both flatten to per-head rows.
+                quant.gather_into(
+                    ngram_ids.reshape(-1), output.reshape(-1, self.head_dim)
+                )
+            else:
+                output.copy_(self.ngram_embedding(ngram_ids).flatten(-2))
+        else:
+            torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
+                ngram_ids,
+                output,
+                self.layer_name,
+            )
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+
+        # With offload enabled, PleOffloadLayer skips this subclass's __init__ in
+        # the GPU worker so the huge table is never allocated there -- which also
+        # means none of the buffers below exist. The CPU process owns the weights;
+        # the GPU side keeps only the global scale. Mirrors nvidia/ple_layer.py.
+        if is_ple_cpu_offload_enabled() and not is_offload_process():
+            retained: set[str] = set()
+            for name, loaded_weight in weights:
+                if name != "ngram_embedding.weight_scale":
+                    continue
+                self.register_buffer(
+                    "_offload_weight_scale",
+                    loaded_weight.to(device=torch.accelerator.current_accelerator()),
+                    persistent=False,
+                )
+                retained.add(name)
+            return retained
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
@@ -378,7 +497,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"Shape mismatch for {name}: expected "
                         f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
                     )
-                buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+                if buffer.is_meta:
+                    # The PLE offload worker builds the model on meta. copy_()
+                    # into a meta buffer silently does nothing (the source gets
+                    # moved to meta too), so the buffer would stay unmaterialized
+                    # and every later read of it fails. Bind the real tensor.
+                    setattr(self, name, loaded_weight.to(dtype=buffer.dtype))
+                else:
+                    buffer.copy_(
+                        loaded_weight.to(device=buffer.device, dtype=buffer.dtype)
+                    )
                 loaded.add(name)
                 continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
@@ -1044,7 +1172,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self.ple_embedding(
+            hidden_states,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1082,6 +1215,14 @@ def qwen4_exp_amd_ple_ngram_embedding(
     output.copy_(result)
 
 
+def qwen4_exp_amd_ple_ngram_embedding_fake(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1092,10 +1233,19 @@ def qwen4_exp_ple_short_conv(
     output[: result.shape[0]].copy_(result)
 
 
+def qwen4_exp_ple_short_conv_fake(
+    inputs: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 direct_register_custom_op(
     op_name="qwen4_exp_amd_ple_ngram_embedding",
     op_func=qwen4_exp_amd_ple_ngram_embedding,
     mutates_args=["output"],
+    fake_impl=qwen4_exp_amd_ple_ngram_embedding_fake,
 )
 
 
@@ -1103,6 +1253,7 @@ direct_register_custom_op(
     op_name="qwen4_exp_ple_short_conv",
     op_func=qwen4_exp_ple_short_conv,
     mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_short_conv_fake,
 )
 
 

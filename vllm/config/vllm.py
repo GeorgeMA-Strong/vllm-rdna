@@ -1156,6 +1156,13 @@ class VllmConfig:
             model_config = speculative_config.target_model_config
         self.engram_config.verify_model_config(model_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm() and self.engram_config.cpu_offload:
+            from vllm.utils.network_utils import get_open_zmq_ipc_path
+
+            if not self.parallel_config._ple_offload_ipc_path:
+                self.parallel_config._ple_offload_ipc_path = get_open_zmq_ipc_path()
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
     def __post_init__(self):

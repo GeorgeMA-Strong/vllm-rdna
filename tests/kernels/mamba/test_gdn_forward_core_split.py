@@ -22,9 +22,8 @@ Both paths are exercised through the REAL ``_forward_core``:
   non-spec tokens in both paths, so it cancels out and only the recurrent split
   is compared).
 
-The Triton/FLA chunk backend is forced so the prefill-only ``chunk_indices``
-must stay consistent with the rebased ``cu_seqlens`` (a stringent, backend
-portable check of the split wiring).
+The test uses Triton/FLA on ROCm and CuteDSL on Blackwell. The prefill-only
+``chunk_indices`` must stay consistent with the rebased ``cu_seqlens``.
 """
 
 from __future__ import annotations
@@ -39,11 +38,13 @@ import torch
 from vllm.platforms import current_platform
 
 if not (
-    current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    current_platform.is_rocm()
+    or (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    )
 ):
     pytest.skip(
-        reason="GDN _forward_core split test uses the CuteDSL prefill backend "
-        "(requires CUDA SM10x).",
+        reason="GDN _forward_core split test requires ROCm or CUDA SM10x.",
         allow_module_level=True,
     )
 
@@ -75,7 +76,8 @@ from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
 
 # Small GDN dims; head_k_dim/head_v_dim=128 keeps the chunk/update kernels happy.
 H = 4  # num key heads
-HV = 8  # num value heads
+# Qwen3.8-Flash-Next TP4 has four key heads and twelve value heads per rank.
+HV = 12 if current_platform.is_rocm() else 8
 K = 128  # head_k_dim
 V = 128  # head_v_dim
 CONV_KERNEL = 4
@@ -89,16 +91,17 @@ PREFIX = "model.layers.0.linear_attn"
 def _make_vllm_config():
     # A small, ungated GDN model whose config is cached locally; only the config
     # (scheduler/cache/compilation/hf) is used here, never the weights. Inject
-    # linear_key_head_dim=128 and request the CuteDSL prefill backend -- the
-    # supported GDN chunk kernel on Blackwell (the Triton/FLA chunk kernel is
-    # unsupported on SM10x). CuteDSL consumes chunk_indices/chunk_offsets, so
-    # this also exercises the prefill-only chunk-metadata wiring.
+    # linear_key_head_dim=128 and use the supported chunk backend for each
+    # platform: Triton/FLA on ROCm and CuteDSL on Blackwell. Both consume the
+    # prefill-only chunk metadata produced by the real builder.
     cfg = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
         block_size=BLOCK_SIZE,
         hf_config_override={"linear_key_head_dim": K},
     )
-    cfg.additional_config = {"gdn_prefill_backend": "cutedsl"}
+    cfg.additional_config = {
+        "gdn_prefill_backend": "triton" if current_platform.is_rocm() else "cutedsl"
+    }
     return cfg
 
 
@@ -193,7 +196,9 @@ def test_forward_core_split_matches_unified(
     assert meta_split.num_decodes == num_decodes
     assert meta_split.num_prefills == len(prefill_lens)
     assert meta_split.num_decode_tokens == num_decodes
-    assert builder.gdn_prefill_backend == "cutedsl"
+    assert builder.gdn_prefill_backend == (
+        "triton" if current_platform.is_rocm() else "cutedsl"
+    )
 
     num_tokens = sum(query_lens)
 

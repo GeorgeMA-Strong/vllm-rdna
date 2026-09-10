@@ -77,6 +77,9 @@ def _ll_bf16_router_shapes_from_model(
 
 
 def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
+    if not current_platform.is_cuda():
+        return
+
     from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
         is_available as is_ll_bf16_gemm_available,
     )
@@ -105,6 +108,11 @@ def _warmup_bf16x3_router_gemm(
     model: torch.nn.Module,
     max_num_tokens: int,
 ) -> None:
+    # ROCm gfx10 also reports capability family 100; that does not make
+    # NVIDIA CuTeDSL kernels available on the device.
+    if not current_platform.is_cuda():
+        return
+
     from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl import (  # noqa: E501
         warmup_bf16x3_router_gemm,
     )

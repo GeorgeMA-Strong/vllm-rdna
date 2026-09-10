@@ -61,6 +61,47 @@ MODELS_TO_TEST = [
 num_tokens_list = [11, 8192]
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm."
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("is_neox_style", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 32, 2048])
+def test_partial_interleaved_mrope_full_context_positions(
+    default_vllm_config, dtype, is_neox_style, num_tokens
+):
+    """Partial BF16 rotary encoding must compile and preserve unrotated values."""
+    rope = get_rope(
+        head_size=256,
+        max_position=262144,
+        is_neox_style=is_neox_style,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+        },
+        dtype=dtype,
+    ).to(device=device)
+    positions, query, key = generate_test_data(
+        num_tokens, 6, 1, 256, 4 * 262144, dtype, device
+    )
+    expected_q, expected_k = rope.forward_native(positions, query.clone(), key.clone())
+    actual_q, actual_k = rope.forward_cuda(positions, query.clone(), key.clone())
+    for actual, expected, original in (
+        (actual_q, expected_q, query),
+        (actual_k, expected_k, key),
+    ):
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            actual.view(num_tokens, -1, 256)[..., 64:],
+            original.view(num_tokens, -1, 256)[..., 64:],
+            atol=0,
+            rtol=0,
+        )
+
+
 def test_apply_interleaved_rope():
     mrope_section = [3, 1, 1]
     x = torch.tensor(

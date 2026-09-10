@@ -9,11 +9,32 @@
 
 # ruff: noqa: E501
 
+from typing import Any
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
+
+
+def _prune_rdna2_bf16_configs(
+    configs: list[triton.Config], named_args: dict[str, Any], **kwargs: Any
+) -> list[triton.Config]:
+    args = {**named_args, **kwargs}
+    if (
+        current_platform.is_rocm()
+        and args["k"].dtype == torch.bfloat16
+        and (args["K"], args["V"], args["BT"]) == (128, 128, 64)
+    ):
+        from vllm.platforms.rocm import on_gfx10x
+
+        if on_gfx10x():
+            # Other candidates can spend minutes in LLVM code generation for
+            # RDNA2's BF16 FMA path. This configuration is reference-checked.
+            return [c for c in configs if c.num_warps == 8 and c.num_stages == 2]
+    return configs
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -24,6 +45,7 @@ from .index import prepare_chunk_indices
         for num_stages in [2, 3, 4]
     ],
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+    prune_configs_by={"early_config_prune": _prune_rdna2_bf16_configs},
 )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(

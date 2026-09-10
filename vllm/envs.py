@@ -158,6 +158,9 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+    VLLM_PLE_DISK_OFFLOAD_DIR: str = ""
+    VLLM_PLE_QUANT_DIR: str = ""
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -1385,8 +1388,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CustomAllreduce. For RDNA systems where PCIe P2P actually works
     # (P2PDMA-enabled kernel); init fails loudly if P2P is broken.
     "VLLM_FORCE_CUSTOM_ALL_REDUCE": lambda: (
-        os.getenv("VLLM_FORCE_CUSTOM_ALL_REDUCE", "False").lower()
-        in ("true", "1")
+        os.getenv("VLLM_FORCE_CUSTOM_ALL_REDUCE", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
@@ -2102,6 +2104,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy fallback for EngramConfig.cpu_offload, which takes precedence.
     # This environment variable may be removed in a future release.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
+    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+        os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+    ),
+    "VLLM_PLE_DISK_OFFLOAD_DIR": lambda: os.getenv("VLLM_PLE_DISK_OFFLOAD_DIR", ""),
+    "VLLM_PLE_QUANT_DIR": lambda: os.getenv("VLLM_PLE_QUANT_DIR", ""),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
