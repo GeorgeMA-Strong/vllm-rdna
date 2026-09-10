@@ -69,6 +69,12 @@ NKM_FACTORS_LLMM1 = [
 ]
 
 NKM_FACTORS_WVSPLITK = [
+    # Small-output shared-expert gates must also avoid generic BF16 GEMM.
+    (1, 2560, 1),
+    (2, 2560, 1),
+    (4, 2560, 1),
+    (5, 640, 2),
+    (2, 2560, 4),
     # Flash-Next hyperconnection and attention projections on four V620s.
     (2, 10240, 336),
     (4, 10240, 320),
@@ -283,18 +289,22 @@ def test_rocm_wvsplitk_kernel(
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm dispatch")
 @pytest.mark.parametrize(
-    "gfx1030,dtype,tokens,strided_weight,expected_skinny",
+    "gfx1030,dtype,tokens,strided_weight,outputs,expected_skinny",
     [
-        (True, torch.bfloat16, 2, False, True),
-        (True, torch.bfloat16, 4, False, True),
-        (True, torch.bfloat16, 8, False, False),
-        (True, torch.bfloat16, 2, True, False),
-        (True, torch.float16, 2, False, False),
-        (False, torch.bfloat16, 2, False, False),
+        (True, torch.bfloat16, 2, False, 64, True),
+        (True, torch.bfloat16, 4, False, 64, True),
+        (True, torch.bfloat16, 8, False, 64, False),
+        (True, torch.bfloat16, 2, True, 64, False),
+        (True, torch.float16, 2, False, 64, False),
+        (False, torch.bfloat16, 2, False, 64, False),
+        (True, torch.bfloat16, 2, False, 1, True),
+        (True, torch.bfloat16, 4, False, 4, True),
+        (True, torch.bfloat16, 5, False, 8, True),
+        (True, torch.bfloat16, 8, False, 1, False),
     ],
 )
 def test_gfx1030_bf16_decode_dispatch(
-    monkeypatch, gfx1030, dtype, tokens, strided_weight, expected_skinny
+    monkeypatch, gfx1030, dtype, tokens, strided_weight, outputs, expected_skinny
 ):
     """Use the port only for supported BF16 decode operands on gfx1030."""
     from vllm.model_executor.layers import utils
@@ -315,10 +325,10 @@ def test_gfx1030_bf16_decode_dispatch(
 
     monkeypatch.setattr(utils.ops, "wvSplitK", skinny)
     x = torch.randn(tokens, 32, dtype=dtype)
-    weight = torch.randn(64, 32, dtype=dtype)
+    weight = torch.randn(outputs, 32, dtype=dtype)
     if strided_weight:
         weight = weight.T.contiguous().T
-    bias = torch.randn(64, dtype=dtype)
+    bias = torch.randn(outputs, dtype=dtype)
     expected = torch.nn.functional.linear(x, weight, bias)
     actual = utils.rocm_unquantized_gemm_impl(x, weight, bias)
     torch.testing.assert_close(actual, expected)

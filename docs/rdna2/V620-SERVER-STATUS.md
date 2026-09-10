@@ -9,8 +9,8 @@ This document records development state, not a validated serving recipe.
 
 Text, basic vision and one-token MTP serve on all four GPUs with the original
 BF16 PLE table in RAM and decode-only full graphs. The latest matched short
-benchmark measures **21.59 output tokens/s**, about **32.7 tokens/s after the
-first token**, with 1.037-second mean TTFT. Uncached 1,024-token requests
+benchmark measures **24.83 output tokens/s**, about **41.1 tokens/s after the
+first token**, with 1.044-second mean TTFT. Uncached 1,024-token requests
 measure **253.41 prompt tokens/s**. Twenty-four elementary text checks pass
 at concurrency one/two/four, as do two synthetic vision checks. Six fixed
 greedy responses match the previous version's text, with different token
@@ -385,9 +385,10 @@ establish broad model quality or a guaranteed production throughput.
 | Decode graphs, MTP one | 3.20 | 1.319 s | 296.41 ms | 64.10% |
 | BF16 skinny GEMM, graphs, MTP one | 16.48 | 1.076 s | 44.54 ms | 50.00% |
 | BF16 expert GEMV plus skinny GEMM | 21.59 | 1.037 s | 30.58 ms | 53.01% |
+| Small-output BF16 gate dispatch | 24.83 | 1.044 s | 24.34 ms | 53.01% |
 
-The last row corresponds to about 32.7 tokens/s after the first token and
-46.43 ms mean inter-response interval; MTP can return multiple tokens together.
+The last row corresponds to about 41.1 tokens/s after the first token and
+36.94 ms mean inter-response interval; MTP can return multiple tokens together.
 All 24 elementary text checks at concurrency one/two/four and both synthetic
 vision checks pass. Six fixed greedy responses match the preceding version's
 text, but token log probabilities differ by up to 0.1245. No broad evaluation
@@ -402,6 +403,15 @@ scales and BF16 dequantization. All 44 focused hardware cases pass, including
 strides, routing weights, EP zeros, changing graph inputs and full MoE output
 references. Its M=2 gate/up and down projections improved about 7.65x and
 6.08x in isolated graph benchmarks. Applicable hooks and mypy 3.12 pass.
+
+The remaining shared-expert gate `[2,2560] @ [2560,1]` also benefits from the
+existing skinny kernel. The small-output dispatch regression failed in three
+cases before the change. All 172 native kernel/dispatch tests pass afterward,
+as do scoped hooks and mypy 3.12. The 15:49:12 UTC restart again verified every
+old serving PID gone and all GPUs at 16 MB before replacement. All 24 text
+and two synthetic vision checks pass; six greedy responses retain exactly
+the previous version's text. This change retains BF16 and leaves other GPU
+architectures' dispatch unchanged.
 
 Uncached 1,024-token prompts with one output token and unique cache salts
 measure 253.41 prompt tokens/s across three warmed requests. This remains
@@ -431,7 +441,8 @@ is substantial, so its module intervals are not graph-mode throughput.
 ## Remaining work
 
 1. Reach the requested 60–90 tokens/s and improve prefill using measured
-   bottlenecks. A remaining scalar BF16 gate projection is under investigation.
+   bottlenecks. Raw ROCm graph-kernel tracing now passes a tiny selected-region
+   proof and can be used to distinguish the remaining graph-mode costs.
 2. Run broader model and vision evaluation, including MTP behavior and
    sustained concurrent requests. Elementary smoke checks are insufficient.
 3. Diagnose the original SDMA copy fault and complete clean PLE/worker shutdown.
@@ -439,3 +450,19 @@ is substantial, so its module intervals are not graph-mode throughput.
    user directed. Keep model-body and KV tensors on GPUs, with PLE in RAM.
 5. Qualify cold/warm loading and publish the tested fork with reproducible
    configuration and source attribution. Any upstream PR requires human review.
+
+## Reproducing the measured serving configuration
+
+After building this branch in the validated remote environment:
+
+```bash
+V620_MTP_TOKENS=1 bash tools/rdna2/serve_flash_next.sh \
+  --no-enforce-eager \
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[2,4,8]}'
+```
+
+The launcher selects the original BF16 RAM PLE table, TP4/EP4, 262,144 configured
+context, four request slots, a 2,048-token scheduling budget and 4 GiB KV per
+GPU. The measured user-level service additionally sets `MemoryMax=220G`,
+`MemorySwapMax=0`, `KillMode=mixed` and `TimeoutStopSec=90`. The temporary
+diagnostic worker extension is not needed for ordinary serving.
