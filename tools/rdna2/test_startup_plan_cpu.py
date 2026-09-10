@@ -72,7 +72,7 @@ def main() -> int:
     spec.loader.exec_module(source)
 
     return pytest.main(
-        ["--noconftest", "-q", str(root / "tests/v1/worker/test_gpu_worker.py")]
+        ["--noconftest", "-q", str(root / "tests/v1/worker/test_startup_plan.py")]
     )
 
 
