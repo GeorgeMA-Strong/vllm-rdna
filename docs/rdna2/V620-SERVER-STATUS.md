@@ -9,9 +9,9 @@ This document records development state, not a validated serving recipe.
 
 Text, basic vision and one-token MTP serve on all four GPUs with the original
 BF16 PLE table in RAM and decode-only full graphs. The latest matched short
-benchmark measures **26.12 output tokens/s**, about **41.4 tokens/s after the
-first token**, with 0.928-second mean TTFT. Uncached 1,024-token requests
-measure **337.66 prompt tokens/s**. Twenty-four elementary text checks pass
+benchmark measures **32.80 output tokens/s**, about **41.4 tokens/s after the
+first token**, with 0.431-second mean TTFT. Uncached 1,024-token requests
+measure **493.16 prompt tokens/s**. Twenty-four elementary text checks pass
 at concurrency one/two/four, as do two synthetic vision checks. Six fixed
 greedy responses and their returned token probabilities exactly match the
 previous version. The user's 60–90 tokens/s target, broad model quality and
@@ -387,12 +387,13 @@ establish broad model quality or a guaranteed production throughput.
 | BF16 expert GEMV plus skinny GEMM | 21.59 | 1.037 s | 30.58 ms | 53.01% |
 | Small-output BF16 gate dispatch | 24.83 | 1.044 s | 24.34 ms | 53.01% |
 | Four-warp TP4 QSA prefill | 26.12 | 0.928 s | 24.17 ms | 53.01% |
+| Smaller INT4 expert prefill tiles | 32.80 | 0.431 s | 24.14 ms | 53.01% |
 
 The last row corresponds to about 41.4 tokens/s after the first token and
-36.69 ms mean inter-response interval; MTP can return multiple tokens together.
+36.64 ms mean inter-response interval; MTP can return multiple tokens together.
 All 24 elementary text checks at concurrency one/two/four and both synthetic
 vision checks pass. Six fixed greedy responses and their returned token log
-probabilities exactly match the preceding scalar-gate version. Earlier expert
+probabilities exactly match the preceding QSA version. Earlier expert
 kernel changes altered log probabilities by up to 0.1245 on these prompts.
 No broad evaluation against the BF16 checkpoint has run on this host.
 
@@ -427,20 +428,37 @@ The 16:33:06 UTC serving restart again verified all previous PIDs gone and
 16 MB/card before loading. It passes the complete short serving checks above.
 
 Uncached 1,024-token prompts with one output token and unique cache salts
-now measure 337.66 prompt tokens/s across three warmed requests, up from
-253.41 before the QSA launch change (about 33% faster). This remains
+measure 493.16 prompt tokens/s across three warmed requests, up from
+337.66 after the QSA change and 253.41 before it. This remains
 well below an optimized prefill target. Actual PyNccl/RCCL reductions measure
 about 73–79 microseconds for small BF16 tensors on this topology. Exact dyadic
 results and changing graph inputs pass on all four ranks. Explicit Tree/LL
 and Ring/LL settings have mixed performance; serving keeps automatic selection.
 The donor's custom RDNA all-reduce rejects BF16 and remains disabled.
 
+The same trace identified INT4 expert prefill as the largest kernel cost.
+At 1,024 rows, the default gate/up and down projections take 37.25 and
+18.29 ms in isolation. A 16-row, 64-column, 32-reduction tile with four
+warps and one stage takes 12.47 and 6.32 ms. Qualification across 64–2,048
+rows and uniform/concentrated routing found no regressions and identical
+outputs for both projections. Nonlocal expert outputs remain exactly zero.
+The default profile is limited to gfx1030, BF16 activations, INT4 group128
+and the checkpoint's EP4 weight shapes; explicit/file configurations and
+batch-invariant mode retain precedence. Both WNA16 call paths select the
+tile before expert routing is padded. All 46 focused hardware tests pass,
+including two added full-MoE reference cases at 64 and 129 input rows.
+Scoped hooks and mypy 3.12 pass. The 16:56:02 UTC restart verified all old
+GPU processes absent and 16 MB/card before loading. The short serving suite
+passes with all six fixed texts and returned log probabilities unchanged.
+Uncached prompt processing improves 46%; generation after the first token
+is essentially unchanged.
+
 The service uses a 4 GiB KV allocation per GPU and reports 291,356 KV tokens,
 1.11 times the configured native context. This is a capacity estimate, not
 successful native-context generation. After the short benchmark, each GPU
 held about 19.80 GiB of model tensors, 4 GiB of KV, 0.36 GiB of other live
-Torch tensors, 0.16 GiB of unused Torch reservation and 1.47–1.64 GiB outside
-Torch reservation, leaving about 4.0–4.2 GiB free. These are live snapshots.
+Torch tensors, 0.64 GiB of unused Torch reservation and 1.52–1.69 GiB outside
+Torch reservation, leaving about 3.5–3.7 GiB free. These are live snapshots.
 The original BF16 PLE table stays in RAM. `MemorySwapMax=0` prevents serving
 swap, and measured swap remains zero.
 

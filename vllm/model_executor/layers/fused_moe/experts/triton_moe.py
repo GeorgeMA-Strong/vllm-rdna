@@ -680,6 +680,7 @@ class TritonWNA16Experts(TritonExperts):
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
+            activation_dtype=hidden_states.dtype,
         )
 
         if hidden_states.dtype == torch.bfloat16:

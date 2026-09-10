@@ -1583,6 +1583,8 @@ def try_get_optimal_moe_config(
     dtype: str | None,
     M: int,
     block_shape: list[int] | None = None,
+    *,
+    activation_dtype: torch.dtype | None = None,
 ) -> dict[str, int]:
     from vllm.model_executor.layers.fused_moe import get_config
 
@@ -1605,6 +1607,26 @@ def try_get_optimal_moe_config(
         else:
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
+            if (
+                _USE_RDNA2_BF16_GEMV
+                and not envs.VLLM_BATCH_INVARIANT
+                and activation_dtype == torch.bfloat16
+                and dtype == "int4_w4a16"
+                and w1_shape == (128, 1280, 1280)
+                and w2_shape == (128, 2560, 320)
+                and top_k == 10
+                and block_shape == [0, 128]
+                and 64 <= M <= 2048
+            ):
+                # Flash-Next EP4 prefill: smaller tiles avoid register spilling
+                # and reduce padding for sparsely populated local experts.
+                config.update(
+                    BLOCK_SIZE_M=16,
+                    BLOCK_SIZE_N=64,
+                    BLOCK_SIZE_K=32,
+                    num_warps=4,
+                    num_stages=1,
+                )
     return config
 
 
@@ -1889,6 +1911,7 @@ def fused_experts_impl(
         top_k_num,
         config_dtype,
         block_shape=block_shape,
+        activation_dtype=hidden_states.dtype,
     )
 
     config = get_config_func(M)

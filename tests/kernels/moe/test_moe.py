@@ -925,6 +925,13 @@ def test_fused_moe_wn16_flash_next_decode(m, has_zp):
     test_fused_moe_wn16(m, 640, 2560, 16, 10, 4, torch.bfloat16, 128, has_zp, 4)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="RDNA2 BF16 prefill")
+@pytest.mark.parametrize("m", [64, 129])
+def test_fused_moe_wn16_flash_next_prefill(m):
+    # Exercise both aligned and partial tiles at the deployed local expert shape.
+    test_fused_moe_wn16(m, 640, 2560, 128, 10, 1, torch.bfloat16, 128, True, 4)
+
+
 MARLIN_MOE_SCENARIOS = [
     # (m, n, k, e, topk, ep_size)
     # N>=256 required for Marlin kernel thread config for MXFP8.
