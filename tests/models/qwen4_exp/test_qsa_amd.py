@@ -23,6 +23,7 @@ from vllm.models.qwen4_exp.amd.indexer_qsa import (
 from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.ple_offload import hip_driver
 
 pytestmark = pytest.mark.skipif(
@@ -90,10 +91,18 @@ def test_qsa_prefill_bounds_scoring_to_live_context(
 
 
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bfloat16"])
+@pytest.mark.parametrize(
+    "dtype,kv_cache_dtype",
+    [
+        (torch.bfloat16, "auto"),
+        (torch.bfloat16, "bfloat16"),
+        (torch.float16, "auto"),
+        (torch.float16, "float16"),
+    ],
+)
 @pytest.mark.parametrize("head_size", [128, 256])
 def test_rocm_qsa_updates_cache_without_flash_attention(
-    monkeypatch, num_kv_heads, kv_cache_dtype, head_size
+    monkeypatch, num_kv_heads, dtype, kv_cache_dtype, head_size
 ):
     """Padded QSA writes must preserve cache values without FlashAttention."""
     monkeypatch.setattr(
@@ -109,13 +118,9 @@ def test_rocm_qsa_updates_cache_without_flash_attention(
         kv_cache_dtype=kv_cache_dtype,
     )
     # QKV projections produce strided inputs; slots omit trailing graph padding.
-    projection = torch.randn(
-        8, 3, num_kv_heads, head_size, device="cuda", dtype=torch.bfloat16
-    )
+    projection = torch.randn(8, 3, num_kv_heads, head_size, device="cuda", dtype=dtype)
     key, value = projection[:, 1], projection[:, 2]
-    cache = torch.randn(
-        3, num_kv_heads, 16, 2 * head_size, device="cuda", dtype=torch.bfloat16
-    )
+    cache = torch.randn(3, num_kv_heads, 16, 2 * head_size, device="cuda", dtype=dtype)
     expected = cache.clone()
     slots = [33, -1, 0, 18, 15]
     for row, slot in enumerate(slots):
@@ -175,20 +180,24 @@ def test_ple_ngram_embedding_custom_op_uses_resident_weight(
     torch.testing.assert_close(output, expected)
 
 
+@pytest.mark.parametrize("compute_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("padding", [0, 3])
-def test_cpu_ple_batched_hashing_matches_scalar_reference(monkeypatch, padding):
+def test_cpu_ple_batched_hashing_matches_scalar_reference(
+    monkeypatch, padding, compute_dtype
+):
     """EOS, request boundaries and graph padding must select the correct rows."""
     monkeypatch.setattr(offload_layer_module, "_offload_worker_flag", True)
     monkeypatch.setattr(offload_layer_module.envs, "VLLM_PLE_QUANT_DIR", "")
     monkeypatch.setattr(offload_layer_module.envs, "VLLM_PLE_DISK_OFFLOAD_DIR", "")
 
     def embedding(rows, width, **kwargs):
-        result = torch.nn.Embedding(rows, width)
+        result = torch.nn.Embedding(rows, width, dtype=kwargs.get("params_dtype"))
         result.params_dtype = result.weight.dtype
         return result
 
     monkeypatch.setattr(ple_layer_module, "PLEVocabParallelEmbedding", embedding)
     config = SimpleNamespace(
+        dtype=torch.bfloat16,
         ngram_size=4,
         heads_per_ngram=1,
         eos_token_id=2,
@@ -197,7 +206,12 @@ def test_cpu_ple_batched_hashing_matches_scalar_reference(monkeypatch, padding):
         ngram_vocab_size_base=31,
         make_ngram_vocab_size_divisible_by=8,
     )
-    layer = ple_layer_module.Qwen4ExpNGramEmbedding(config, 6, 0, 16, 4, "test", "test")
+    with set_default_torch_dtype(compute_dtype):
+        layer = ple_layer_module.Qwen4ExpNGramEmbedding(
+            config, 6, 0, 16, 4, "test", "test"
+        )
+    # Changing GPU arithmetic must preserve the original RAM table precision.
+    assert layer.ngram_embedding.weight.dtype == torch.bfloat16
     requests = [[3, 4, 2, 5], [9, 10]]
     contexts = [[2, 2, 7], [1, 2, 8]]
     expected = []
@@ -378,6 +392,7 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
     [
@@ -391,6 +406,7 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
     ],
 )
 def test_qsa_sparse_paged_attention_matches_reference(
+    dtype: torch.dtype,
     num_rows: int,
     num_query_heads: int,
     num_kv_heads: int,
@@ -405,16 +421,14 @@ def test_qsa_sparse_paged_attention_matches_reference(
     indexer_budget = 2048
     indexer_compress_ratio = 4
     selection_width = indexer_budget + indexer_compress_ratio - 1
-    q = torch.randn(
-        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(num_rows, num_query_heads, head_dim, device="cuda", dtype=dtype)
     kv_cache = torch.randn(
         num_cache_blocks,
         page_size,
         num_kv_heads,
         2 * head_dim,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
     block_table = (

@@ -235,10 +235,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
+        # The checkpoint table is BF16 even when GPU computation uses FP16.
+        # Keep that storage precision in the dedicated RAM worker.
+        storage_dtype = torch.bfloat16 if is_offload_process() else None
         self.ngram_embedding = PLEVocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim,
             padding_size=divisor,
+            params_dtype=storage_dtype,
             prefix=f"{prefix}.ngram_embedding",
         )
         self._max_total_tokens = int(max_total_tokens)

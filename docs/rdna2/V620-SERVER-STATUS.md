@@ -510,3 +510,59 @@ context, four request slots, a 2,048-token scheduling budget and 4 GiB KV per
 GPU. The measured user-level service additionally sets `MemoryMax=220G`,
 `MemorySwapMax=0`, `KillMode=mixed` and `TimeoutStopSec=90`. The temporary
 diagnostic worker extension is not needed for ordinary serving.
+
+## FP16 donor execution path — qualification in progress
+
+The donor's `e34cdc720` enables FP16 execution in the AMD QSA attention,
+indexer caches and hyperconnections, including MTP. This port follows the
+requested model dtype while retaining the checkpoint's original BF16 table
+in the CPU offload process. GPU transfer buffers continue to follow compute
+dtype. BF16 remains supported.
+
+A read-only scan of all 8,003,780,464 BF16 model-body values (excluding PLE)
+found zero FP16 overflows, maximum absolute value 25.625 and relative L2
+conversion error 1.21e-8. This checks weight representation, not activation
+range or broad model quality. The original PLE table was not converted.
+
+FP16 also needs the existing dense decode and INT4 expert fast paths. Their
+dispatch now accepts both 16-bit types and dequantizes expert weights to the
+activation dtype before FP32 accumulation. All 132 real-shape native dense
+comparisons pass across four V620s; the native/dispatch suite passes 175
+cases, and 72 expert reference and changing-input graph cases pass. The
+QSA/cache/RAM-table suite passes 43 cases.
+
+The FP16 expert prefill profile uses BM32/BN64/BK32, four warps and one stage
+for the same qualified EP4 geometry. Twelve size/routing cases produce
+identical baseline outputs in both expert projections. Uniform routing is
+roughly twice as fast; deliberately concentrated routing can be about 5%
+slower. The established BF16 profile retains BM16.
+
+The first full-model FP16 startup exposed two defects in the target fork's
+older native convolution dispatch: prefill rejected MTP's extra state slot,
+and decode executed a second state update after the Triton kernel had
+already updated it. The native decode implementation also discarded the
+oldest convolution contribution. Current Leapdragon uses the mainline
+Triton route. Restoring that route preserves the earlier RDNA2 BF16 arithmetic
+fix and removes the obsolete native dispatch overrides. Three focused
+failures reproduce before the correction; all 168 convolution cases pass
+afterward, including FP16 prefill/decode with MTP state padding.
+
+Full-model FP16 quality, vision, MTP, concurrency and speed validation is
+pending. The performance figures at the top still describe the validated
+BF16 configuration. No large-context request is part of this qualification.
+
+## OpenAI-compatible service flags
+
+The four-V620 service wrapper must register the client-facing alias and the
+Qwen3 formats used by the checkpoint's chat template:
+
+```text
+--served-model-name active qwen3.8-flash-next
+--enable-auto-tool-choice
+--tool-call-parser qwen3_xml
+--reasoning-parser qwen3
+```
+
+Without the reasoning parser, the template's `<think>...</think>` block is
+returned as ordinary assistant content. Without the auto-tool flags, requests
+with `tool_choice: "auto"` are rejected before generation.

@@ -314,16 +314,19 @@ def rocm_unquantized_gemm_impl(
 
         return gemm_a16w16(x, weight, bias)
 
-    gfx1030_bf16_decode = (
-        on_gfx1030() and x.dtype == torch.bfloat16 and m > 0 and 0 < n <= 5
+    gfx1030_decode = (
+        on_gfx1030()
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and m > 0
+        and 0 < n <= 5
     )
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
         and (
             on_gfx9()
             or on_gfx1x()
-            # The gfx1030 port is qualified for BF16 wvSplitK decode only.
-            or gfx1030_bf16_decode
+            # The gfx1030 port is qualified for BF16/FP16 wvSplitK decode only.
+            or gfx1030_decode
         )
         # TODO GFX1250: Include once skinny GEMM is supported on gfx1250
         and x.dtype in [torch.float16, torch.bfloat16]
@@ -335,7 +338,7 @@ def rocm_unquantized_gemm_impl(
         # The skinny kernels assume contiguous K elements. A shape-preserving
         # reshape can retain a transposed activation's non-contiguous strides.
         x_view = x.reshape(-1, x.size(-1)).contiguous()
-        if (m > 8 or gfx1030_bf16_decode) and 0 < n <= 5:
+        if (m > 8 or gfx1030_decode) and 0 < n <= 5:
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])

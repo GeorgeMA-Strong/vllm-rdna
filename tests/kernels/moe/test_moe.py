@@ -791,7 +791,7 @@ def test_fused_moe_wn16(
     torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
 
 
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="RDNA2 BF16 decode kernel")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="RDNA2 decode kernel")
 @pytest.mark.parametrize(
     "m,topk,n,k",
     [
@@ -806,9 +806,10 @@ def test_fused_moe_wn16(
 @pytest.mark.parametrize(
     "has_zp,mul_weight", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("strided", [False, True])
-def test_fused_moe_wna16_bf16_decode(m, topk, n, k, has_zp, mul_weight, strided):
-    """Decode preserves BF16 dequantization, EP zeros and changing graph inputs."""
+def test_fused_moe_wna16_decode(m, topk, n, k, has_zp, mul_weight, strided, dtype):
+    """Decode preserves dequantization, EP zeros and changing graph inputs."""
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
@@ -830,12 +831,12 @@ def test_fused_moe_wna16_bf16_decode(m, topk, n, k, has_zp, mul_weight, strided)
         view.copy_(t)
         return view
 
-    a = padded(torch.randn(m, k, device=device, dtype=torch.bfloat16))
+    a = padded(torch.randn(m, k, device=device, dtype=dtype))
     q = torch.randint(0, 16, (e, n, k), device=device, dtype=torch.uint8)
     b = padded(q[..., ::2] | (q[..., 1::2] << 4))
     scales = padded(
         (torch.rand(e, n, k // group_size, device=device) * 0.004 + 0.001).to(
-            torch.float16 if strided else torch.bfloat16
+            torch.float16 if strided else dtype
         )
     )
     zero = torch.randint(
@@ -845,7 +846,7 @@ def test_fused_moe_wna16_bf16_decode(m, topk, n, k, has_zp, mul_weight, strided)
     dequant = (
         (q.float() - (zero.float().repeat_interleave(group_size, -1) if has_zp else 8))
         * scales.float().repeat_interleave(group_size, -1)
-    ).bfloat16()
+    ).to(dtype)
     ids = (
         (
             torch.arange(m, device=device)[:, None]
@@ -856,9 +857,7 @@ def test_fused_moe_wna16_bf16_decode(m, topk, n, k, has_zp, mul_weight, strided)
     expert_map = torch.full((global_e,), -1, device=device, dtype=torch.int32)
     expert_map[:e] = torch.arange(e, device=device, dtype=torch.int32)
     weights = torch.rand((m, topk), device=device)
-    out = padded(
-        torch.full((m, topk, n), float("nan"), device=device, dtype=torch.bfloat16)
-    )
+    out = padded(torch.full((m, topk, n), float("nan"), device=device, dtype=dtype))
     config = {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 64,
@@ -883,7 +882,7 @@ def test_fused_moe_wna16_bf16_decode(m, topk, n, k, has_zp, mul_weight, strided)
             mul_weight,
             topk,
             config,
-            tl.bfloat16,
+            tl.bfloat16 if dtype == torch.bfloat16 else tl.float16,
             False,
             True,
             [0, group_size],
@@ -898,7 +897,7 @@ def test_fused_moe_wna16_bf16_decode(m, topk, n, k, has_zp, mul_weight, strided)
             if mul_weight:
                 values *= weights.flatten()[slots, None]
             expected[slots] = values
-        expected = expected.reshape(m, topk, n).bfloat16()
+        expected = expected.reshape(m, topk, n).to(dtype)
         torch.testing.assert_close(out, expected, atol=1e-3, rtol=8e-3)
         assert torch.count_nonzero(out.reshape(-1, n)[routed == -1]) == 0
 

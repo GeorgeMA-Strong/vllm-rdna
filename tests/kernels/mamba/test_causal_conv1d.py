@@ -392,3 +392,53 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm native dispatch")
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("state_padding", [0, 1])
+def test_fp16_convolution_preserves_mtp_state_padding(prefill, state_padding):
+    """Only the active history is consumed, and each input updates it once."""
+    set_random_seed(620)
+    dim, width = 64, 4
+    history = width - 1
+    state = torch.randn(
+        4, dim, history + state_padding, device=DEVICE, dtype=torch.float16
+    )
+    if prefill:
+        state = state.transpose(1, 2).contiguous().transpose(1, 2)
+    expected_state = state.clone()
+    slots = torch.tensor([1, 3], device=DEVICE, dtype=torch.int32)
+    weight = torch.randn(dim, width, device=DEVICE, dtype=torch.float16) * 0.1
+    bias = torch.randn(dim, device=DEVICE, dtype=torch.float16) * 0.1
+    lengths = [1, 7] if prefill else [1, 1]
+    x = torch.randn(sum(lengths), dim, device=DEVICE, dtype=torch.float16)
+    initial = torch.tensor([True, False], device=DEVICE)
+    expected = []
+    for i, part in enumerate(x.split(lengths)):
+        slot = int(slots[i])
+        old = expected_state[slot, :, :history].clone()
+        if prefill and not initial[i]:
+            old.zero_()
+        combined = torch.cat((old.float(), part.T.float()), dim=1)
+        y = F.conv1d(
+            combined.unsqueeze(0), weight.float().unsqueeze(1), bias.float(), groups=dim
+        )
+        expected.append(F.silu(y).squeeze(0).T.half())
+        expected_state[slot, :, :history] = combined[:, -history:].half()
+    if prefill:
+        actual = causal_conv1d_fn(
+            x.T,
+            weight,
+            bias,
+            state,
+            torch.tensor([0, 1, 8], device=DEVICE, dtype=torch.int32),
+            cache_indices=slots,
+            has_initial_state=initial,
+        ).T
+    else:
+        actual = causal_conv1d_update(
+            x, state, weight, bias, activation="silu", conv_state_indices=slots
+        )
+    torch.testing.assert_close(actual, torch.cat(expected), rtol=3e-3, atol=1e-3)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)

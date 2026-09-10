@@ -295,7 +295,10 @@ def test_rocm_wvsplitk_kernel(
         (True, torch.bfloat16, 4, False, 64, True),
         (True, torch.bfloat16, 8, False, 64, False),
         (True, torch.bfloat16, 2, True, 64, False),
-        (True, torch.float16, 2, False, 64, False),
+        (True, torch.float16, 2, False, 64, True),
+        (True, torch.float16, 4, False, 1, True),
+        (True, torch.float16, 8, False, 64, False),
+        (True, torch.float16, 2, True, 64, False),
         (False, torch.bfloat16, 2, False, 64, False),
         (True, torch.bfloat16, 2, False, 1, True),
         (True, torch.bfloat16, 4, False, 4, True),
@@ -303,10 +306,10 @@ def test_rocm_wvsplitk_kernel(
         (True, torch.bfloat16, 8, False, 1, False),
     ],
 )
-def test_gfx1030_bf16_decode_dispatch(
+def test_gfx1030_decode_dispatch(
     monkeypatch, gfx1030, dtype, tokens, strided_weight, outputs, expected_skinny
 ):
-    """Use the port only for supported BF16 decode operands on gfx1030."""
+    """Use the port only for supported BF16/FP16 decode operands on gfx1030."""
     from vllm.model_executor.layers import utils
     from vllm.platforms import rocm
 

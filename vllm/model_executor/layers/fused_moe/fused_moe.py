@@ -43,9 +43,9 @@ logger = init_logger(__name__)
 if current_platform.is_rocm():
     from vllm.platforms.rocm import on_gfx1030
 
-    _USE_RDNA2_BF16_GEMV = on_gfx1030()
+    _USE_RDNA2_GEMV = on_gfx1030()
 else:
-    _USE_RDNA2_BF16_GEMV = False
+    _USE_RDNA2_GEMV = False
 
 
 @triton.jit
@@ -303,7 +303,7 @@ def fused_moe_kernel_gptq_awq(
 
 
 @triton.jit
-def fused_moe_kernel_w4a16_bf16_decode(
+def fused_moe_kernel_w4a16_decode(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -375,8 +375,8 @@ def fused_moe_kernel_w4a16_bf16_decode(
             zero = ((packed_zp >> ((ns[:, None] % 2) * 4)) & 15).to(tl.float32)
         else:
             zero = 8.0
-        # Match WNA16's BF16 dequantization before FP32 accumulation.
-        weight = ((quant - zero) * scale).to(tl.bfloat16).to(tl.float32)
+        # Match WNA16's activation-dtype dequantization before FP32 accumulation.
+        weight = ((quant - zero) * scale).to(a_ptr.dtype.element_ty).to(tl.float32)
     else:
         weight = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K), 0, tl.float32)
 
@@ -805,12 +805,13 @@ def invoke_fused_moe_wna16_triton_kernel(
     num_tokens = M * top_k
 
     if (
-        _USE_RDNA2_BF16_GEMV
+        _USE_RDNA2_GEMV
         and use_int4_w4a16
         and not use_int8_w8a16
-        and A.dtype == C.dtype == torch.bfloat16
+        and A.dtype == C.dtype
+        and A.dtype in (torch.bfloat16, torch.float16)
         and B.dtype == torch.uint8
-        and compute_type == tl.bfloat16
+        and compute_type == (tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16)
         and 0 < num_tokens <= 80
         and block_shape[1] == 128
         and 0 < A.size(1) <= 4096
@@ -822,7 +823,7 @@ def invoke_fused_moe_wna16_triton_kernel(
             triton.cdiv(sorted_token_ids.numel(), block_m),
             triton.cdiv(B.size(1), block_n),
         )
-        fused_moe_kernel_w4a16_bf16_decode[decode_grid](
+        fused_moe_kernel_w4a16_decode[decode_grid](
             A,
             B,
             C,
@@ -1608,9 +1609,9 @@ def try_get_optimal_moe_config(
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
             if (
-                _USE_RDNA2_BF16_GEMV
+                _USE_RDNA2_GEMV
                 and not envs.VLLM_BATCH_INVARIANT
-                and activation_dtype == torch.bfloat16
+                and activation_dtype in (torch.bfloat16, torch.float16)
                 and dtype == "int4_w4a16"
                 and w1_shape == (128, 1280, 1280)
                 and w2_shape == (128, 2560, 320)
@@ -1621,7 +1622,7 @@ def try_get_optimal_moe_config(
                 # Flash-Next EP4 prefill: smaller tiles avoid register spilling
                 # and reduce padding for sparsely populated local experts.
                 config.update(
-                    BLOCK_SIZE_M=16,
+                    BLOCK_SIZE_M=16 if activation_dtype == torch.bfloat16 else 32,
                     BLOCK_SIZE_N=64,
                     BLOCK_SIZE_K=32,
                     num_warps=4,
