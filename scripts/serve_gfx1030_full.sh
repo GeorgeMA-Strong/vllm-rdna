@@ -49,13 +49,14 @@ export VLLM_BATCH_INVARIANT=0
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export GPU_MAX_HW_QUEUES=2
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export NCCL_P2P_LEVEL=pix
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-pix}"
 export RCCL_P2P_NET_DISABLE=1
 export RCCL_P2P_BATCH_ENABLE=1
 export NCCL_PROTO=Simple
 export RCCL_MSCCL_ENABLE=0
-# PIX + leapdragon RDNA one-shot AR for eager/prefill (vLLM custom AR
-# barriers are invisible on RDNA PCIe). FULL graphs still record PYNCCL.
+export HSA_FORCE_FINE_GRAIN_PCIE="${HSA_FORCE_FINE_GRAIN_PCIE:-1}"
+# PIX mesh: RCCL P2P + gfx10x push one-shot (rdna_ar). Do not use vLLM's
+# XGMI pull custom AR on this platform (FORCE here opts into rdna_ar).
 export VLLM_FORCE_CUSTOM_ALL_REDUCE=${VLLM_FORCE_CUSTOM_ALL_REDUCE:-1}
 # Opt-in: measured parity at TP=2 and -18% at TP=4 vs the custom allreduce,
 # so the one-shot path is not the default (2026-09-12).
@@ -81,13 +82,14 @@ KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-7000000000}"
 COMPILATION_CONFIG="${COMPILATION_CONFIG:-{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"compile_ranges_endpoints\":[],\"max_cudagraph_capture_size\":16,\"cudagraph_capture_sizes\":[1,2,4,8,16],\"inductor_compile_config\":{\"combo_kernels\":false}}}"
 
 if [ "${ENABLE_PREFIX_CACHING:-1}" = "0" ]; then
-  PREFIX_CACHE_FLAG=""
+  PREFIX_CACHE_FLAGS=()
 else
-  PREFIX_CACHE_FLAG="--enable-prefix-caching"
+  PREFIX_CACHE_FLAGS=(--enable-prefix-caching)
 fi
 
 cd /tmp
-# EXTRA_ARGS e.g. --enforce-eager for isolation cells.
+# EXTRA_ARGS contains whitespace-separated flags, e.g. --enforce-eager.
+read -r -a extra_flags <<< "${EXTRA_ARGS:-}"
 exec python -m vllm.entrypoints.cli.main serve "$MODEL" \
   --port "$PORT" \
   --tensor-parallel-size "$TP" \
@@ -97,9 +99,9 @@ exec python -m vllm.entrypoints.cli.main serve "$MODEL" \
   --gpu-memory-utilization "${GPU_MEM:-0.90}" \
   --kv-cache-memory-bytes "$KV_CACHE_MEMORY" \
   --block-size 16 \
-  ${PREFIX_CACHE_FLAG} \
+  "${PREFIX_CACHE_FLAGS[@]}" \
   --language-model-only \
   --skip-mm-profiling \
   --trust-remote-code \
   --compilation-config "$COMPILATION_CONFIG" \
-  ${EXTRA_ARGS:-}
+  "${extra_flags[@]}"

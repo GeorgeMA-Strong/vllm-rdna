@@ -177,13 +177,20 @@ class CustomAllreduce:
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if not fully_connected and envs.VLLM_FORCE_CUSTOM_ALL_REDUCE:
-            # fully_connected only gates enablement + the 1stage/2stage
-            # heuristic; safe to force when PCIe P2P actually works.
-            logger.warning(
-                "Custom allreduce force-enabled by VLLM_FORCE_CUSTOM_ALL_REDUCE "
-                "(treating PCIe P2P as fully connected)."
-            )
-            fully_connected = True
+            # Do not pretend PCIe PIX is XGMI. gfx10x uses rdna_ar instead;
+            # lying here enabled the pull 1-stage kernel on >2 GPUs.
+            if current_platform.is_rocm():
+                logger.warning(
+                    "VLLM_FORCE_CUSTOM_ALL_REDUCE does not treat PCIe as "
+                    "XGMI fully-connected; gfx10x should use rdna_ar."
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce force-enabled by "
+                    "VLLM_FORCE_CUSTOM_ALL_REDUCE "
+                    "(treating PCIe P2P as fully connected)."
+                )
+                fully_connected = True
         if same_node and world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"

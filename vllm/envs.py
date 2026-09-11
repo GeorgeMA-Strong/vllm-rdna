@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_USE_RDNA2_FA: bool = True
     VLLM_FORCE_CUSTOM_ALL_REDUCE: bool = False
+    VLLM_RDNA_AR: str = "0"
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1383,12 +1384,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "DBG_VLLM_STEP_TIMING": lambda: (
         os.getenv("DBG_VLLM_STEP_TIMING", "False").lower() in ("true", "1")
     ),
-    # Bypass the "no more than two PCIe-only GPUs" XGMI-topology gate in
-    # CustomAllreduce. For RDNA systems where PCIe P2P actually works
-    # (P2PDMA-enabled kernel); init fails loudly if P2P is broken.
+    # On CUDA / MI300: bypass the "no more than two PCIe-only GPUs" gate in
+    # CustomAllreduce. On gfx10x this does **not** enable that pull kernel;
+    # it opts into rdna_ar (push over PCIe PIX) unless VLLM_RDNA_AR=0.
     "VLLM_FORCE_CUSTOM_ALL_REDUCE": lambda: (
         os.getenv("VLLM_FORCE_CUSTOM_ALL_REDUCE", "False").lower() in ("true", "1")
     ),
+    # gfx10x push one-shot all-reduce: "0" off (default), "1" on, "auto"
+    # only when the TP mesh is PIX (PCIe hops<=2 / same switch).
+    "VLLM_RDNA_AR": lambda: (os.getenv("VLLM_RDNA_AR", "0").strip().lower() or "0"),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
     # Recommended for large models to get allreduce

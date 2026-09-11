@@ -130,15 +130,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 ),
             )
 
-        if (
-            current_platform.is_rocm()
-            and 2 <= self.world_size <= 8
-            and os.getenv("VLLM_RDNA_AR", "0") == "1"
-        ):
-            # T44: gfx1030 one-shot all-reduce. Opt-in; default off.
+        if current_platform.is_rocm() and 2 <= self.world_size <= 8:
+            from vllm.distributed.device_communicators.rdna_p2p import (
+                rdna_ar_env_allows_probe,
+            )
             from vllm.platforms.rocm import on_gfx10x
 
-            if on_gfx10x():
+            # Raw getenv: envs.VLLM_RDNA_AR is "0" when unset and would
+            # hide FORCE opt-in.
+            if on_gfx10x() and rdna_ar_env_allows_probe(
+                os.environ.get("VLLM_RDNA_AR"),
+                envs.VLLM_FORCE_CUSTOM_ALL_REDUCE,
+            ):
                 from vllm.distributed.device_communicators.rdna_all_reduce import (
                     RdnaOneShotAllReduce,
                 )
@@ -148,7 +151,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                         group=self.cpu_group, device=self.device
                     )
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("rdna_ar: init failed (%s); using stock all-reduce", e)
+                    logger.warning(
+                        "rdna_ar: init failed (%s); using stock all-reduce", e
+                    )
                     self.rdna_ar_comm = None
         if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
             # Initialize a custom quick all-reduce implementation for AMD.
@@ -247,6 +252,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "QUICK_REDUCE",
             "FLASHINFER",
             "AITER_CUSTOM",
+            "RDNA_ONESHOT",
             "CUSTOM",
             "SYMM_MEM",
             "PYNCCL",
@@ -282,6 +288,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             enabled_ar_backends.append("FLASHINFER")
         if self.aiter_ar_comm is not None and not self.aiter_ar_comm.disabled:
             enabled_ar_backends.append("AITER_CUSTOM")
+        if self.rdna_ar_comm is not None and not self.rdna_ar_comm.disabled:
+            enabled_ar_backends.append("RDNA_ONESHOT")
         if self.ca_comm is not None and not self.ca_comm.disabled:
             enabled_ar_backends.append("CUSTOM")
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
@@ -307,8 +315,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
-        # always try quick reduce first, then flashinfer, then the AITER or vLLM
-        # custom allreduce, and then pynccl. (quick reduce just for ROCM MI3*)
+        # QR (MI3*), FlashInfer, AITER, gfx10x rdna_ar, then vLLM custom AR,
+        # then pynccl. rdna_ar must beat CUSTOM: FORCE used to construct the
+        # XGMI pull kernel on gfx10x and steal the push path.
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -336,6 +345,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        rdna_ar_comm = self.rdna_ar_comm
+        if rdna_ar_comm is not None and rdna_ar_comm.should_use(input_):
+            return rdna_ar_comm.all_reduce(input_)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -350,9 +362,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
             return out
-        rdna_ar_comm = self.rdna_ar_comm
-        if rdna_ar_comm is not None and rdna_ar_comm.should_use(input_):
-            return rdna_ar_comm.all_reduce(input_)
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()

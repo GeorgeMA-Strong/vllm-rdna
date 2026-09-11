@@ -772,7 +772,7 @@ class RocmPlatform(Platform):
             logger.info_once("Using Flash Attention backend for ViT model.")
             return AttentionBackendEnum.FLASH_ATTN
 
-        # RDNA2/RDNA3/RDNA4 (gfx10xx/gfx11xx/gfx12xx): Use Flash Attention Triton backend
+        # RDNA2/RDNA3/RDNA4 use the Flash Attention Triton backend.
         if (
             (on_gfx1x() or on_gfx10x())
             and flash_attn_triton_available()
@@ -837,6 +837,51 @@ class RocmPlatform(Platform):
                         logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
                         return False
         return True
+
+    @classmethod
+    @with_amdsmi_context
+    def is_pix_connected(cls, physical_device_ids: list[int]) -> bool:
+        """True if every pair is PIX (same PCI switch) or better.
+
+        PIX is PCIe hops<=2, matching amd-smi on a 4x V620 PEX88096 board.
+        XGMI 1-hop also qualifies. Two CPU-rooted 88096 boards are PHB,
+        not one PIX domain. NCCL_P2P_LEVEL does not widen this check.
+        """
+        from vllm.distributed.device_communicators.rdna_p2p import (
+            mesh_within_p2p_level,
+            p2p_level_from_env,
+        )
+
+        if len(physical_device_ids) < 2:
+            return False
+        handles_all = amdsmi_get_processor_handles()
+        try:
+            handles = [handles_all[i] for i in physical_device_ids]
+        except IndexError:
+            return False
+        pair_links: list[tuple[int, int]] = []
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i >= j:
+                    continue
+                try:
+                    link = amdsmi_topo_get_link_type(handle, peer_handle)
+                    pair_links.append((int(link["hops"]), int(link["type"])))
+                except (AmdSmiException, KeyError, TypeError, ValueError) as error:
+                    logger.error("AMD PCIe PIX detection failed.", exc_info=error)
+                    return False
+        # Always PIX (hops<=2 PCIE / XGMI 1-hop). NCCL_P2P_LEVEL is RCCL's
+        # cutoff; auto rdna_ar must not follow PHB/SYS and enable on a
+        # two-board CPU-rooted mesh.
+        ok = mesh_within_p2p_level(pair_links, "pix")
+        logger.info_once(
+            "ROCm PIX mesh (NCCL_P2P_LEVEL=%s): %s (pairs=%s)",
+            p2p_level_from_env(),
+            "connected" if ok else "not connected",
+            str(pair_links),
+            scope="global",
+        )
+        return ok
 
     @classmethod
     @with_amdsmi_context
@@ -1007,7 +1052,12 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # Opt-in escape hatch for PCIe-only RDNA boxes with working P2P.
+        # gfx10x uses rdna_ar (push over PCIe PIX). The XGMI pull custom
+        # AR must not be constructed there — FORCE used to enable it and
+        # steal the fast path.
+        if on_gfx10x():
+            return False
+        # Opt-in escape hatch for non-RDNA PCIe boxes with working P2P.
         if envs.VLLM_FORCE_CUSTOM_ALL_REDUCE:
             return True
         # We only enable custom allreduce for MI300 series
