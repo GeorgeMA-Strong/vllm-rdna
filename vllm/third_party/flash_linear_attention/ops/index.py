@@ -25,8 +25,16 @@ def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Te
     # This will be fixed by https://github.com/vllm-project/vllm/pull/51540.
     with gpu_sync_allowed():
         chunk_counts = triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
-    indices = torch.cat([torch.arange(n) for n in chunk_counts])
-    chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+    # Counting local-index zeros renumbers sequences when an empty one has no
+    # chunks. Preserve the original sequence IDs, including gaps and empty input.
+    chunk_indices = torch.tensor(
+        [
+            (sequence_idx, chunk_idx)
+            for sequence_idx, count in enumerate(chunk_counts)
+            for chunk_idx in range(count)
+        ],
+        dtype=cu_seqlens.dtype,
+    ).reshape(-1, 2)
     return chunk_indices.to(
         device=cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True
     )

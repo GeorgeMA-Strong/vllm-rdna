@@ -60,6 +60,10 @@ class MambaBase(AttentionLayerBase):
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         pass
 
+    @property
+    def is_kv_cache_tp_replicated(self) -> bool:
+        return False
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
@@ -71,6 +75,7 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
+            tp_replicated=self.is_kv_cache_tp_replicated,
             # RecoverSSM verifies the whole window off one checkpoint, so it
             # never writes the baseline's per-draft-token state slots.
             num_speculative_blocks=(

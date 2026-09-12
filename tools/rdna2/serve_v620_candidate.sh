@@ -64,7 +64,7 @@ command=("$venv/bin/python" -m vllm.entrypoints.openai.api_server
     --kv-cache-memory-bytes 4294967296
     --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[2,4,8]}'
     --engram-config '{"cpu_offload":true}'
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder
+    --enable-auto-tool-choice --tool-call-parser qwen3_xml
     --reasoning-parser qwen3
     --default-chat-template-kwargs '{"enable_thinking":false}'
     --limit-mm-per-prompt "$mm_limit"

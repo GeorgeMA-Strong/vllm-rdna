@@ -4,6 +4,7 @@
 import math
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -306,6 +307,40 @@ def test_qsa_rope_uses_platform_dispatch() -> None:
     torch.testing.assert_close(output[..., 2:], tensor[..., 2:])
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("is_neox_style", [False, True])
+def test_qsa_native_rope_matches_independent_reference(dtype, is_neox_style):
+    torch.manual_seed(620)
+    tensor = torch.randn(4, 3, 256, device="cuda", dtype=dtype)
+    positions = torch.tensor([3, 0, 2, 1], device="cuda")
+    angles = torch.randn(4, 64, device="cuda")
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(dtype)
+    rotary = SimpleNamespace(
+        rotary_dim=128,
+        is_neox_style=is_neox_style,
+        _match_cos_sin_cache_dtype=lambda _: cache,
+    )
+    expected = tensor.float().clone()
+    rotated = tensor[..., :128].float()
+    cos, sin = cache[positions].float().chunk(2, dim=-1)
+    cos, sin = cos[:, None], sin[:, None]
+    if is_neox_style:
+        first, second = rotated.chunk(2, dim=-1)
+        expected[..., :128] = torch.cat(
+            (first * cos - second * sin, second * cos + first * sin), dim=-1
+        )
+    else:
+        first, second = rotated[..., ::2], rotated[..., 1::2]
+        expected[..., :128:2] = first * cos - second * sin
+        expected[..., 1:128:2] = second * cos + first * sin
+    actual = apply_qsa_rope(rotary, positions, tensor)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-3
+    torch.testing.assert_close(
+        actual, expected.to(dtype), rtol=tolerance, atol=tolerance
+    )
+    torch.testing.assert_close(actual[..., 128:], tensor[..., 128:], rtol=0, atol=0)
+
+
 def test_qsa_rmsnorm_uses_portable_implementation(default_vllm_config) -> None:
     norm = GemmaRMSNorm(4, eps=1e-6)
     norm.weight.data.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4]))
@@ -492,3 +527,28 @@ def test_qsa_sparse_paged_attention_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_ple_runtime_cache_spec_preserves_tp_replication() -> None:
+    """PLE must not be grouped with the differently shaped TP-sharded GDN state."""
+    from vllm.models.qwen4_exp.amd.ple_layer import Qwen4ExpPLELayer
+
+    layer_type = Qwen4ExpPLELayer
+    layer = object.__new__(layer_type)
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_block_size=64,
+            mamba_page_size_padded=None,
+            mamba_cache_mode="align",
+            use_kda_recoverssm=False,
+        ),
+        num_speculative_tokens=1,
+    )
+    with (
+        patch.object(layer_type, "get_state_shape", return_value=((3, 32),)),
+        patch.object(layer_type, "get_state_dtype", return_value=(torch.float16,)),
+    ):
+        spec = layer.get_kv_cache_spec(config)
+    assert spec.tp_replicated is True
+    assert spec.shapes == ((3, 32),)
+    assert spec.num_speculative_blocks == 1
