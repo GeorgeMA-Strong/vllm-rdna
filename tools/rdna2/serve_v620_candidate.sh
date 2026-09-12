@@ -45,10 +45,9 @@ export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
 export VLLM_ROCM_USE_AITER=0
 export TORCH_BLAS_PREFER_HIPBLASLT=0
 
-speculative_args=()
-if (( mtp_tokens > 0 )); then
-    speculative_args=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$mtp_tokens}")
-fi
+decode_width=$((mtp_tokens + 1))
+capture_sizes="[$decode_width,$((decode_width * 2)),$((decode_width * 4))]"
+compilation_config="{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":$capture_sizes}"
 if [[ -z ${V620_MM_LIMIT:-} ]]; then
     printf 'Set V620_MM_LIMIT explicitly for this candidate memory test.\n' >&2
     printf 'Use a JSON image/video count matching your intended workload.\n' >&2
@@ -62,14 +61,16 @@ command=("$venv/bin/python" -m vllm.entrypoints.openai.api_server
     --dtype float16 --max-model-len 262144
     --max-num-seqs 4 --max-num-batched-tokens 2048
     --kv-cache-memory-bytes 4294967296
-    --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[2,4,8]}'
+    --compilation-config "$compilation_config"
     --engram-config '{"cpu_offload":true}'
     --enable-auto-tool-choice --tool-call-parser qwen3_xml
     --reasoning-parser qwen3
     --default-chat-template-kwargs '{"enable_thinking":false}'
     --limit-mm-per-prompt "$mm_limit"
-    --mm-processor-kwargs '{"max_pixels":1638400}'
-    "${speculative_args[@]}")
+    --mm-processor-kwargs '{"max_pixels":1638400}')
+if (( mtp_tokens > 0 )); then
+    command+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$mtp_tokens}")
+fi
 if [[ ${1:-} == --dry-run ]]; then
     shift
     printf 'Source: %s\nEnvironment: %s\nCache: %s\n' "$source_dir" "$venv" "$VLLM_CACHE_ROOT"
