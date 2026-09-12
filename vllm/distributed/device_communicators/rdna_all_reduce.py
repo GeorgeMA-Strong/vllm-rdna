@@ -97,7 +97,7 @@ class RdnaOneShotAllReduce:
         for r in range(self.world_size):
             if r == self.rank and err is None:
                 try:
-                    with torch.accelerator.device_index(device):
+                    with torch.accelerator.device_index(dev_idx):
                         packed = ops.rdna_ar_init(
                             self.rank,
                             self.world_size,
@@ -126,7 +126,7 @@ class RdnaOneShotAllReduce:
         )
         err = None
         try:
-            with torch.accelerator.device_index(device):
+            with torch.accelerator.device_index(dev_idx):
                 ops.rdna_ar_connect(self.handle, buf.contiguous())
         except Exception as e:  # noqa: BLE001
             err = str(e)
@@ -178,10 +178,15 @@ class RdnaOneShotAllReduce:
         import time
 
         debug = os.environ.get("VLLM_RDNA_AR_DEBUG") == "1"
+        dev_idx = (
+            device.index
+            if device.index is not None
+            else torch.accelerator.current_device_index()
+        )
         REPEATS = 3
         err: str | None = None
         try:
-            with torch.accelerator.device_index(device):
+            with torch.accelerator.device_index(dev_idx):
                 for trial, numel in enumerate((1024, 4096, self.max_bytes // 2)):
                     inp = torch.full(
                         (numel,),
@@ -211,7 +216,7 @@ class RdnaOneShotAllReduce:
                         try:
                             t0 = time.perf_counter()
                             out = self._ops.rdna_ar_all_reduce(self.handle, inp)
-                            torch.accelerator.synchronize(device)
+                            torch.accelerator.synchronize(dev_idx)
                             dt = time.perf_counter() - t0
                             if debug:
                                 print(
