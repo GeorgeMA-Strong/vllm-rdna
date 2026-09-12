@@ -10,6 +10,7 @@ single Triton launch. See :func:`fused_qk_rmsnorm_rope_gate`.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -196,6 +197,6 @@ def fused_qk_rmsnorm_rope_gate(
         ROT_HALF_BLOCK=rot_half_block,
         HAS_PASS=rotary_dim < head_dim,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=1 if current_platform.is_rocm() else 2,
     )
     return q_out, k_out, gate_out

@@ -206,6 +206,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+        elif current_platform.is_rocm():
+            from vllm.model_executor.layers import rdna_dense_int8
+
+            rdna_dense_int8.make_shadow(layer)
 
     def apply(
         self,
@@ -215,6 +219,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if hasattr(layer, "weight_i8"):
+            from vllm.model_executor.layers import rdna_ops  # noqa: F401
+
+            return torch.ops.vllm.rdna_dense_gemm(
+                x, layer.weight, layer.weight_i8, layer.weight_i8_scale, bias
+            )
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 
