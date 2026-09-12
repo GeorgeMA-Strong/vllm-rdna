@@ -1,9 +1,9 @@
 # V620 candidate integration — 2026-09-12
 
-This is an unqualified development candidate. No SSH connection, remote command,
-server build, package installation, inference request, service restart, or model
-download was performed during this integration. The published FP16 deployment
-has not been replaced. Historical benchmark results are not candidate results.
+This remains a development candidate. The initial integration was local only.
+After remote testing was authorized, its native extensions were built and tested
+in a separate installation on the four V620s. The stable installation is preserved;
+it has not been replaced. Historical benchmark results are not candidate results.
 
 ## Isolation and stable baseline
 
@@ -11,18 +11,18 @@ has not been replaced. Historical benchmark results are not candidate results.
 - Local preservation tag: `stable/v620-fp16-2026-09-12`.
 - A checksummed source archive is outside this checkout, under the workspace's
   `stable-releases/v620-fp16-2026-09-12/` directory.
-- That archive contains source, **not the server's built extensions or virtual
-  environment**. A remote runtime snapshot remains pending because remote work
-  is explicitly prohibited for this stage.
+- That local archive contains source only. A separate, verified server snapshot
+  now preserves source, built extensions, environment, Python runtime, tools and
+  the boot unit at
+  `/home/george/v620-stable-releases/2026-09-12-before-refresh`.
 - Local candidate: `vllm-rdna-testing`, branch `codex/v620-rdna-refresh`.
-- Future remote candidate root: `/home/george/v620-vllm-testing`; use `source`,
+- Remote candidate root: `/home/george/v620-vllm-testing`; use `source`,
   `.venv`, build outputs, caches, logs, and any test service exclusively there.
 - Protected deployment: `/home/george/v620-vllm/source`, its sibling `.venv`,
   `tools/v620-serve-intel-fp16.sh`, and
   `/home/george/.config/systemd/user/v620-serve-intel.service`.
 
-Before any future remote build, preserve the original built checkout, untracked
-extensions, environment/package inventory, launch scripts and systemd unit.
+The runtime snapshot was verified before the remote build.
 Keep the original installation at its existing paths; copied virtual environments
 can contain absolute paths. Do not change its boot service. Model files can be
 read from the existing model directory without editing or redownloading them.
@@ -31,7 +31,8 @@ The candidate launcher refuses an environment outside its testing root, refuses
 an import from another source checkout, and refuses to launch while another
 vLLM process for the same user exists. It never stops a process. It uses test port
 8081 by default, with `active` and `qwen3.8-flash-next` aliases. It changes no
-client settings. No test service has been installed.
+client settings. Transient test services are used during authorized validation;
+the existing stable boot unit is unchanged.
 
 ## Reused changes and preserved behavior
 
@@ -68,7 +69,7 @@ environment switches. Extra dense quantization is not required to use fusion.
 
 ## Candidate launch preview
 
-Only a dry-run has been performed. From the candidate checkout:
+To preview the command from the candidate checkout:
 
 ```bash
 V620_MM_LIMIT='{"image":4,"video":1}' \
@@ -125,9 +126,9 @@ Reproduce the CPU checks without downloading weights:
 
 ## Still required
 
-1. Once remote work is authorized, snapshot the stable runtime and build only in
-   the separate candidate installation, using matching wheel SDK/AMD-SMI bindings.
-2. Run native reference and changing-input graph tests, then short deterministic
+1. Stable snapshot and isolated gfx1030 build are complete, using the wheel SDK's
+   matching AMD-SMI bindings. Preserve these throughout subsequent experiments.
+2. Complete full-model and changing-input graph tests, then short deterministic
    text, tools, thinking, vision/video and MTP checks at concurrency 1/2/4.
 3. Establish coherent group-16 INT4 PLE output against the BF16-table control;
    packing/hash/transfer checks alone do not establish model quality.
@@ -144,5 +145,40 @@ Reproduce the CPU checks without downloading weights:
    model behavior and benchmark descriptions have been reviewed and qualified.
    The published PR has not been force-pushed by this local integration.
 
-AI assistance was used. This document records source reuse and local checks,
-not a new GPU performance or model-quality claim.
+## Server regression results
+
+The native suite passes 121 tests. It exposed and now covers shared-memory
+write races and padded gate batch strides in the GDN output kernel, and empty
+sequence IDs in FLA chunk metadata. QSA native dispatch now checks the tensor
+device. The numerical MoE reference models FP16 workspace and output rounding,
+with separate finite-input and overflow cases. The production MoE arithmetic
+and test tolerances were unchanged by that reference correction.
+
+The first model launch loaded weights but failed because the integration dropped
+the stable runtime PLE replication flag. Restoring that flag exposed missing
+mixed-state V2 handling. The missing framework portions of upstream
+`e126687a9` (PR #53896), plus the copyable-prefix correction in `91752b7a3`
+(PR #54634), have been reused from the stable source history. These cover
+per-type GDN/PLE state copies, circular-cache slot/prefix handling and speculative
+query-row alignment. Validation passes 43 state-copy tests, 5 GPU block-table
+tests and 6 scheduling tests using an offline generated config.
+
+The corrected candidate served successfully. Its deterministic reference returned
+exactly `blue` with the same 21 prompt token IDs as stable and no reasoning tokens.
+Eight answer checks each at concurrency 1/2/4 passed, as did two synthetic vision
+checks. Observed readiness was 276 seconds; this is not a controlled cold/warm
+comparison because prior failed launches populated parts of the test caches.
+
+Uncached 1024-input/1-output prefill averaged 954.69 tok/s across three measured
+requests after warm-up. A random 128-input/64-output test at concurrency 1,
+two measured requests after warm-up, produced 40.70 output tok/s including prefill,
+20.69 ms TPOT (48.34 decode tok/s excluding the first token), 268.89 ms TTFT and
+58.75% MTP acceptance. These results do not establish an improvement over stable.
+The 32k/64k comparison and tools/video/broader quality checks remain outstanding.
+
+The run uses the original BF16 PLE table in CPU RAM as the stable control, not a
+qualified group-16 INT4 sidecar. Models and their configs are unchanged. The
+bounded driver stopped the candidate and restarted the original stable service.
+
+AI assistance was used. Full-model results must be recorded separately from
+kernel correctness and historical stable benchmarks.
