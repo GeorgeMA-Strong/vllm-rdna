@@ -664,24 +664,24 @@ class GPUModelRunner(
         # Under PP the drafter exists only on the last rank; the other ranks
         # keep None so the shared paths (profile/dummy runs, attn-metadata
         # isinstance dispatch) can still read the attribute.
-        self.drafter = None
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        self.drafter: (
+            NgramProposer  # noqa: F823
+            | NgramProposerGPU
+            | SuffixDecodingProposer
+            | EagleProposer
+            | DFlashProposer
+            | DraftModelProposer
+            | MedusaProposer
+            | ExtractHiddenStatesProposer
+            | Gemma4Proposer
+            | Step3p5MTPProposer
+            | Qwen4ExpMTPProposer
+            | None
+        ) = None
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                NgramProposer  # noqa: F823
-                | NgramProposerGPU
-                | SuffixDecodingProposer
-                | EagleProposer
-                | DFlashProposer
-                | DraftModelProposer
-                | MedusaProposer
-                | ExtractHiddenStatesProposer
-                | Gemma4Proposer
-                | Step3p5MTPProposer
-                | Qwen4ExpMTPProposer
-            )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
                     self.vllm_config
@@ -914,7 +914,8 @@ class GPUModelRunner(
             # NOTE: `mrope_positions` is implemented with one additional dummy
             # position on purpose to make it non-contiguous so that it can work
             # with torch compile.
-            # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
+            # See detailed explanation in
+            # https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
 
             # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
             # the modality of inputs. For text-only inputs, each dimension has
@@ -2715,7 +2716,9 @@ class GPUModelRunner(
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
-            elif self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
+            elif self.speculative_config and isinstance(
+                self.drafter, Step3p5MTPProposer
+            ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
@@ -5643,7 +5646,7 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if getattr(self, "drafter", None) is not None:
+                if self.drafter is not None:
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
                         self.drafter.load_model(self.model)

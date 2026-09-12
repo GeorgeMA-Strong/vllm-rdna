@@ -27,15 +27,14 @@ import os
 import torch
 from torch import nn
 
+# Eager registration of torch.ops.vllm.rdna_* (see rdna_dense_int8.py): a compile-cache
+# hit runs the cached graph before the lazy imports below would have executed.
+from vllm.model_executor.layers import rdna_ops  # noqa: F401
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
 from vllm.model_executor.models.utils import maybe_prefix
-
-# Eager registration of torch.ops.vllm.rdna_* (see rdna_dense_int8.py): a compile-cache
-# hit runs the cached graph before the lazy imports below would have executed.
-from vllm.model_executor.layers import rdna_ops  # noqa: F401
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
@@ -49,10 +48,10 @@ from .ops.hc import (
     hc_silu,
 )
 
-
 # ---------------------------------------------------------------------------
 # Gated-residual variant
 # ---------------------------------------------------------------------------
+
 
 def _rdna_weight(layer):
     """(weight, scale) for the fused decode kernels: int8 shadow if present."""

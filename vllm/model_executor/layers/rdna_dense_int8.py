@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """T45: int8 weight-only shadow copies of the dense fp16 projections for gfx1030 decode.
 
 On Qwen3.8-Flash-Next only the routed experts are quantised; the GDN/QSA
@@ -42,7 +43,9 @@ def enabled() -> bool:
     if _ENABLED is None:
         from vllm.platforms import current_platform
 
-        on = os.getenv("VLLM_RDNA_DENSE_INT8", "0") == "1" and current_platform.is_rocm()
+        on = (
+            os.getenv("VLLM_RDNA_DENSE_INT8", "0") == "1" and current_platform.is_rocm()
+        )
         if on:
             from vllm.platforms.rocm import on_gfx10x
 
@@ -52,7 +55,7 @@ def enabled() -> bool:
 
 
 def only_mode() -> bool:
-    """True when the fp16 weight is released after shadowing (VLLM_RDNA_DENSE_INT8_ONLY=1)."""
+    """Whether to release the FP16 weight after creating its INT8 shadow."""
     global _ONLY
     if _ONLY is None:
         _ONLY = enabled() and os.getenv("VLLM_RDNA_DENSE_INT8_ONLY", "0") == "1"
@@ -68,14 +71,17 @@ _SCRATCH: dict[tuple, torch.Tensor] = {}
 
 
 def dequant(weight_i8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """fp16 [N, K] view of the per-channel int8 shadow, written into a persistent scratch buffer.
+    """
+    fp16 [N, K] view of the per-channel int8 shadow, written into a persistent
+    scratch buffer.
 
-    One buffer per (rows, K, device) is allocated on first use and reused for every later call
-    of that shape, so prefill never churns short-lived N*K*2-byte temporaries through the caching
-    allocator (that churn fragmented it and OOMed a full-vocab logits allocation at 96 %). The
-    handful of shapes (GDN in/out, QSA qkv/o, shared expert, hc, one lm_head block) costs
-    ~100 MB/rank, allocated during the profile run and therefore inside vLLM's budget. Callers
-    must consume the result before the next dequant of the same shape.
+    One buffer per (rows, K, device) is allocated on first use and reused for every
+    later call of that shape, so prefill never churns short-lived N*K*2-byte
+    temporaries through the caching allocator (that churn fragmented it and OOMed a
+    full-vocab logits allocation at 96 %). The handful of shapes (GDN in/out, QSA
+    qkv/o, shared expert, hc, one lm_head block) costs ~100 MB/rank, allocated
+    during the profile run and therefore inside vLLM's budget. Callers must consume
+    the result before the next dequant of the same shape.
     """
     n, k = weight_i8.shape
     key = (n, k, weight_i8.device)
@@ -94,11 +100,14 @@ def linear_released(
     bias: torch.Tensor | None,
     block_rows: int = 8192,
 ) -> torch.Tensor:
-    """x @ dequant(weight_i8)^T + bias, dequantising `block_rows` output rows at a time.
+    """
+    x @ dequant(weight_i8)^T + bias, dequantising `block_rows` output rows at a
+    time.
 
-    A whole-weight temporary for the lm_head is 318 MB/rank; freed at once it stays reserved
-    in the caching allocator in a size the following full-vocab logits cannot reuse, which
-    OOMed a prompt_logprobs request at 96 % utilisation. 42 MB blocks fragment nothing.
+    A whole-weight temporary for the lm_head is 318 MB/rank; freed at once it stays
+    reserved in the caching allocator in a size the following full-vocab logits
+    cannot reuse, which OOMed a prompt_logprobs request at 96 % utilisation. 42 MB
+    blocks fragment nothing.
     """
     n = weight_i8.shape[0]
     if n <= block_rows:
@@ -115,7 +124,7 @@ def linear_released(
 def weight_for_gemm(
     weight: torch.Tensor, weight_i8: torch.Tensor | None, scale: torch.Tensor | None
 ) -> torch.Tensor:
-    """The fp16 weight for a prefill-shaped GEMM: the real one, or a dequantised shadow."""
+    """Return the FP16 weight or dequantized shadow for prefill GEMM."""
     if weight_i8 is not None and is_released(weight):
         return dequant(weight_i8, scale)
     return weight
@@ -123,7 +132,7 @@ def weight_for_gemm(
 
 @torch.no_grad()
 def make_shadow(layer: torch.nn.Module) -> None:
-    """Attach `weight_i8` / `weight_i8_scale` to a layer whose `weight` is fp16 [N, K]."""
+    """Attach an INT8 shadow and scales to an FP16 matrix layer."""
     if not enabled():
         return
     w = getattr(layer, "weight", None)
@@ -133,7 +142,7 @@ def make_shadow(layer: torch.nn.Module) -> None:
     if k % 16 != 0 or n < int(os.getenv("VLLM_RDNA_DENSE_INT8_MIN_ROWS", "64")):
         return
     amax = w.abs().amax(dim=1).float().clamp_min(1e-8)
-    scale = (amax / 127.0)
+    scale = amax / 127.0
     q = torch.round(w.float() / scale[:, None]).clamp_(-127, 127).to(torch.int8)
     layer.weight_i8 = q.contiguous()
     layer.weight_i8_scale = scale.to(torch.float16).contiguous()

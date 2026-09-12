@@ -186,17 +186,8 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self._ple_offload_worker_handle: Any | None = None
         self._ple_offload_enabled = self._has_ple_layers()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
-            if self._ple_offload_enabled:
-                self._validate_ple_offload_config()
-            elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
-                text_config = self.model_config.hf_text_config
-                logger.warning(
-                    "VLLM_PLE_CPU_OFFLOAD is enabled, but the model has no "
-                    "PLE layers (ple_layer_ids=%s); skipping PLE offload "
-                    "process creation.",
-                    getattr(text_config, "ple_layer_ids", None),
-                )
+        if self._ple_offload_enabled:
+            self._validate_ple_offload_config()
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
@@ -204,16 +195,19 @@ class Worker(WorkerBase):
         self._sleep_mode_backend: SleepModeBackend | None = None
 
     def _has_ple_layers(self) -> bool:
-        """Return whether this model configuration constructs PLE layers."""
-        if not envs.VLLM_PLE_CPU_OFFLOAD:
-            return False
-        text_config = self.model_config.hf_text_config
-        return bool(getattr(text_config, "ple_layer_ids", None))
+        engram = self.vllm_config.engram_config
+        return bool(
+            engram is not None
+            and engram.cpu_offload
+            and getattr(self.model_config.hf_text_config, "ple_layer_ids", None)
+        )
 
     def _validate_ple_offload_config(self) -> None:
         """Reject unsupported PLE offload execution modes."""
         parallel_config = self.parallel_config
         unsupported = []
+        if not self.use_v2_model_runner:
+            unsupported.append("model runner V1; use VLLM_USE_V2_MODEL_RUNNER=1")
         # ROCm reports device_type "cuda" but is_cuda() is False. The offload
         # primitives (stream write/wait-value, host register) are bound from
         # libamdhip64 by vllm.v1.ple_offload.hip_driver and verified working on

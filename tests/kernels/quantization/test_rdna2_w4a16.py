@@ -46,6 +46,7 @@ device = "cuda"
 WEIGHT_TYPE = scalar_types.uint4b8  # symmetric int4, bias = 8
 PACK_FACTOR = 8  # 8 x 4-bit nibbles per int32
 
+
 # Skip everything unless we are on the only architecture the kernel is built for.
 # Note: do NOT use `hasattr(torch.ops._rocm_C, "gptq_gemm_rdna2")` here —
 # `dir(torch.ops._rocm_C)` only returns ['name'] (the namespace object
@@ -178,7 +179,6 @@ def _run_kernel(
         act_type=torch.float16,
         group_size=group_size,
         zero_points=has_zp,
-        has_g_idx=False,
     )
     ok, reason = RDNA2W4A16LinearKernel.can_implement(config)
     assert ok, f"can_implement rejected a supported config: {reason}"
@@ -189,7 +189,6 @@ def _run_kernel(
         w_q_param_name="qweight",
         w_s_param_name="scales",
         w_zp_param_name="qzeros" if has_zp else None,
-        w_gidx_param_name=None,
     )
     kernel.process_weights_after_loading(layer)
     return kernel.apply_weights(layer, x_mk, bias=bias)
@@ -210,6 +209,55 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor):
 # Forward correctness
 # ---------------------------------------------------------------------------
 
+
+@gfx1030_only
+@pytest.mark.parametrize("M,K", [(1, 256), (1, 4096), (64, 256)])
+@pytest.mark.parametrize("scale", [0.003, 0.01, 0.03125, 1.0])
+def test_quantized_zero_is_exact_zero(M, K, scale, dist_init):
+    """Scaling the bit-trick offset must not introduce a weight bias."""
+    N, G = 256, 128
+    x = torch.ones((M, K), dtype=torch.float16, device=device)
+    q = torch.full((K, N), 8, dtype=torch.int32, device=device)
+    scales = torch.full((K // G, N), scale, dtype=torch.float16, device=device)
+
+    out = _run_kernel(x, q, scales, None, G, None)
+
+    torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@gfx1030_only
+@pytest.mark.parametrize("M", [1, 64])
+@pytest.mark.parametrize("zero_weights", [True, False])
+def test_prefill_handles_non_power_of_two_k_tiles(M, zero_weights):
+    """K=640 must never split into partial 32-element dequantization tiles."""
+    set_random_seed(42)
+    K, N, G = 640, 2560, 128
+    x = (torch.randn(M, K, device=device) * 0.25).half()
+    q = torch.full((K, N), 8, dtype=torch.int32, device=device)
+    if not zero_weights:
+        q.random_(0, 16)
+    packed = torch.zeros(K // 8, N, dtype=torch.int32, device=device)
+    for i in range(8):
+        packed |= q[i::8] << ((i // 2) * 4 + (i % 2) * 16)
+    scales = torch.full((K // G, N), 0.003, device=device).half()
+    zeros = torch.full((K // G, N // 8), 0x77777777, device=device, dtype=torch.int32)
+    out = torch.ops._rocm_C.gptq_gemm_rdna2_prefill(
+        x,
+        packed,
+        zeros,
+        scales,
+        torch.empty(0, device=device, dtype=torch.int32),
+        False,
+    )
+    if zero_weights:
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+    else:
+        weights = ((q.float() - 8) * scales.float().repeat_interleave(G, dim=0)).half()
+        ref = (x.float() @ weights.float()).half()
+        relative_l2 = (out.float() - ref.float()).norm() / ref.float().norm()
+        assert relative_l2 < 0.002
+
+
 # Coverage: each shape exercises one path of the 3-bucket dispatcher.
 # (M, K, N, G) and the bucket it routes to per _rdna2_w4a16_select_kernel:
 #   M <= 32, K < 4096                   -> prefill
@@ -218,12 +266,12 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor):
 #   32 < M <= 256, N >= 3072            -> exllama (gate/up-proj)
 #   M > 256                             -> exllama
 MKNG_SHAPES = [
-    (1, 128, 128, 128),     # prefill (M <= 32, K < 4096)
-    (2, 256, 256, 128),     # prefill
-    (8, 256, 512, 64),      # prefill
-    (8, 4096, 512, 128),    # rdna2_decode (K-gated)
-    (16, 512, 256, 128),    # prefill
-    (32, 512, 512, 64),     # prefill
+    (1, 128, 128, 128),  # prefill (M <= 32, K < 4096)
+    (2, 256, 256, 128),  # prefill
+    (8, 256, 512, 64),  # prefill
+    (8, 4096, 512, 128),  # rdna2_decode (K-gated)
+    (16, 512, 256, 128),  # prefill
+    (32, 512, 512, 64),  # prefill
     (64, 1024, 1024, 128),  # rdna2_decode (32 < M <= 256, N < 3072)
     (300, 512, 2048, 128),  # exllama (M > 256)
 ]

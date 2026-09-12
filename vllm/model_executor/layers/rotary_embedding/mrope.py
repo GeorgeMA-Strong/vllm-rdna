@@ -31,6 +31,7 @@ def _triton_mrope_forward(
     mrope_section_w: tl.constexpr,
     is_interleaved: tl.constexpr,
     is_neox_style: tl.constexpr,
+    PROMOTE_BF16: tl.constexpr,
 ):
     # Adapted from
     # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/qwen2vl_mrope.py
@@ -84,6 +85,12 @@ def _triton_mrope_forward(
 
     cos_row = t_cos_row + h_cos_row + w_cos_row
     sin_row = t_sin_row + h_sin_row + w_sin_row
+
+    if PROMOTE_BF16:
+        # RDNA2 has no packed BF16 dot instruction. Keep the rotation in
+        # FP32 to avoid LLVM selecting fdot2.bf16 for the multiply-adds.
+        cos_row = cos_row.to(tl.float32)
+        sin_row = sin_row.to(tl.float32)
 
     # ####################################################################
     # Load the two values in each rotary pair for the current token.
@@ -200,6 +207,11 @@ def triton_mrope(
     # NeoX, and other backends.
     use_single_wave = current_platform.is_rocm() and not is_neox_style and pad_rd <= 64
     num_warps = 1 if use_single_wave else 4
+    promote_bf16 = False
+    if current_platform.is_rocm() and q.dtype == torch.bfloat16:
+        from vllm.platforms.rocm import on_gfx10x
+
+        promote_bf16 = on_gfx10x()
     _triton_mrope_forward[(n_row,)](
         q,
         k,
@@ -218,6 +230,7 @@ def triton_mrope(
         mrope_section[2],
         mrope_interleaved,
         is_neox_style,
+        PROMOTE_BF16=promote_bf16,
         num_warps=num_warps,
     )
     return q, k

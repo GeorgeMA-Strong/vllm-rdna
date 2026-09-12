@@ -1,19 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import msgspec
 import pytest
 import torch
+from safetensors.torch import save_file
 
 import vllm.envs as envs
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config.device import DeviceConfig
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.ple_offload import connector as ple_connector
 from vllm.v1.ple_offload import worker as ple_offload_worker
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -53,6 +58,122 @@ class _WeightLoadingModel(torch.nn.Module):
             filtered_weights,
             mapper=self.hf_to_vllm_mapper,
         )
+
+
+def test_cpu_ple_weights_survive_meta_model_construction(monkeypatch):
+    """The shared BF16 RAM table must own storage before checkpoint copies."""
+    monkeypatch.setattr(ple_offload_layer, "_offload_worker_flag", True)
+    monkeypatch.setattr(envs, "VLLM_PLE_QUANT_DIR", "")
+    monkeypatch.setattr(envs, "VLLM_PLE_DISK_OFFLOAD_DIR", "")
+    with torch.device("meta"), set_default_torch_dtype(torch.bfloat16):
+        layer = _WeightLoadingPleLayer()
+        unrelated = torch.nn.Linear(2, 2)
+    assert unrelated.weight.is_meta
+    assert layer.weight.device.type == "cpu"
+    assert layer.weight.dtype == torch.bfloat16
+    expected = torch.tensor([3.0, 7.0], dtype=torch.bfloat16)
+    layer.weight.data.copy_(expected)
+    torch.testing.assert_close(layer.weight, expected)
+
+
+def test_gpu_ple_placeholder_does_not_allocate_table(monkeypatch):
+    monkeypatch.setattr(ple_offload_layer, "_offload_worker_flag", False)
+    monkeypatch.setattr(ple_offload_layer, "is_ple_cpu_offload_enabled", lambda: True)
+    with torch.device("meta"):
+        layer = _WeightLoadingPleLayer()
+    assert list(layer.parameters()) == []
+
+
+def test_dummy_ple_loading_preserves_hash_constants_and_workspace(monkeypatch):
+    """Synthetic weights must not corrupt the constructor's n-gram routing."""
+    monkeypatch.setattr(ple_offload_layer, "_offload_worker_flag", True)
+    monkeypatch.setattr(envs, "VLLM_PLE_QUANT_DIR", "")
+    monkeypatch.setattr(envs, "VLLM_PLE_DISK_OFFLOAD_DIR", "")
+    model = _WeightLoadingModel()
+    model.ple.register_buffer("layer_multipliers", torch.tensor([101, 307]))
+    model.ple.register_buffer("positions", torch.arange(8), persistent=False)
+    expected = {name: value.clone() for name, value in model.ple.named_buffers()}
+    monkeypatch.setattr(ple_offload_worker, "initialize_model", lambda **_: model)
+    monkeypatch.setattr(
+        ple_offload_worker,
+        "get_model_loader",
+        lambda _: ple_offload_worker.DummyModelLoader(
+            SimpleNamespace(
+                model_loader_extra_config=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker, "process_weights_after_loading", lambda *args: None
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.float32),
+        load_config=SimpleNamespace(),
+    )
+    runner = ple_offload_worker.PleOffloadRunner(config)
+    assert runner.layer_names == ["ple"]
+    assert torch.count_nonzero(model.ple.weight) == model.ple.weight.numel()
+    for name, value in model.ple.named_buffers():
+        torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_explicit_engram_setting_overrides_legacy_environment(monkeypatch, cpu_offload):
+    monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", not cpu_offload)
+    monkeypatch.setattr(
+        ple_offload_layer,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(engram_config=SimpleNamespace(cpu_offload=cpu_offload)),
+    )
+    assert ple_offload_layer.is_ple_cpu_offload_enabled() is cpu_offload
+
+
+@pytest.mark.parametrize(
+    ("layout", "weight_key", "dtype", "scale_dtype"),
+    [
+        ("e4m3-per-row", "weight_fp8", torch.float8_e4m3fn, torch.float32),
+        ("int8_per_row", "weight_i8", torch.int8, torch.float16),
+    ],
+)
+def test_byte_ram_table_preserves_reordered_cross_shard_lookups(
+    monkeypatch, tmp_path, layout, weight_key, dtype, scale_dtype
+):
+    """Byte storage must preserve signed values and cross-shard row ordering."""
+    monkeypatch.setattr(ple_offload_worker._PleQuantTable, "ROWS_PER_SHARD", 4)
+    (tmp_path / "META.json").write_text(
+        json.dumps(dict(layout=layout, rows=8, width=8, shards=2))
+    )
+    weights = torch.arange(-32, 32).reshape(8, 8).to(dtype)
+    scales = torch.linspace(0.1, 0.8, 8).to(scale_dtype)
+    for shard in range(2):
+        rows = slice(shard * 4, (shard + 1) * 4)
+        save_file(
+            {weight_key: weights[rows], "weight_scale": scales[rows]},
+            str(tmp_path / f"shard_{shard}.safetensors"),
+        )
+    table = ple_offload_worker._PleQuantTable(str(tmp_path), 8, 8)
+    ids = torch.tensor([7, 0, 4, 7, 3])
+    out = torch.empty(5, 8, dtype=torch.bfloat16)
+
+    table.gather_into(ids, out)
+
+    expected = (weights.float() * scales[:, None])[ids].bfloat16()
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+def test_ple_completion_timeout_covers_decode_and_prefill(monkeypatch, num_tokens):
+    """Prefill sleep-polling must not bypass the worker failure deadline."""
+    connector = ple_connector.PleOffloadConnector.__new__(
+        ple_connector.PleOffloadConnector
+    )
+    connector._page_np = [0]
+    connector._wait_ema = 0.0
+    ticks = iter([0.0, 601.0])
+    monkeypatch.setattr(ple_connector.time, "perf_counter", lambda: next(ticks))
+    monkeypatch.setattr(ple_connector.time, "sleep", lambda _: None)
+    with pytest.raises(RuntimeError, match="did not complete launch 1 within 600 s"):
+        connector._wait_lookup_done(1, num_tokens)
 
 
 class _TestDefaultModelLoader:
@@ -272,7 +393,10 @@ def test_ple_offload_requires_ple_layers(
     worker.model_config = SimpleNamespace(  # type: ignore[assignment]
         hf_text_config=SimpleNamespace(ple_layer_ids=ple_layer_ids)
     )
-    monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    worker.vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=True)
+    )
+    monkeypatch.setattr(gpu_worker_module.current_platform, "is_rocm", lambda: True)
 
     assert worker._has_ple_layers() is expected
 
@@ -307,7 +431,9 @@ def test_ple_offload_accepts_supported_configurations(
     )
     worker.model_config = SimpleNamespace(architecture=architecture)
     worker.vllm_config = SimpleNamespace(weight_transfer_config=None)
-    monkeypatch.setattr(gpu_worker_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        gpu_worker_module.current_platform, "is_cuda_alike", lambda: True
+    )
 
     if unsupported_setting is None:
         worker._validate_ple_offload_config()
@@ -369,7 +495,7 @@ def test_only_dp0_tp0_spawns_shared_ple_offload_worker(
 def test_offload_distributed_sets_config_only_for_model_parallel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     calls = []
 
     # The Offload subprocess may inherit DP environment variables from a GPU
@@ -403,7 +529,7 @@ def test_offload_distributed_sets_config_only_for_model_parallel(
         lambda **_: "/tmp/test-ple-offload",
     )
 
-    ple_offload_worker._init_offload_distributed()
+    ple_offload_worker._init_offload_distributed(vllm_config)
 
     offload_config = calls[1][1]
     assert offload_config is not vllm_config
@@ -482,6 +608,8 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
                     input_ids_buf=torch.full((8,), dp_rank, dtype=torch.int32),
                     query_start_loc_buf=torch.zeros(4, dtype=torch.int32),
                     ngram_context_buf=None,
+                    done_seq_buf=torch.zeros(1, dtype=torch.int32),
+                    out_bufs={"ple": torch.empty(8, 2)},
                 )
             )
 
@@ -491,7 +619,7 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
         kwargs.pop("pin_memory", None)
         return original_empty(*args, **kwargs)
 
-    monkeypatch.setattr(ple_offload_worker.pickle, "loads", lambda item: item)
+    monkeypatch.setattr(ple_offload_worker.ForkingPickler, "loads", lambda item: item)
     monkeypatch.setattr(ple_offload_worker.torch, "empty", unpinned_empty)
     monkeypatch.setattr(
         ple_offload_worker.torch.cuda,
@@ -515,7 +643,7 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
     assert set(runner._pinned_bufs) == {0, 1}
 
 
-def test_ple_offload_runner_routes_requests_layer_first(
+def test_ple_offload_runner_publishes_shared_results_in_request_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events = []
@@ -523,6 +651,7 @@ def test_ple_offload_runner_routes_requests_layer_first(
     class FakeLayer:
         def __init__(self, name: str):
             self.name = name
+            self.ngram_embedding = SimpleNamespace()
 
         def forward_impl(
             self,
@@ -555,16 +684,24 @@ def test_ple_offload_runner_routes_requests_layer_first(
             gpu_output_buffer=torch.empty(4, 2, dtype=torch.int32),
             sem=FakeSemaphore(),
             copy_stream=FakeStream(),  # type: ignore[arg-type]
+            done_seq_buf=torch.zeros(1, dtype=torch.int32),
+            out_buf=torch.empty(4, 2, dtype=torch.int32),
         )
 
     runner = ple_offload_worker.PleOffloadRunner.__new__(
         ple_offload_worker.PleOffloadRunner
     )
     runner._clamp_input_ids = True
+    runner._debug_delay_s = 0
+    runner._debug_trace = None
+    runner._fused_check = False
+    runner._done_seq = {}
+    runner._t_lookup = runner._t_total = 0.0
+    runner._n_timed = runner._n_fused = 0
     runner._layers = {"ple0": FakeLayer("ple0"), "ple1": FakeLayer("ple1")}
     runner._worker_targets = {
-        0: {"ple0": [target()], "ple1": [target()]},
-        1: {"ple0": [target()], "ple1": [target()]},
+        0: {"ple0": [target(), target()], "ple1": [target(), target()]},
+        1: {"ple0": [target(), target()], "ple1": [target(), target()]},
     }
     runner._input_bufs = {
         0: ple_offload_worker.PleOffloadInputBuffers(
@@ -608,18 +745,24 @@ def test_ple_offload_runner_routes_requests_layer_first(
 
     assert events == [
         ("ple0", 0),
-        ("ple0", 20),
         ("ple1", 0),
+        ("ple0", 20),
         ("ple1", 20),
     ]
-    torch.testing.assert_close(
-        runner._worker_targets[0]["ple1"][0].gpu_output_buffer[:2],
-        torch.tensor([[0, 0], [11, 11]], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        runner._worker_targets[1]["ple1"][0].gpu_output_buffer[:1],
-        torch.tensor([[20, 20]], dtype=torch.int32),
-    )
+    for layer_targets in runner._worker_targets[0].values():
+        for output_target in layer_targets:
+            torch.testing.assert_close(
+                output_target.out_buf[:2],
+                torch.tensor([[0, 0], [11, 11]], dtype=torch.int32),
+            )
+            assert output_target.done_seq_buf.item() == 1
+    for layer_targets in runner._worker_targets[1].values():
+        for output_target in layer_targets:
+            torch.testing.assert_close(
+                output_target.out_buf[:1],
+                torch.tensor([[20, 20]], dtype=torch.int32),
+            )
+            assert output_target.done_seq_buf.item() == 1
 
 
 def test_wait_for_ready_closes_pipe() -> None:

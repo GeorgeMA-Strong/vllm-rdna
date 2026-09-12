@@ -20,27 +20,24 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 """
 
 import contextlib
+import copy
 import json
 import mmap as _mmap
 import multiprocessing.process
 import os
-import pickle
 import signal
 import tempfile
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
+from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
 
-import time
-
-import numpy as np
-_HOPS = os.getenv("PLE_OFFLOAD_DEBUG_HOPS", "0") == "1"  # see connector.py: per-hop round-trip stamps (test hook)
-_DOORBELL = os.getenv("PLE_OFFLOAD_DOORBELL", "1") == "1"  # see connector.py: requests via the shared page
-_DB_SEQ, _DB_NTOK, _DB_NREQ = 4, 5, 6
-_DB_SPIN_S = 0.05  # keep spinning this long after the last request, then sleep-poll (idle CPU stays low)
 import msgspec
+import numpy as np
+import regex as re
 import torch
 import torch.distributed as dist
 import zmq
@@ -64,7 +61,7 @@ from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
 )
-from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
+from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.ple_offload.protocol import (
@@ -72,6 +69,15 @@ from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
 )
+
+_HOPS = (
+    os.getenv("PLE_OFFLOAD_DEBUG_HOPS", "0") == "1"
+)  # see connector.py: per-hop round-trip stamps (test hook)
+_DOORBELL = (
+    os.getenv("PLE_OFFLOAD_DOORBELL", "1") == "1"
+)  # see connector.py: requests via the shared page
+_DB_SEQ, _DB_NTOK, _DB_NREQ = 4, 5, 6
+_DB_SPIN_S = 0.05  # Spin briefly after a request, then sleep-poll while idle.
 
 logger = init_logger(__name__)
 
@@ -84,7 +90,9 @@ class PleOffloadOutputTarget:
     gpu_output_buffer: torch.Tensor  # IPC-mapped GPU buffer for this TP worker
     sem: CpuGpuSemaphore  # semaphore paired with gpu_output_buffer
     copy_stream: torch.cuda.Stream
-    done_seq_buf: torch.Tensor | None = None  # shared CPU page (int32) of completed requests
+    done_seq_buf: torch.Tensor | None = (
+        None  # shared CPU page (int32) of completed requests
+    )
     out_buf: torch.Tensor | None = None  # this TP worker's shared pinned result buffer
 
 
@@ -126,7 +134,7 @@ class PleOffloadWorkerHandle:
             self.proc.join(timeout=5)
 
 
-def _init_offload_distributed() -> None:
+def _init_offload_distributed(vllm_config: VllmConfig) -> None:
     """Initialize the single-rank Gloo world required by TP-aware layers."""
     if dist.is_initialized():
         return
@@ -147,7 +155,7 @@ def _init_offload_distributed() -> None:
     # world, regardless of any DP environment variables inherited from the GPU
     # worker. The real DP/TP configuration is used later for model construction,
     # registration, and request routing.
-    offload_config = VllmConfig()
+    offload_config = copy.deepcopy(vllm_config)
     offload_parallel_config = offload_config.parallel_config
     offload_parallel_config.data_parallel_size = 1
     offload_parallel_config.data_parallel_size_local = 1
@@ -288,7 +296,7 @@ class PleOffloadWorker:
 
             # Initialize Gloo before installing the real VllmConfig. This keeps
             # the CPU process in an isolated rank-zero, world-size-one group.
-            _init_offload_distributed()
+            _init_offload_distributed(vllm_config)
 
             # Model components read the active VllmConfig while the meta model
             # is constructed, so keep the context around runner initialization.
@@ -334,9 +342,7 @@ class PleOffloadWorker:
 
 
 def _ple_disk_shard_of(mapped_name: str) -> str | None:
-    """"<layer>.a.b.shard_3.weight" -> "<layer>.a.b" (the parameter the shard fills)."""
-    import re
-
+    """Return the parent table name of a checkpoint shard."""
     m = re.match(r"^(.*)\.shard_\d+\.weight$", mapped_name)
     return m.group(1) if m else None
 
@@ -345,11 +351,12 @@ def _ple_disk_dir() -> str | None:
     return envs.VLLM_PLE_DISK_OFFLOAD_DIR or None
 
 
-_PLE_DISK_MAPS: dict[str, object] = {}
+_PLE_DISK_MAPS: dict[str, np.memmap] = {}
 
 
-def _disk_backed_tensor(path: str, shape: tuple[int, ...], dtype: torch.dtype,
-                        writable: bool) -> torch.Tensor:
+def _disk_backed_tensor(
+    path: str, shape: tuple[int, ...], dtype: torch.dtype, writable: bool
+) -> torch.Tensor:
     """Map ``path`` as a tensor of ``shape``/``dtype``.
 
     numpy has no bfloat16, so the file is mapped with a same-width integer dtype
@@ -360,8 +367,12 @@ def _disk_backed_tensor(path: str, shape: tuple[int, ...], dtype: torch.dtype,
     """
     import numpy as np
 
-    _NP = {torch.bfloat16: (np.uint16, torch.uint16), torch.float16: (np.uint16, torch.uint16),
-           torch.float32: (np.uint32, torch.uint32), torch.float8_e4m3fn: (np.uint8, torch.uint8)}
+    _NP = {
+        torch.bfloat16: (np.uint16, torch.uint16),
+        torch.float16: (np.uint16, torch.uint16),
+        torch.float32: (np.uint32, torch.uint32),
+        torch.float8_e4m3fn: (np.uint8, torch.uint8),
+    }
     np_dtype, torch_int = _NP[dtype]
     arr = np.memmap(path, dtype=np_dtype, mode="r+" if writable else "c", shape=shape)
     with contextlib.suppress(Exception):
@@ -373,12 +384,11 @@ def _disk_backed_tensor(path: str, shape: tuple[int, ...], dtype: torch.dtype,
 # ---------------------------------------------------------------------------
 # Quantized PLE sidecar (primitive-ai/Qwen3.8-Flash-Next-PLE-quant).
 #
-# The bf16 n-gram table is 95-102 GB, which does not fit this host's RAM, so the
-# disk path below pages it and every decoded token pays random read latency. The
-# sidecar ships the same table at int4 g16 (32 GB) / fp8 per-row (49 GB), small
-# enough to sit in page cache. Lifted from that repo's worker overlay: pure torch
-# plus safetensors mmap, no CUDA, so it runs unchanged on ROCm.
+# Optional compressed RAM tables reduce host memory and loading work. The donor
+# sidecars use INT4 g16 or FP8 per-row; INT8 per-row is also supported for local
+# comparisons. Lookup dequantizes selected rows on CPU before the H2D copy.
 # ---------------------------------------------------------------------------
+
 
 class _PleQuantTable:
     """Shard-mmapped quantized n-gram table; gathers dequantize to BF16."""
@@ -391,7 +401,8 @@ class _PleQuantTable:
 
         from safetensors import safe_open
 
-        meta = json.load(open(os.path.join(quant_dir, "META.json")))
+        with open(os.path.join(quant_dir, "META.json")) as metadata_file:
+            meta = json.load(metadata_file)
         self.layout = meta["layout"]
         assert meta["rows"] == total_rows and meta["width"] == width, (
             f"sidecar built for {meta['rows']}x{meta['width']}, "
@@ -404,35 +415,56 @@ class _PleQuantTable:
             key = "weight_e2m1"
         elif "e4m3" in self.layout:
             key = "weight_fp8"
+        elif self.layout == "int8_per_row":
+            key = "weight_i8"
         else:
             key = "weight_i4"
         self._q, self._s, self._s2 = [], [], []
         for n in range(n_shards):
-            f = safe_open(os.path.join(quant_dir, f"shard_{n}.safetensors"),
-                          framework="pt")
+            f = safe_open(
+                os.path.join(quant_dir, f"shard_{n}.safetensors"), framework="pt"
+            )
             self._q.append(f.get_tensor(key))
             self._s.append(f.get_tensor("weight_scale"))
+            tensor_names = f.keys()
             self._s2.append(
                 f.get_tensor("weight_scale_2").item()
-                if "weight_scale_2" in f.keys() else 1.0
+                if "weight_scale_2" in tensor_names
+                else 1.0
             )
         self.width = width
-        self._lut = None
+        self._lut: torch.Tensor | None = None
         self.quant_dir = quant_dir
         self.n_shards = n_shards
         # zero-copy numpy views of the same mmaps for the small-batch fused path
-        # plain ndarray views (an np.memmap subclass view costs microseconds per row index)
-        self._q_np = [t.numpy().view(np.ndarray) for t in self._q]
-        self._s_np = [t.numpy().view(np.ndarray) for t in self._s]
-        logger.info("PLE quant table: %s, %d shards mmapped from %s",
-                    self.layout, n_shards, quant_dir)
+        # plain ndarray views (an np.memmap subclass view costs microseconds per row
+        # index)
+        # NumPy has no FP8 dtype. Non-INT4 layouts only use these views for
+        # prefaulting, so expose their storage bytes without converting data.
+        self._q_np = [t.view(torch.uint8).numpy().view(np.ndarray) for t in self._q]
+        self._s_np = [
+            (t if "int4" in self.layout else t.view(torch.uint8))
+            .numpy()
+            .view(np.ndarray)
+            for t in self._s
+        ]
+        logger.info(
+            "PLE quant table: %s, %d shards mmapped from %s",
+            self.layout,
+            n_shards,
+            quant_dir,
+        )
 
     def populate_page_tables(self) -> bool:
-        """madvise(MADV_POPULATE_READ) every shard mapping: faults the whole table into the
+        """Populate every shard's page tables with MADV_POPULATE_READ.
+
+        This faults the whole table into the
         page cache AND pre-maps it in this process, so a decode gather never takes a
         first-touch minor fault (~3.8 us/page -> 0.5 us; 16 rows/token). ~1.6 s warm.
-        Returns False when the kernel refuses (pre-5.14): caller falls back to reading."""
+        Return False when the kernel refuses; the caller falls back to reading.
+        """
         import ctypes
+
         try:
             libc = ctypes.CDLL("libc.so.6", use_errno=True)
         except OSError:
@@ -441,9 +473,17 @@ class _PleQuantTable:
         for arr in self._q_np + self._s_np:
             base = arr.ctypes.data
             off = base & 4095
-            rc = libc.madvise(ctypes.c_void_p(base - off), ctypes.c_size_t(arr.nbytes + off), MADV_POPULATE_READ)
+            rc = libc.madvise(
+                ctypes.c_void_p(base - off),
+                ctypes.c_size_t(arr.nbytes + off),
+                MADV_POPULATE_READ,
+            )
             if rc != 0:
-                logger.warning("PLE populate: madvise failed (errno %d); falling back to a read pass", ctypes.get_errno())
+                logger.warning(
+                    "PLE populate: madvise failed (errno %d); "
+                    "falling back to a read pass",
+                    ctypes.get_errno(),
+                )
                 return False
         return True
 
@@ -462,15 +502,17 @@ class _PleQuantTable:
         for k in range(n):
             i = int(ids[k])
             s = i // rps
-            l = i - s * rps
-            packed[k] = q_np[s][l]
-            scales[k] = s_np[s][l]
+            local_row = i - s * rps
+            packed[k] = q_np[s][local_row]
+            scales[k] = s_np[s][local_row]
         lo = (packed & 0xF).astype(np.float32)
         hi = (packed >> 4).astype(np.float32)
         nib = np.empty((n, self.width), dtype=np.float32)
         nib[:, 0::2] = lo
         nib[:, 1::2] = hi
-        out[:] = (nib - 8.0) * np.repeat(scales.astype(np.float32), self.width // g_per_row, axis=1)
+        out[:] = (nib - 8.0) * np.repeat(
+            scales.astype(np.float32), self.width // g_per_row, axis=1
+        )
 
     def gather_into(self, ids: torch.Tensor, out: torch.Tensor) -> None:
         ids = ids.long()
@@ -481,27 +523,24 @@ class _PleQuantTable:
         uniq, counts = torch.unique_consecutive(s_sorted, return_counts=True)
         pos = 0
         for s, c in zip(uniq.tolist(), counts.tolist()):
-            sel = l_sorted[pos:pos + c]
+            sel = l_sorted[pos : pos + c]
             rows = self._dequant(s, sel)
-            out[order[pos:pos + c]] = rows.to(out.dtype)
+            out[order[pos : pos + c]] = rows.to(out.dtype)
             pos += c
 
     def _dequant(self, s: int, sel: torch.Tensor) -> torch.Tensor:
         if "e2m1" in self.layout:
             if self._lut is None:
                 mags = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-                self._lut = torch.tensor(mags + [-m for m in mags],
-                                         dtype=torch.float32)
+                self._lut = torch.tensor(mags + [-m for m in mags], dtype=torch.float32)
             packed = self._q[s].index_select(0, sel)
             lo = (packed & 0xF).long()
             hi = (packed >> 4).long()
             nib = torch.stack((lo, hi), dim=-1).view(packed.shape[0], self.width)
             scale = self._s[s].index_select(0, sel).to(torch.float32)
             g = self.width // scale.shape[1]
-            return (self._lut[nib]
-                    * scale.repeat_interleave(g, dim=1)
-                    * self._s2[s])
-        if "e4m3" in self.layout:
+            return self._lut[nib] * scale.repeat_interleave(g, dim=1) * self._s2[s]
+        if "e4m3" in self.layout or self.layout == "int8_per_row":
             q = self._q[s].index_select(0, sel).to(torch.float32)
             return q * self._s[s].index_select(0, sel)[:, None]
         packed = self._q[s].index_select(0, sel)
@@ -513,16 +552,20 @@ class _PleQuantTable:
         return (nib.to(torch.float32) - 8) * scale.repeat_interleave(g, dim=1)
 
 
-_FUSED_MISMATCH = [0, 0]   # [mismatches, checks]
+_FUSED_MISMATCH = [0, 0]  # [mismatches, checks]
 
 
-def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinned, check):
+def _fused_decode_lookup(
+    layer, input_ids, query_start_loc, ngram_context, pinned, check
+):
     """Decode fast path (2026-09-05 rewrite of _fused_decode_lookup_ref, bit-identical):
     hashing constants cached on the layer, plain-ndarray row gather (pages pre-mapped by
     populate_page_tables), and the float32->bf16 store done in numpy straight into the
-    pinned buffer (round-to-nearest-even, same as torch). 264 -> 114 us offline for one token.
-    Returns the pinned view [:num_tokens] or None when the batch is not a plain decode batch."""
+    pinned buffer (round-to-nearest-even, same as torch).
+    Return the pinned view or None when the batch is not a plain decode batch.
+    """
     import numpy as np
+
     quant = getattr(layer.ngram_embedding, "_ple_quant", None)
     if quant is None or "int4" not in quant.layout or ngram_context is None:
         return None
@@ -531,16 +574,18 @@ def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinne
     num_tokens = input_ids.shape[0]
     if num_reqs == 1:
         if int(qsl[1]) != 1:
-            return None                             # one request with >1 token: prefill
+            return None  # one request with >1 token: prefill
     else:
         if num_reqs <= 0 or num_reqs > 64 or int(qsl[-1]) != num_reqs:
             return None
         if not np.array_equal(qsl, np.arange(num_reqs + 1, dtype=qsl.dtype)):
-            return None                             # some request has >1 token: prefill
+            return None  # some request has >1 token: prefill
     consts = getattr(layer, "_ple_np_consts", None)
     if consts is None:
         consts = (
-            int(layer.ngram_size), int(layer.heads_per_ngram), int(layer.eos_token_id),
+            int(layer.ngram_size),
+            int(layer.heads_per_ngram),
+            int(layer.eos_token_id),
             layer.layer_multipliers.numpy().astype(np.int64),
             layer.ngram_heads_vocab_sizes.numpy().astype(np.int64),
             layer.ngram_heads_offsets.numpy().astype(np.int64),
@@ -553,7 +598,11 @@ def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinne
         # signed), same EOS segmentation, same floor-modulo as np.remainder.
         py = getattr(layer, "_ple_py_consts", None)
         if py is None:
-            py = ([int(m) for m in mult], [int(x) for x in sizes], [int(x) for x in offsets])
+            py = (
+                [int(m) for m in mult],
+                [int(x) for x in sizes],
+                [int(x) for x in offsets],
+            )
             layer._ple_py_consts = py
         pm, psz, pof = py
         row = ngram_context[0].tolist() + [int(input_ids[0])]
@@ -592,9 +641,13 @@ def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinne
                 views = layer._ple_out16_views = {}
             out16_all = views.get(key)
             if out16_all is None:
-                out16_all = views[key] = pinned.view(torch.int16).numpy().view(np.uint16)
+                out16_all = views[key] = (
+                    pinned.view(torch.int16).numpy().view(np.uint16)
+                )
             u = f32.view(np.uint32)
-            out16_all[0] = ((u + (((u >> 16) & 1) + np.uint32(0x7FFF))) >> 16).astype(np.uint16)[0]
+            out16_all[0] = ((u + (((u >> 16) & 1) + np.uint32(0x7FFF))) >> 16).astype(
+                np.uint16
+            )[0]
             if num_tokens > 1:
                 out16_all[1:num_tokens] = 0
             out = pinned[:num_tokens]
@@ -606,11 +659,11 @@ def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinne
         if check:
             _fused_check(layer, input_ids, query_start_loc, ngram_context, out, 1)
         return out
-    ctx = ngram_context[:num_reqs].numpy()                            # (R, ngram_size-1) int64
-    tok = input_ids[:num_reqs].numpy()                                # (R,)
+    ctx = ngram_context[:num_reqs].numpy()  # (R, ngram_size-1) int64
+    tok = input_ids[:num_reqs].numpy()  # (R,)
     L = ctx.shape[1] + 1
     row = np.empty((num_reqs, L), dtype=np.int64)
-    row[:, :L - 1] = ctx
+    row[:, : L - 1] = ctx
     row[:, L - 1] = tok
     a = L - 1
     is_eos = row[:, :a] == eos
@@ -629,8 +682,11 @@ def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinne
         for n in range(2, ngram_size + 1):
             mixed = np.bitwise_xor(mixed, shifted[n - 1] * mult[n - 1])
             start = (n - 2) * hpn
-            blocks.append(np.remainder(mixed[:, None], sizes[None, start:start + hpn]) + offsets[None, start:start + hpn])
-    ngram_ids = np.concatenate(blocks, axis=1).reshape(-1)             # (R*heads,)
+            blocks.append(
+                np.remainder(mixed[:, None], sizes[None, start : start + hpn])
+                + offsets[None, start : start + hpn]
+            )
+    ngram_ids = np.concatenate(blocks, axis=1).reshape(-1)  # (R*heads,)
     rows = np.empty((ngram_ids.shape[0], layer.head_dim), dtype=np.float32)
     quant.gather_rows_small(ngram_ids, rows)
     out = pinned[:num_tokens]
@@ -648,21 +704,34 @@ def _fused_decode_lookup(layer, input_ids, query_start_loc, ngram_context, pinne
     return out
 
 
-def _fused_check(layer, input_ids, query_start_loc, ngram_context, out, num_reqs) -> None:
+def _fused_check(
+    layer, input_ids, query_start_loc, ngram_context, out, num_reqs
+) -> None:
     ref = layer.forward_impl(input_ids, input_ids, query_start_loc, ngram_context)
     r, o = ref[:num_reqs].float(), out[:num_reqs].float()
     diff = (r - o).abs().max().item()
     scale = r.abs().max().item() + 1e-6
     _FUSED_MISMATCH[1] += 1
     if _FUSED_MISMATCH[1] <= 3 or diff > 1e-2 * scale:
-        logger.info("fused PLE check #%d: max abs diff %.3g (ref max %.3g, dtype ref %s / out %s)",
-                    _FUSED_MISMATCH[1], diff, scale, ref.dtype, out.dtype)
+        logger.info(
+            "fused PLE check #%d: max abs diff %.3g "
+            "(ref max %.3g, dtype ref %s / out %s)",
+            _FUSED_MISMATCH[1],
+            diff,
+            scale,
+            ref.dtype,
+            out.dtype,
+        )
     if diff > 1e-2 * scale:
         _FUSED_MISMATCH[0] += 1
-        logger.error("fused PLE lookup MISMATCH (max abs diff %.4g vs ref max %.4g)", diff, scale)
+        logger.error(
+            "fused PLE lookup MISMATCH (max abs diff %.4g vs ref max %.4g)", diff, scale
+        )
 
 
-def _fused_decode_lookup_ref(layer, input_ids, query_start_loc, ngram_context, pinned, check):
+def _fused_decode_lookup_ref(
+    layer, input_ids, query_start_loc, ngram_context, pinned, check
+):
     """Decode fast path: one token per request, int4 sidecar. Reproduces forward_impl's
     hashing (int64 wraparound, EOS segmentation) in numpy and gathers the rows with
     gather_rows_small, writing straight into the pinned buffer. Returns the pinned view
@@ -678,19 +747,20 @@ def _fused_decode_lookup_ref(layer, input_ids, query_start_loc, ngram_context, p
     if num_reqs <= 0 or num_reqs > 64 or int(qsl[-1]) != num_reqs:
         return None
     if not np.array_equal(qsl, np.arange(num_reqs + 1, dtype=qsl.dtype)):
-        return None                                 # some request has >1 token: prefill
+        return None  # some request has >1 token: prefill
     ngram_size = layer.ngram_size
     hpn = layer.heads_per_ngram
     eos = layer.eos_token_id
     mult = layer.layer_multipliers.numpy().astype(np.int64)
     sizes = layer.ngram_heads_vocab_sizes.numpy().astype(np.int64)
     offsets = layer.ngram_heads_offsets.numpy().astype(np.int64)
-    ctx = ngram_context[:num_reqs].numpy().astype(np.int64)          # (R, ngram_size-1)
-    tok = input_ids[:num_reqs].numpy().astype(np.int64)               # (R,)
-    row = np.concatenate([ctx, tok[:, None]], axis=1)                 # (R, L), token last
+    ctx = ngram_context[:num_reqs].numpy().astype(np.int64)  # (R, ngram_size-1)
+    tok = input_ids[:num_reqs].numpy().astype(np.int64)  # (R,)
+    row = np.concatenate([ctx, tok[:, None]], axis=1)  # (R, L), token last
     L = row.shape[1]
     a = L - 1
-    # position_in_segment of the last column: distance past the last EOS strictly before it
+    # position_in_segment of the last column: distance past the last EOS strictly before
+    # it
     is_eos = row[:, :a] == eos
     has = is_eos.any(axis=1)
     last_eos = np.where(has, a - 1 - np.argmax(is_eos[:, ::-1], axis=1), -1)
@@ -707,9 +777,12 @@ def _fused_decode_lookup_ref(layer, input_ids, query_start_loc, ngram_context, p
         for n in range(2, ngram_size + 1):
             mixed = np.bitwise_xor(mixed, shifted[n - 1] * mult[n - 1])
             start = (n - 2) * hpn
-            ids = np.remainder(mixed[:, None], sizes[None, start:start + hpn]) + offsets[None, start:start + hpn]
+            ids = (
+                np.remainder(mixed[:, None], sizes[None, start : start + hpn])
+                + offsets[None, start : start + hpn]
+            )
             blocks.append(ids)
-    ngram_ids = np.concatenate(blocks, axis=1).reshape(-1)             # (R*heads,)
+    ngram_ids = np.concatenate(blocks, axis=1).reshape(-1)  # (R*heads,)
     rows = np.empty((ngram_ids.shape[0], layer.head_dim), dtype=np.float32)
     quant.gather_rows_small(ngram_ids, rows)
     out = pinned[:num_tokens]
@@ -723,11 +796,22 @@ def _fused_decode_lookup_ref(layer, input_ids, query_start_loc, ngram_context, p
         scale = r.abs().max().item() + 1e-6
         _FUSED_MISMATCH[1] += 1
         if _FUSED_MISMATCH[1] <= 3 or diff > 1e-2 * scale:
-            logger.info("fused PLE check #%d: max abs diff %.3g (ref max %.3g, dtype ref %s / out %s)",
-                        _FUSED_MISMATCH[1], diff, scale, ref.dtype, out.dtype)
+            logger.info(
+                "fused PLE check #%d: max abs diff %.3g "
+                "(ref max %.3g, dtype ref %s / out %s)",
+                _FUSED_MISMATCH[1],
+                diff,
+                scale,
+                ref.dtype,
+                out.dtype,
+            )
         if diff > 1e-2 * scale:
             _FUSED_MISMATCH[0] += 1
-            logger.error("fused PLE lookup MISMATCH (max abs diff %.4g vs ref max %.4g)", diff, scale)
+            logger.error(
+                "fused PLE lookup MISMATCH (max abs diff %.4g vs ref max %.4g)",
+                diff,
+                scale,
+            )
     return out
 
 
@@ -753,17 +837,25 @@ def _prefault_sidecar_async(layers) -> None:
         t0 = time.perf_counter()
         total = 0
         if quant.populate_page_tables():
-            logger.info("PLE sidecar populated (page cache + page tables): %.1f GB in %.0f s",
-                        sum(a.nbytes for a in quant._q_np + quant._s_np) / 1e9, time.perf_counter() - t0)
+            logger.info(
+                "PLE sidecar populated (page cache + page tables): %.1f GB in %.0f s",
+                sum(a.nbytes for a in quant._q_np + quant._s_np) / 1e9,
+                time.perf_counter() - t0,
+            )
             return
         for n in range(quant.n_shards):
             path = os.path.join(quant.quant_dir, f"shard_{n}.safetensors")
             try:
                 with open(path, "rb", buffering=0) as f:
-                    try:
-                        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_WILLNEED)
-                    except OSError:
-                        pass
+                    with contextlib.suppress(OSError, AttributeError):
+                        advise = getattr(os, "posix_fadvise", None)
+                        if advise is not None:
+                            advise(
+                                f.fileno(),
+                                0,
+                                0,
+                                getattr(os, "POSIX_FADV_WILLNEED", 3),
+                            )
                     while True:
                         b = f.read(64 << 20)
                         if not b:
@@ -772,8 +864,11 @@ def _prefault_sidecar_async(layers) -> None:
             except OSError as e:
                 logger.warning("PLE prefault: %s: %s", path, e)
                 return
-        logger.info("PLE sidecar prefaulted into the page cache: %.1f GB in %.0f s",
-                    total / 1e9, time.perf_counter() - t0)
+        logger.info(
+            "PLE sidecar prefaulted into the page cache: %.1f GB in %.0f s",
+            total / 1e9,
+            time.perf_counter() - t0,
+        )
 
     threading.Thread(target=run, name="ple-prefault", daemon=True).start()
 
@@ -784,8 +879,9 @@ def _ple_quant_dir() -> str | None:
     return os.environ.get("VLLM_PLE_QUANT_DIR") or None
 
 
-def _ple_quant_attach(layer_name: str, layer: torch.nn.Module,
-                      quant_dir: str) -> str | None:
+def _ple_quant_attach(
+    layer_name: str, layer: torch.nn.Module, quant_dir: str
+) -> str | None:
     """Swap the layer's table for a sidecar-backed quant store.
 
     Returns the stubbed parameter's name, or None when the layer has no
@@ -816,13 +912,15 @@ def _ple_quant_attach(layer_name: str, layer: torch.nn.Module,
         setattr(owner, parts[-1], new_param)
     else:
         target.data = stub
-    logger.info("PLE quant: %s.%s stubbed, gathers served from sidecar.",
-                layer_name, pname)
+    logger.info(
+        "PLE quant: %s.%s stubbed, gathers served from sidecar.", layer_name, pname
+    )
     return pname
 
 
-def _ple_disk_attach(layer_name: str, layer: torch.nn.Module,
-                     disk_dir: str) -> tuple[str, bool] | None:
+def _ple_disk_attach(
+    layer_name: str, layer: torch.nn.Module, disk_dir: str
+) -> tuple[str, bool] | None:
     """Swap the layer's largest parameter (the n-gram table) for a disk-backed map.
 
     Returns ``(param_name, file_complete)`` or ``None`` when the layer has no
@@ -841,8 +939,13 @@ def _ple_disk_attach(layer_name: str, layer: torch.nn.Module,
     bin_path, done_path = base + ".bin", base + ".done.json"
 
     complete = False
-    if os.path.exists(done_path) and os.path.exists(bin_path)             and os.path.getsize(bin_path) == nbytes:
-        meta = json.load(open(done_path))
+    if (
+        os.path.exists(done_path)
+        and os.path.exists(bin_path)
+        and os.path.getsize(bin_path) == nbytes
+    ):
+        with open(done_path) as metadata_file:
+            meta = json.load(metadata_file)
         complete = meta.get("shape") == list(shape) and meta.get("dtype") == str(dtype)
     if not complete:
         with contextlib.suppress(FileNotFoundError):
@@ -872,14 +975,18 @@ def _ple_disk_attach(layer_name: str, layer: torch.nn.Module,
         target.data = mapped
     logger.info(
         "PLE disk offload: %s.%s -> %s (%.1f GiB, %s)",
-        layer_name, pname, bin_path, nbytes / (1 << 30),
+        layer_name,
+        pname,
+        bin_path,
+        nbytes / (1 << 30),
         "reusing finished file" if complete else "first boot, writing through",
     )
     return pname, complete
 
 
-def _ple_disk_finalize(layer_name: str, layer: torch.nn.Module, pname: str,
-                       disk_dir: str) -> None:
+def _ple_disk_finalize(
+    layer_name: str, layer: torch.nn.Module, pname: str, disk_dir: str
+) -> None:
     """Flush the written mapping, record completion, and remap copy-on-write."""
     import os
 
@@ -893,12 +1000,18 @@ def _ple_disk_finalize(layer_name: str, layer: torch.nn.Module, pname: str,
     if arr is not None:
         with contextlib.suppress(Exception):
             arr.flush()
-    json.dump({"shape": list(param.shape), "dtype": str(param.dtype)},
-              open(base + ".done.json", "w"))
-    param.data = _disk_backed_tensor(base + ".bin", tuple(param.shape), param.dtype,
-                                     writable=False)
-    logger.info("PLE disk offload: %s.%s finalized and remapped copy-on-write.",
-                layer_name, pname)
+    with open(base + ".done.json", "w") as metadata_file:
+        json.dump(
+            {"shape": list(param.shape), "dtype": str(param.dtype)}, metadata_file
+        )
+    param.data = _disk_backed_tensor(
+        base + ".bin", tuple(param.shape), param.dtype, writable=False
+    )
+    logger.info(
+        "PLE disk offload: %s.%s finalized and remapped copy-on-write.",
+        layer_name,
+        pname,
+    )
 
 
 class PleOffloadRunner:
@@ -1043,16 +1156,11 @@ class PleOffloadRunner:
                 len(offload_layers),
             )
             for layer in offload_layers.values():
-                # The model was built under torch.device("meta"), and
-                # initialize_dummy_weights fills existing storage -- it cannot
-                # materialize meta tensors. The DefaultModelLoader path gets
-                # storage implicitly by copying checkpoint data in; the dummy
-                # path has to ask for it, or the layer's parameters and its
-                # persistent buffers (layer_multipliers, ngram_heads_*) stay on
-                # meta and the first forward dies with
-                # "Tensor on device meta is not on the expected device cpu".
-                layer.to_empty(device=torch.device("cpu"))
-                initialize_dummy_weights(layer, model_config)
+                # CPU constructors already own storage. Preserve their hash
+                # constants and workspace; generic dummy loading overwrites
+                # persistent integer buffers on ROCm.
+                for param in layer.parameters():
+                    initialize_single_dummy_weight(param)
         elif isinstance(loader, DefaultModelLoader):
             all_weights = loader.get_all_weights(model_config, model)
             loaded_params = model.load_weights(offload_only_iter(all_weights))
@@ -1104,8 +1212,9 @@ class PleOffloadRunner:
         if disk_dir is not None:
             for layer_name, pname in disk_attached.items():
                 if f"{layer_name}.{pname}" not in disk_complete_params:
-                    _ple_disk_finalize(layer_name, offload_layers[layer_name],
-                                       pname, disk_dir)
+                    _ple_disk_finalize(
+                        layer_name, offload_layers[layer_name], pname, disk_dir
+                    )
 
         self._layers.update(offload_layers)
         del model
@@ -1123,15 +1232,22 @@ class PleOffloadRunner:
             return self._done_pages[addr]
         import ctypes
 
-        from vllm.model_executor.layers.ple_offload_layer import _cuda_check, cuda_driver
+        from vllm.model_executor.layers.ple_offload_layer import (
+            _cuda_check,
+            cuda_driver,
+        )
 
         nbytes = page.numel() * page.element_size()
-        _cuda_check(cuda_driver.cuMemHostRegister(addr, nbytes, 0x1 | 0x2),
-                    "hipHostRegister(done page)")
+        _cuda_check(
+            cuda_driver.cuMemHostRegister(addr, nbytes, 0x1 | 0x2),
+            "hipHostRegister(done page)",
+        )
         lib = cuda_driver._hip
         devptr = ctypes.c_void_p()
         lib.hipHostGetDevicePointer.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_uint,
         ]
         rc = lib.hipHostGetDevicePointer(ctypes.byref(devptr), ctypes.c_void_p(addr), 0)
         if rc != 0:
@@ -1148,7 +1264,7 @@ class PleOffloadRunner:
         logger.info("Waiting for %d GPU worker registration(s) ...", num_workers)
         registrations: list[PleOffloadRegistration] = []
         for index in range(num_workers):
-            item = pickle.loads(pull_socket.recv())
+            item = ForkingPickler.loads(pull_socket.recv())
             if not isinstance(item, PleOffloadRegistration):
                 raise RuntimeError(
                     "Expected PleOffloadRegistration during setup, got "
@@ -1264,8 +1380,12 @@ class PleOffloadRunner:
         self._debug_trace = None
         trace_path = os.getenv("PLE_OFFLOAD_DEBUG_TRACE", "")
         if trace_path:
-            self._debug_trace = open(trace_path, "a", buffering=1)
-            logger.warning("PLE_OFFLOAD_DEBUG_TRACE=%s: tracing every request (test hook).", trace_path)
+            # Kept open for the process lifetime to avoid per-token file opens.
+            self._debug_trace = open(trace_path, "a", buffering=1)  # noqa: SIM115
+            logger.warning(
+                "PLE_OFFLOAD_DEBUG_TRACE=%s: tracing every request (test hook).",
+                trace_path,
+            )
         self._done_seq: dict[int, int] = {}
         self._t_lookup = 0.0
         self._t_total = 0.0
@@ -1276,13 +1396,16 @@ class PleOffloadRunner:
         self._fused_check = os.getenv("PLE_OFFLOAD_FUSED_CHECK", "0") == "1"
         _prefault_sidecar_async(self._layers)
         if self._debug_delay_s:
-            logger.warning("PLE_OFFLOAD_DEBUG_DELAY_MS=%.0f: every lookup is delayed (test hook).", self._debug_delay_s * 1e3)
+            logger.warning(
+                "PLE_OFFLOAD_DEBUG_DELAY_MS=%.0f: every lookup is delayed (test hook).",
+                self._debug_delay_s * 1e3,
+            )
         logger.info("Busy-loop started.")
         poller = zmq.Poller()
         poller.register(pull_socket, zmq.POLLIN)
         # Doorbell pages: one per DP rank, the TP-rank-0 worker's done page (its request
         # thread writes num_tokens/num_reqs then seq into slots 5/6/4 after the D2H).
-        db_pages: dict[int, object] = {}
+        db_pages: dict[int, np.ndarray] = {}
         if _DOORBELL:
             for dp_rank, per_layer in self._worker_targets.items():
                 for targets in per_layer.values():
@@ -1291,10 +1414,16 @@ class PleOffloadRunner:
                             db_pages[dp_rank] = t.done_seq_buf.numpy()
                     break
             if len(db_pages) != len(self._worker_targets):
-                logger.warning("PLE doorbell: no TP-rank-0 page for every DP rank; ZMQ only.")
+                logger.warning(
+                    "PLE doorbell: no TP-rank-0 page for every DP rank; ZMQ only."
+                )
                 db_pages = {}
             else:
-                logger.info("PLE doorbell: polling shared pages for %d DP rank(s); ZMQ still accepted.", len(db_pages))
+                logger.info(
+                    "PLE doorbell: polling shared pages for %d DP rank(s); "
+                    "ZMQ still accepted.",
+                    len(db_pages),
+                )
         db_seen = {dp_rank: 0 for dp_rank in db_pages}
         db_items = list(db_pages.items())
         last_active = time.perf_counter()
@@ -1305,16 +1434,22 @@ class PleOffloadRunner:
                     s = int(page[_DB_SEQ])
                     if s > db_seen[dp_rank]:
                         db_seen[dp_rank] = s
-                        got = PleOffloadRequest(dp_rank=dp_rank, num_tokens=int(page[_DB_NTOK]), num_reqs=int(page[_DB_NREQ]))
+                        got = PleOffloadRequest(
+                            dp_rank=dp_rank,
+                            num_tokens=int(page[_DB_NTOK]),
+                            num_reqs=int(page[_DB_NREQ]),
+                        )
                         break  # protocol: at most one outstanding request per DP rank
                 if got is not None:
                     self._handle_requests([got])
                     last_active = time.perf_counter()
                     continue
                 if time.perf_counter() - last_active < _DB_SPIN_S:
-                    continue  # hot window: spin so the next step's request is seen within ~1 us
+                    continue  # Hot window: detect the next request promptly.
                 if pull_socket not in dict(poller.poll(timeout=0)):
-                    time.sleep(200e-6)  # idle: cheap sleep-poll of both the pages and the socket
+                    time.sleep(
+                        200e-6
+                    )  # idle: cheap sleep-poll of both the pages and the socket
                     continue
             elif pull_socket not in dict(poller.poll(timeout=100)):
                 continue
@@ -1399,7 +1534,9 @@ class PleOffloadRunner:
                 t_lk0 = time.perf_counter()
                 # compute straight into TP rank 0's shared result buffer
                 if targets[0].out_buf is None:
-                    raise RuntimeError("PLE offload: GPU worker registered no result buffer")
+                    raise RuntimeError(
+                        "PLE offload: GPU worker registered no result buffer"
+                    )
                 pinned = targets[0].out_buf
                 result = _fused_decode_lookup(
                     layer,
@@ -1428,11 +1565,19 @@ class PleOffloadRunner:
                     t_lookup_ns = time.perf_counter_ns()
                 if self._debug_trace is not None:
                     import hashlib
+
                     ids = input_bufs.input_ids_buf[: request.num_tokens]
-                    h_ids = hashlib.md5(ids.contiguous().numpy().tobytes()).hexdigest()[:12]
-                    h_res = hashlib.md5(result.contiguous().view(torch.uint8).numpy().tobytes() if result.dtype != torch.bfloat16 else result.float().contiguous().numpy().tobytes()).hexdigest()[:12]
+                    h_ids = hashlib.md5(ids.contiguous().numpy().tobytes()).hexdigest()[
+                        :12
+                    ]
+                    h_res = hashlib.md5(
+                        result.contiguous().view(torch.uint8).numpy().tobytes()
+                        if result.dtype != torch.bfloat16
+                        else result.float().contiguous().numpy().tobytes()
+                    ).hexdigest()[:12]
                     self._debug_trace.write(
-                        f"{self._done_seq.get(dp_rank, 0) + 1} {request.num_tokens} {request.num_reqs} {h_ids} {h_res}\n"
+                        f"{self._done_seq.get(dp_rank, 0) + 1} "
+                        f"{request.num_tokens} {request.num_reqs} {h_ids} {h_res}\n"
                     )
 
                 # The result is identical on every TP rank in this DP group.
@@ -1454,7 +1599,9 @@ class PleOffloadRunner:
                     for target in self._worker_targets[dp_rank][layer_name]:
                         if target.done_seq_buf is not None:
                             page = target.done_seq_buf.view(torch.int64)
-                            page[10] = t_recv_ns; page[11] = t_lookup_ns; page[12] = t_pub_ns
+                            page[10] = t_recv_ns
+                            page[11] = t_lookup_ns
+                            page[12] = t_pub_ns
         for dp_rank in requests_by_dp:
             seq = self._done_seq.get(dp_rank, 0) + 1
             self._done_seq[dp_rank] = seq
@@ -1470,7 +1617,12 @@ class PleOffloadRunner:
             logger.info(
                 "PLE offload timing over %d requests (%d fused): lookup %.2f ms, "
                 "replicate+publish %.2f ms, total in worker %.2f ms per request%s",
-                n, self._n_fused, self._t_lookup / n * 1e3,
-                (self._t_total - self._t_lookup) / n * 1e3, self._t_total / n * 1e3,
-                f"; fused-check mismatches {_FUSED_MISMATCH[0]}" if self._fused_check else "",
+                n,
+                self._n_fused,
+                self._t_lookup / n * 1e3,
+                (self._t_total - self._t_lookup) / n * 1e3,
+                self._t_total / n * 1e3,
+                f"; fused-check mismatches {_FUSED_MISMATCH[0]}"
+                if self._fused_check
+                else "",
             )

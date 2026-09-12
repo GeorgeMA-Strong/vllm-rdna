@@ -50,6 +50,7 @@ except ImportError:  # pragma: no cover - platform dependent
     PLE_OFFLOAD_DRIVER_AVAILABLE = cuda_driver.HIP_DRIVER_AVAILABLE
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # Module-level flag set to True inside the offload subprocess.
@@ -57,6 +58,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
 # processes (spawned via multiprocessing), each has its own memory space.
 # A plain module-level bool is sufficient -- no thread-local storage needed.
 _offload_worker_flag = False
+
+
+def is_ple_cpu_offload_enabled() -> bool:
+    config = get_current_vllm_config_or_none()
+    if config is not None and config.engram_config is not None:
+        return config.engram_config.cpu_offload
+    return envs.VLLM_PLE_CPU_OFFLOAD
 
 
 def is_offload_process() -> bool:
@@ -220,8 +228,18 @@ class PleOffloadLayer(nn.Module, ABC):
         def guarded_init(
             self: "PleOffloadLayer", *args: object, **kwargs: object
         ) -> None:
-            if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            if is_ple_cpu_offload_enabled() and not is_offload_process():
                 nn.Module.__init__(self)
+                return
+            if (
+                is_offload_process()
+                and not envs.VLLM_PLE_QUANT_DIR
+                and not envs.VLLM_PLE_DISK_OFFLOAD_DIR
+            ):
+                # The outer model is built on meta. Only the PLE subtree owns
+                # RAM; shard copies into a meta parameter silently lose data.
+                with torch.device("cpu"):
+                    original_init(self, *args, **kwargs)
                 return
             original_init(self, *args, **kwargs)
 
@@ -230,7 +248,7 @@ class PleOffloadLayer(nn.Module, ABC):
     @classmethod
     def get_target_device(cls) -> torch.device:
         """Return CPU for the offload process and the active GPU otherwise."""
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if is_ple_cpu_offload_enabled():
             return torch.device("cpu")
         return torch.device("cuda", torch.accelerator.current_device_index())
 

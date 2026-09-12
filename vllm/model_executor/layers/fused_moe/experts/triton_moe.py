@@ -253,6 +253,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             output,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
             w1_zp=self.quant_config.w1_zp,
+            w2_zp=self.quant_config.w2_zp,
             block_shape=self.block_shape,
             activation=activation,
             expert_map=expert_map,
@@ -316,6 +317,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
+            activation_dtype=hidden_states.dtype,
         )
 
         if hidden_states.dtype == torch.bfloat16:
@@ -669,6 +671,7 @@ class TritonWNA16Experts(TritonExperts):
             output,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
             w1_zp=self.quant_config.w1_zp,
+            w2_zp=self.quant_config.w2_zp,
             block_shape=self.block_shape,
             activation=activation,
             expert_map=expert_map,
@@ -714,6 +717,7 @@ class TritonWNA16Experts(TritonExperts):
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
+            activation_dtype=hidden_states.dtype,
         )
 
         if hidden_states.dtype == torch.bfloat16:

@@ -41,15 +41,13 @@ def _awq_prefill_available() -> bool:
     attribute access in a try/except instead.
     """
     try:
-        torch.ops._rocm_C.awq_gemm_rdna2_prefill
+        _ = torch.ops._rocm_C.awq_gemm_rdna2_prefill
         return True
     except AttributeError:
         return False
 
 
-def _rdna2_w4a16_select_kernel(
-    m: int, k: int, n: int, is_awq: bool = False
-) -> str:
+def _rdna2_w4a16_select_kernel(m: int, k: int, n: int, is_awq: bool = False) -> str:
     # M > 256: exllama is the clear winner for compute-bound GEMMs.
     # AWQ models route to GPTQ prefill (ConfigA for M > 256): the separate
     # AWQ prefill kernel has BLOCK_M=16 (fails on non-aligned chunked-prefill
@@ -104,6 +102,7 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         # correct). The Triton W4A16 fallback is graph-safe.
         try:
             from vllm.config import get_current_vllm_config
+
             _cfg = get_current_vllm_config()
             if _cfg is not None and _cfg.parallel_config.tensor_parallel_size > 2:
                 return (
@@ -288,49 +287,66 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         m = x_2d.size(0)
         k = x_2d.size(1)
         n = c.partition_weight_shape[1]
-        is_awq = (c.weight_type == scalar_types.uint4)
+        is_awq = c.weight_type == scalar_types.uint4
         kernel_name = _rdna2_w4a16_select_kernel(m, k, n, is_awq=is_awq)
 
         # AWQ stores literal zeros → kernel must NOT add 1 (use_v2_format=True,
         # q_gemm_rdna2.cu:219 picks zero_offset=0). GPTQv1 stores zero-1 →
         # kernel adds 1 to recover the original zero (use_v2_format=False,
         # zero_offset=1). uint4b8 is GPTQv1; uint4 is AWQ.
-        use_v2_format = (c.weight_type == scalar_types.uint4)
+        use_v2_format = c.weight_type == scalar_types.uint4
 
-        if kernel_name == "awq_prefill" and hasattr(
-                ops, "awq_gemm_rdna2_prefill"):
+        if kernel_name == "awq_prefill" and hasattr(ops, "awq_gemm_rdna2_prefill"):
             output = ops.awq_gemm_rdna2_prefill(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+            )
         elif kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
             output = ops.gptq_gemm_rdna2_prefill(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+            )
         elif kernel_name == "exllama" and hasattr(ops, "gptq_gemm"):
             output = ops.gptq_gemm(
-                x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
-                c.weight_type.size_bits)
-        elif kernel_name == "rdna2_decode" and hasattr(
-                ops, "gptq_gemm_rdna2"):
-            output = ops.gptq_gemm_rdna2(
-                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                x_2d,
+                w_q,
+                w_zp,
+                w_s,
+                w_g_idx,
+                True,
+                use_v2_format,
+                c.weight_type.size_bits,
+            )
+        elif kernel_name == "rdna2_decode" and hasattr(ops, "gptq_gemm_rdna2"):
+            output = ops.gptq_gemm_rdna2(x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
         else:
             if hasattr(ops, "awq_gemm_rdna2_prefill") and use_v2_format:
                 output = ops.awq_gemm_rdna2_prefill(
-                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+                )
             elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
                 output = ops.gptq_gemm_rdna2_prefill(
-                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+                )
             elif hasattr(ops, "gptq_gemm"):
                 output = ops.gptq_gemm(
-                    x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
-                    c.weight_type.size_bits)
+                    x_2d,
+                    w_q,
+                    w_zp,
+                    w_s,
+                    w_g_idx,
+                    True,
+                    use_v2_format,
+                    c.weight_type.size_bits,
+                )
             elif hasattr(ops, "gptq_gemm_rdna2"):
                 output = ops.gptq_gemm_rdna2(
-                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format
+                )
             else:
                 raise RuntimeError(
                     f"RDNA2 W4A16 dispatcher: kernel_name={kernel_name!r} but "
                     "neither gptq_gemm nor gptq_gemm_rdna2 ops are "
-                    "available; rebuild the C++ extension")
+                    "available; rebuild the C++ extension"
+                )
 
         if bias is not None:
             output.add_(bias)

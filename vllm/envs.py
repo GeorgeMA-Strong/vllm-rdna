@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_USE_RDNA2_FA: bool = True
     VLLM_FORCE_CUSTOM_ALL_REDUCE: bool = False
+    VLLM_RDNA_DENSE_GEMV: bool = False
     VLLM_RDNA_AR: str = "0"
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -1392,6 +1393,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # gfx10x push one-shot all-reduce: "0" off (default), "1" on, "auto"
     # only when the TP mesh is PIX (PCIe hops<=2 / same switch).
+    "VLLM_RDNA_DENSE_GEMV": lambda: os.getenv("VLLM_RDNA_DENSE_GEMV", "0") == "1",
     "VLLM_RDNA_AR": lambda: (os.getenv("VLLM_RDNA_AR", "0").strip().lower() or "0"),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

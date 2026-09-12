@@ -42,6 +42,7 @@ from vllm.config import (
     DiffusionConfig,
     ECTransferConfig,
     EncoderCacheManagerConfig,
+    EngramConfig,
     EPLBConfig,
     FaultToleranceConfig,
     KernelConfig,
@@ -728,6 +729,7 @@ class EngineArgs:
     )
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
 
+    engram_config: EngramConfig | None = VllmConfig.engram_config
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
@@ -770,6 +772,8 @@ class EngineArgs:
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
+        if isinstance(self.engram_config, dict):
+            self.engram_config = EngramConfig(**self.engram_config)
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.attention_config, dict):
@@ -1665,6 +1669,7 @@ class EngineArgs:
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
         vllm_group.add_argument("--reasoning-config", **vllm_kwargs["reasoning_config"])
+        vllm_group.add_argument("--engram-config", **vllm_kwargs["engram_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
@@ -2548,6 +2553,7 @@ class EngineArgs:
             ec_manager_config=self.ec_manager_config,
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
+            engram_config=self.engram_config,
             additional_config=self.additional_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,

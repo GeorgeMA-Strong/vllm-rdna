@@ -12,6 +12,9 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.breakable_cudagraph import (
+    eager_break_during_capture,
+)
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -48,9 +51,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx10x
-from vllm.compilation.breakable_cudagraph import (
-    eager_break_during_capture,
-)
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
@@ -103,16 +103,16 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
 def _gdn_prefill_chain_rdna2(
-    q: torch.Tensor,                # [1, L, Hg, K] fp16 (from prep, B=1)
-    k: torch.Tensor,                # [1, L, Hg, K] fp16
-    v: torch.Tensor,                # [1, L, H, V]  fp16 (H=HV in Qwen3.5/3.6)
-    g_cumsum: torch.Tensor,         # [1, L, H]      fp32 (cumsum'd, from prep)
-    beta: torch.Tensor,             # [1, L, H]      fp32 (from prep)
-    initial_state: torch.Tensor,    # [N, H, V, K]   fp32 (from ssm_state, may be zeros)
+    q: torch.Tensor,  # [1, L, Hg, K] fp16 (from prep, B=1)
+    k: torch.Tensor,  # [1, L, Hg, K] fp16
+    v: torch.Tensor,  # [1, L, H, V]  fp16 (H=HV in Qwen3.5/3.6)
+    g_cumsum: torch.Tensor,  # [1, L, H]      fp32 (cumsum'd, from prep)
+    beta: torch.Tensor,  # [1, L, H]      fp32 (from prep)
+    initial_state: torch.Tensor,  # [N, H, V, K]   fp32 (from ssm_state, may be zeros)
     scale: float,
-    cu_seqlens: torch.Tensor,       # [N+1] int32 (always varlen for prefill)
-    chunk_indices: torch.Tensor,    # [NT, 2] int32
-    chunk_offsets: torch.Tensor,    # [N+1] int32
+    cu_seqlens: torch.Tensor,  # [N+1] int32 (always varlen for prefill)
+    chunk_indices: torch.Tensor,  # [NT, 2] int32
+    chunk_offsets: torch.Tensor,  # [N+1] int32
     chunk_size: int = FLA_CHUNK_SIZE,
 ):
     """Native HIP prefill chain for gfx1030: replicates chunk.py:23-86 using
@@ -146,27 +146,42 @@ def _gdn_prefill_chain_rdna2(
 
     ops = torch.ops._rocm_C
     ops.gdn_prefill_kkt_rdna2(k, beta, g_cumsum, A, cu_seqlens, chunk_indices)
-    ops.gdn_prefill_solve_wy_rdna2(A, k, v, beta, g_cumsum, A_inv, w, u,
-                                   cu_seqlens, chunk_indices)
-    ops.gdn_prefill_delta_h_rdna2(k, u, w, g_cumsum, h, v_new, initial_state,
-                                  final_state, cu_seqlens, chunk_offsets,
-                                  chunk_size)
+    ops.gdn_prefill_solve_wy_rdna2(
+        A, k, v, beta, g_cumsum, A_inv, w, u, cu_seqlens, chunk_indices
+    )
+    ops.gdn_prefill_delta_h_rdna2(
+        k,
+        u,
+        w,
+        g_cumsum,
+        h,
+        v_new,
+        initial_state,
+        final_state,
+        cu_seqlens,
+        chunk_offsets,
+        chunk_size,
+    )
     o = torch.empty_like(v)
-    ops.gdn_prefill_o_rdna2(q, k, v_new, h, g_cumsum, o, scale, cu_seqlens,
-                            chunk_offsets)
+    ops.gdn_prefill_o_rdna2(
+        q, k, v_new, h, g_cumsum, o, scale, cu_seqlens, chunk_offsets
+    )
     return o, final_state
 
 
-def _gdn_prefill_dispatch_available() -> bool:
+def _gdn_prefill_dispatch_available(dtype: torch.dtype) -> bool:
     """True iff all 5 GDN prefill HIP ops are registered for this build."""
     # Opt-out: the chain's chunk-local indexing bug (fixed in
     # gdn_prefill_delta_h_rdna2.cu, k/w/u/v_new rows are now rebased per
     # chunk) is covered by a stage-level differential test; keep the env
     # as a fast rollback valve.
-    if os.environ.get("VLLM_GDN_HIP_PREFILL") == "0":
+    if dtype != torch.float16 or os.environ.get("VLLM_GDN_HIP_PREFILL") == "0":
         return False
-    return (current_platform.is_rocm() and on_gfx10x() and hasattr(
-        torch.ops._rocm_C, "gdn_prefill_prep_rdna2"))
+    return (
+        current_platform.is_rocm()
+        and on_gfx10x()
+        and hasattr(torch.ops._rocm_C, "gdn_prefill_prep_rdna2")
+    )
 
 
 def _resolve_gdn_prefill_backend(
@@ -999,7 +1014,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # does not trace into GDN RMSNorm / conv1d (device_index skip).
         # Packed output keeps a stable data_ptr for breakable FULL replay.
         n = hidden_states.shape[0]
-        if self._packed_out is None or self._packed_out.shape[-1] != hidden_states.shape[-1]:
+        if (
+            self._packed_out is None
+            or self._packed_out.shape[-1] != hidden_states.shape[-1]
+        ):
             cap = max(self._packed_out_n, n)
             # zeros: RDNA2 hipMalloc leaves empty pages uncommitted.
             self._packed_out = hidden_states.new_zeros((cap, hidden_states.shape[-1]))
@@ -1287,7 +1305,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
-        if _gdn_prefill_dispatch_available():
+        if _gdn_prefill_dispatch_available(qkv_or_qkvz.dtype):
             return
 
         device = qkv_or_qkvz.device
@@ -1656,7 +1674,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
 
-            if _gdn_prefill_dispatch_available():
+            if _gdn_prefill_dispatch_available(conv_output_prefill.dtype):
                 _L = conv_output_prefill.shape[0]
                 _HV = self.num_v_heads // self.tp_size
                 _H = self.num_k_heads // self.tp_size
@@ -1670,10 +1688,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g_non_spec = torch.zeros(_L, _HV, dtype=torch.float32, device=_dev)
                 beta_non_spec = torch.zeros(_L, _HV, dtype=torch.float32, device=_dev)
                 torch.ops._rocm_C.gdn_prefill_prep_rdna2(
-                    conv_output_prefill, a_prefill, b_prefill,
-                    self.A_log, self.dt_bias,
-                    query_non_spec, key_non_spec, value_non_spec,
-                    g_non_spec, beta_non_spec,
+                    conv_output_prefill,
+                    a_prefill,
+                    b_prefill,
+                    self.A_log,
+                    self.dt_bias,
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
                     attn_metadata.prefill_query_start_loc,
                     attn_metadata.chunk_indices,
                 )
@@ -1782,12 +1806,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     g_cumsum=g_non_spec,
                     beta=beta_non_spec,
                     initial_state=initial_state,
-                    scale=self.head_k_dim ** -0.5,
+                    scale=self.head_k_dim**-0.5,
                     cu_seqlens=attn_metadata.prefill_query_start_loc,
                     chunk_indices=attn_metadata.chunk_indices,
                     chunk_offsets=attn_metadata.chunk_offsets,
                 )
-                if _gdn_prefill_dispatch_available()
+                if _gdn_prefill_dispatch_available(query_non_spec.dtype)
                 else self.chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -1983,12 +2007,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     # print -- ssm_state is GB-scale and any().item() forces
                     # a host sync. The one-shot _rdna2_ssm_sanitized guard
                     # below already covers correctness.
-                    print(f"[gdn_dbg] dispatching gdn_decode_rdna2 "
-                          f"mixed_qkv.shape={tuple(mixed_qkv_non_spec.shape)} "
-                          f"a.shape={tuple(a.shape)} "
-                          f"out_buf.shape={tuple(out_buf.shape)} "
-                          f"ssm_state.shape={tuple(ssm_state.shape)}",
-                          flush=True)
+                    print(
+                        f"[gdn_dbg] dispatching gdn_decode_rdna2 "
+                        f"mixed_qkv.shape={tuple(mixed_qkv_non_spec.shape)} "
+                        f"a.shape={tuple(a.shape)} "
+                        f"out_buf.shape={tuple(out_buf.shape)} "
+                        f"ssm_state.shape={tuple(ssm_state.shape)}",
+                        flush=True,
+                    )
                 # On RDNA2, torch.empty returns virtual address space with
                 # uncommitted physical pages. The ssm_state tensor is
                 # allocated by the cache engine upstream with torch.empty,
@@ -2029,10 +2055,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     True,
                 )
                 if os.environ.get("VLLM_GDN_DBG") == "1":
-                    print(f"[gdn_dbg] AFTER kernel call "
-                          f"out_buf_has_nan={torch.isnan(out_buf.float()).any().item()} "
-                          f"out_buf_norm={out_buf.float().norm().item():.4f}",
-                          flush=True)
+                    print(
+                        f"[gdn_dbg] AFTER kernel call "
+                        f"out_buf_has_nan={torch.isnan(out_buf.float()).any().item()} "
+                        f"out_buf_norm={out_buf.float().norm().item():.4f}",
+                        flush=True,
+                    )
                 self._unbind_decode_state_arenas(
                     paged_conv_state,
                     paged_ssm_state,
@@ -2388,9 +2416,11 @@ def qwen_gdn_full_forward_fake(
     return output
 
 
-_gdn_full_forward_tags = ()
-if hasattr(torch, "_C") and hasattr(torch._C, "Tag") and hasattr(
-    torch._C.Tag, "cudagraph_unsafe"
+_gdn_full_forward_tags: tuple[torch.Tag, ...] = ()
+if (
+    hasattr(torch, "_C")
+    and hasattr(torch._C, "Tag")
+    and hasattr(torch._C.Tag, "cudagraph_unsafe")
 ):
     _gdn_full_forward_tags = (torch._C.Tag.cudagraph_unsafe,)
 

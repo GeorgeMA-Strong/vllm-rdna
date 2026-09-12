@@ -1806,7 +1806,7 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
-def _annotate_eagle_groups_deepseek_v4(
+def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1814,20 +1814,32 @@ def _annotate_eagle_groups_deepseek_v4(
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle():
         return
-    # Detection uses the merged MLA spec's model_version.
-    if not any(
+    if any(
         getattr(spec, "model_version", None) == "deepseek_v4"
         for spec in kv_cache_spec.values()
     ):
+        last_layer = next(reversed(kv_cache_spec))
+        for group in kv_cache_groups:
+            if last_layer in group.layer_names:
+                group.is_eagle_group = True
+                break
         return
-    # DeepseekV4's MTP attention layer is always the last layer, and we flag whichever
-    # group contains it.
-    # FIXME(yifan): avoid/generalize this hacky check.
-    last_layer = next(reversed(kv_cache_spec))
+    # PR #56026 / V620 baseline: mark every separately prefixed draft group.
+    names = list(kv_cache_spec)
+    if len(names) < 2:
+        return
+    first_prefix = names[0].split(".", 1)[0]
+    drafter_prefix = names[-1].split(".", 1)[0]
+    if drafter_prefix == first_prefix:
+        return
+    drafter_layers = {name for name in names if name.split(".", 1)[0] == drafter_prefix}
+    if any(
+        name.split(".", 1)[0] != first_prefix for name in names[: -len(drafter_layers)]
+    ):
+        return
     for group in kv_cache_groups:
-        if last_layer in group.layer_names:
+        if drafter_layers.intersection(group.layer_names):
             group.is_eagle_group = True
-            break
 
 
 def _largest_divisor_at_most(value: int, limit: int) -> int:
@@ -2175,6 +2187,15 @@ def _get_csa_linear_tensor_layout(
 
 
 def get_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    groups = _get_kv_cache_groups(vllm_config, kv_cache_spec)
+    _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+    return groups
+
+
+def _get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
     """
@@ -2211,7 +2232,6 @@ def get_kv_cache_groups(
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
     elif csa_groups := _get_kv_cache_groups_csa_linear(vllm_config, kv_cache_spec):
         # CSA (compressed sparse attention) + linear case: main_kv/compressed/

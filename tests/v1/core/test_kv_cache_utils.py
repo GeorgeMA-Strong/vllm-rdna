@@ -3218,3 +3218,29 @@ def test_iter_layer_specs_returns_group_members():
         block_size=4, kv_cache_specs={"a": full, "b": mla}
     )
     assert list(iter_layer_specs(wrapped)) == [full, mla]
+
+
+@pytest.mark.parametrize(
+    "names, expected",
+    [
+        (
+            ["model.attn", "model.gdn", "mtp.attn", "mtp.raw", "mtp.compressed"],
+            [False, False, True, True, True],
+        ),
+        (["model.attn", "model.gdn", "model.mtp"], [False, False, False]),
+        (["model.attn", "other.attn", "mtp.attn"], [False, False, False]),
+        (
+            ["model.attn", "mtp.raw", "model.gdn", "mtp.attn"],
+            [False, False, False, False],
+        ),
+    ],
+)
+def test_separately_prefixed_draft_marks_all_cache_groups(names, expected):
+    """Target prefix hits must survive all three independently owned MTP caches."""
+    config = SimpleNamespace(speculative_config=SimpleNamespace(use_eagle=lambda: True))
+    specs = {name: SimpleNamespace() for name in names}
+    groups = [
+        SimpleNamespace(layer_names=[name], is_eagle_group=False) for name in names
+    ]
+    kv_cache_utils._annotate_eagle_groups(config, specs, groups)
+    assert [group.is_eagle_group for group in groups] == expected

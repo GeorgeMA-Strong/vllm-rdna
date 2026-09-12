@@ -1,0 +1,148 @@
+# V620 candidate integration — 2026-09-12
+
+This is an unqualified development candidate. No SSH connection, remote command,
+server build, package installation, inference request, service restart, or model
+download was performed during this integration. The published FP16 deployment
+has not been replaced. Historical benchmark results are not candidate results.
+
+## Isolation and stable baseline
+
+- Published source: `fa961c2250aa0eb6797b0787b5f04381895c017d` (PR #5).
+- Local preservation tag: `stable/v620-fp16-2026-09-12`.
+- A checksummed source archive is outside this checkout, under the workspace's
+  `stable-releases/v620-fp16-2026-09-12/` directory.
+- That archive contains source, **not the server's built extensions or virtual
+  environment**. A remote runtime snapshot remains pending because remote work
+  is explicitly prohibited for this stage.
+- Local candidate: `vllm-rdna-testing`, branch `codex/v620-rdna-refresh`.
+- Future remote candidate root: `/home/george/v620-vllm-testing`; use `source`,
+  `.venv`, build outputs, caches, logs, and any test service exclusively there.
+- Protected deployment: `/home/george/v620-vllm/source`, its sibling `.venv`,
+  `tools/v620-serve-intel-fp16.sh`, and
+  `/home/george/.config/systemd/user/v620-serve-intel.service`.
+
+Before any future remote build, preserve the original built checkout, untracked
+extensions, environment/package inventory, launch scripts and systemd unit.
+Keep the original installation at its existing paths; copied virtual environments
+can contain absolute paths. Do not change its boot service. Model files can be
+read from the existing model directory without editing or redownloading them.
+
+The candidate launcher refuses an environment outside its testing root, refuses
+an import from another source checkout, and refuses to launch while another
+vLLM process for the same user exists. It never stops a process. It uses test port
+8081 by default, with `active` and `qwen3.8-flash-next` aliases. It changes no
+client settings. No test service has been installed.
+
+## Reused changes and preserved behavior
+
+The branch starts directly from
+[`opengfx1030:rdna_extras` at c6b5cfb90](https://github.com/opengfx1030/vllm-rdna/tree/c6b5cfb904f2edf99585a8b23c920dbb018ff54e).
+It does not merge mainline vLLM history.
+
+| Source | Integrated work |
+| --- | --- |
+| Current target branch | GDN sequence-local output addressing, state arenas, graph input and collective fixes, gated RMSNorm, current native prefill kernels, and TP4 correctness fallbacks. |
+| [PR #6](https://github.com/opengfx1030/vllm-rdna/pull/6), `22bb2e8d0`, `c05af4087` | Attention launch tuning, sequential-layout HIP MoE GEMV, Hybrid W4A16, and MTP/PP plumbing. |
+| [PR #8](https://github.com/opengfx1030/vllm-rdna/pull/8), `5765f57b4` | Flash-Next model/PLE/QSA/MTP infrastructure, FP16 hyperconnection fusion, QSA norm/rotary fusion, EP-aware skinny experts and optional dense INT8. |
+| [PR #7](https://github.com/opengfx1030/vllm-rdna/pull/7), `361df8a25` | PCIe topology-aware dispatch, combined with newer target all-reduce boot barriers/self-tests. |
+| [PR #3](https://github.com/opengfx1030/vllm-rdna/pull/3), `4b9badd0a` | Four-warps/one-stage gfx10 recurrent GDN tuning and shallow fused gating. |
+| [Leapdragon](https://github.com/leapdragon/vllm-rdna2-qwen/tree/35b351f5b79f072b9159aba39acd27bbaba25449) | Missing shared-expert fusion caller, rocBLAS build-hash lookup selection and offline TunableOp row probe. |
+| Our published branch | CPU PLE materialization/hash/FP8-byte/HIP-runtime fixes, checkpoint expert filtering, startup-plan invalidation, FP16 skinny decode, specialized INT4 expert decode/prefill, QSA live-context scoring bound, rotary/vision support, and separately prefixed draft cache groups. |
+
+The imported code needed integration fixes: missing QSA live-context metadata,
+the preselected embedding quantization argument, variable-length Mamba dtype
+annotations, and PP drafter typing. Native MoE eligibility now rejects explicit
+zero points on **either** projection, since that kernel only implements symmetric
+weights. Intel asymmetric experts retain the existing Triton path.
+
+The target branch's broad FULL-to-PIECEWISE policy is restricted to compiled
+configurations that actually have piecewise captures. Compilation mode 0 retains
+real full-decode captures. Both graph modes still require runtime qualification.
+The corrected native convolution alternatives remain opt-in; the candidate
+launcher selects the previously qualified Triton convolution path.
+
+Additional dense INT8, the alternative FP16 dense GEMV, RDNA custom all-reduce,
+startup-plan reuse, and TunableOp lookup default off in the candidate launcher.
+FP16 hyperconnection/shared-expert fusions remain selectable through the donor
+environment switches. Extra dense quantization is not required to use fusion.
+
+## Candidate launch preview
+
+Only a dry-run has been performed. From the candidate checkout:
+
+```bash
+V620_MM_LIMIT='{"image":4,"video":1}' \
+  bash tools/rdna2/serve_v620_candidate.sh --dry-run
+```
+
+The image/video counts above are an example for preview, not a qualified capacity
+or a proposed permanent limit. Set `V620_MM_LIMIT` explicitly for each memory
+test. Context capacity, image resolution and video frame sampling still constrain
+what fits in VRAM. Larger multimedia limits require a new profiling/memory check.
+
+The launcher uses FP16, TP4/EP4, MTP1, CPU PLE, a configured 262,144-token context,
+4 GiB of KV memory per card, 2,048 scheduled tokens and four request slots, with
+decode graph sizes 2/4/8. Tool parsing and thinking-disabled defaults are included.
+`VLLM_PLE_QUANT_DIR` may select an existing sidecar; no table is converted by the
+launcher. An unset sidecar uses checkpoint PLE in RAM as the comparison baseline.
+The explicit Engram config here supports the ROCm worker; embedding-across-DP
+sharding is rejected because that implementation has not been ported.
+
+TunableOp remains lookup-only. After offline qualification, set `V620_TUNABLEOP=1`
+and `V620_ROCBLAS_LIBRARY` to the actual library loaded by the testing wheel SDK.
+The helper requires all four per-device CSVs under
+`<test-root>/tunableop/rocblas-<library-sha256-first-12>/`. No donor solution IDs
+are assumed valid for the server's different ROCm build. The offline probe checks
+whether recorded solutions execute; it is not an accuracy or throughput test.
+
+## Local validation
+
+- 121 selected CPU tests pass across topology, PLE, expert loading and graph
+  policy/input helpers; six GPU cases skip. Five cases are excluded: two model
+  download tests, one test requiring the normal configuration fixture, and two
+  graph tests requiring accelerator/platform initialization.
+- 16 startup-plan persistence/invalidation tests pass.
+- Four separately prefixed draft-cache regression cases pass.
+- 12 HIP-MoE dispatch predicate cases pass, including down-projection zero points.
+- Python syntax, shell checks, repository hooks and static typing are checked
+  locally. GPU test collection is separate from GPU execution.
+
+Reproduce the CPU checks without downloading weights:
+
+```bash
+.venv/bin/python tools/rdna2/test_startup_plan_cpu.py
+.venv/bin/python -m pytest --noconftest -q \
+  tests/distributed/test_rdna_p2p.py \
+  tests/v1/worker/test_ple_offload_worker.py \
+  tests/compile/test_cudagraph_replay_inputs.py \
+  tests/model_executor/model_loader/test_ep_weight_filter.py \
+  -k 'not torch_compile_matches_eager and not TestSafetensors and not should_copy_and_wrap_eager_piecewise_graphmodules and not mrope_get_positions_contiguous_per_capture_size'
+.venv/bin/python -m pytest --noconftest -q \
+  tests/v1/core/test_kv_cache_utils.py -k separately_prefixed_draft
+.venv/bin/python -m pytest --noconftest -q \
+  tests/kernels/quantization/test_rocm_moe_skinny.py -k decode_supported
+```
+
+## Still required
+
+1. Once remote work is authorized, snapshot the stable runtime and build only in
+   the separate candidate installation, using matching wheel SDK/AMD-SMI bindings.
+2. Run native reference and changing-input graph tests, then short deterministic
+   text, tools, thinking, vision/video and MTP checks at concurrency 1/2/4.
+3. Establish coherent group-16 INT4 PLE output against the BF16-table control;
+   packing/hash/transfer checks alone do not establish model quality.
+4. Measure cold/warm API readiness and compare each enabled fusion, QSA profile,
+   dense/expert kernel and matched TunableOp lookup against the stable runtime.
+   Start with bounded prompts; the published 32k/64k benchmarks are the subsequent
+   comparison workloads. Do not begin with a 262k-token prefill.
+5. Assess larger graph captures against the full-context VRAM budget. Additional
+   dense INT8 needs accuracy measurements before default enablement.
+6. Later candidates remain in the reuse audit: mainline PLE/QSA output fusion,
+   QSA workspace reuse, portable V2 GDN changes, GPTQ loader exclusions, and
+   alternative dense prefill kernels. These are not claimed as integrated here.
+7. Replace PR #5's bloated branch only after the replacement's dependencies,
+   model behavior and benchmark descriptions have been reviewed and qualified.
+   The published PR has not been force-pushed by this local integration.
+
+AI assistance was used. This document records source reuse and local checks,
+not a new GPU performance or model-quality claim.

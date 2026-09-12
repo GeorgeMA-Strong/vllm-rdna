@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""T46: opaque custom ops with *runtime* decode/prefill dispatch for gfx1030.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+T46: opaque custom ops with *runtime* decode/prefill dispatch for gfx1030.
 
-torch.compile traces the model once for a dynamic token range, so a Python
-branch like `if 0 < n <= 8` is decided at trace time and the decode kernels
-never run inside the compiled graph (boot 6/8 of T45: only the hyper-connection
-linears, which sit outside the traced region, took the int8 path). Wrapping the
-decision in a custom op makes it a runtime choice on the real batch size.
+torch.compile traces the model once for a dynamic token range, so a Python branch
+like `if 0 < n <= 8` is decided at trace time and the decode kernels never run
+inside the compiled graph (boot 6/8 of T45: only the hyper-connection linears, which
+sit outside the traced region, took the int8 path). Wrapping the decision in a
+custom op makes it a runtime choice on the real batch size.
 
-  rdna_dense_gemm   int8-shadow GEMV for decode, fp16 rocBLAS for prefill
-  rdna_hc_mix       hyper-connection mix: 2 fused kernels for decode, torch for prefill
-  rdna_shared_expert shared expert (gate_up+silu*mul, down*sigmoid(gate)): 2 kernels / torch
+rdna_dense_gemm int8-shadow GEMV for decode, fp16 rocBLAS for prefill rdna_hc_mix
+hyper-connection mix: 2 fused kernels for decode, torch for prefill
+rdna_shared_expert shared expert (gate_up+silu*mul, down*sigmoid(gate)): 2 kernels /
+torch
 """
 
 import torch
@@ -74,8 +77,8 @@ def _rdna_hc_mix(
         block_input = ops.rdna_hc_up_gate_mix(lora, wu, su, xn, hc_count)
         return block_input, dai
     # prefill / fallback: the original op sequence
-    from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
     from vllm.model_executor.layers.rdna_dense_int8 import weight_for_gemm
+    from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
 
     w_down = weight_for_gemm(w_down, w_down_i8, s_down)
     w_up = weight_for_gemm(w_up, w_up_i8, s_up)
@@ -86,7 +89,9 @@ def _rdna_hc_mix(
     return block_input, dai
 
 
-def _rdna_hc_mix_fake(xn, w_down, w_down_i8, s_down, w_up, w_up_i8, s_up, lora_rank, hc_count):
+def _rdna_hc_mix_fake(
+    xn, w_down, w_down_i8, s_down, w_up, w_up_i8, s_up, lora_rank, hc_count
+):
     m = xn.shape[0]
     n_down = w_down_i8.shape[0] if w_down_i8 is not None else w_down.shape[0]
     return (
@@ -108,7 +113,12 @@ def _rdna_shared_expert(
 ) -> torch.Tensor:
     """Per-rank partial of sigmoid(w_gate.x) * down(silu(gate)*up); caller reduces."""
     n = _ntok(x)
-    if 0 < n <= _DECODE_MAX and x.dtype == torch.float16 and x.dim() == 2 and x.is_contiguous():
+    if (
+        0 < n <= _DECODE_MAX
+        and x.dtype == torch.float16
+        and x.dim() == 2
+        and x.is_contiguous()
+    ):
         from vllm import _custom_ops as ops
 
         a, sa = (w1_i8, s1) if w1_i8 is not None else (w1, None)

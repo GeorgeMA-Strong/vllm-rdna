@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GPU-resident Qwen4Exp position-learning enhancement layers."""
+"""Qwen4Exp PLE layers with optional CPU n-gram lookup."""
 
 import math
 from collections.abc import Iterable, Sequence
@@ -18,13 +18,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-import vllm.envs as envs
 from vllm.model_executor.layers.ple_offload_layer import (
     PleOffloadLayer,
     is_offload_process,
-)
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
+    is_ple_cpu_offload_enabled,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.qwen4_exp import (
@@ -38,7 +35,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import PLEVocabParallelEmbedding
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -75,6 +72,12 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
 
 
 class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+    positions_buffer: torch.Tensor
+    padded_buffer: torch.Tensor
+    ngram_heads_vocab_sizes: torch.Tensor
+    ngram_heads_offsets: torch.Tensor
+    layer_multipliers: torch.Tensor
+
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
     _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -232,10 +235,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = VocabParallelEmbedding(
+        # The checkpoint table is BF16 even when GPU computation uses FP16.
+        # Keep that storage precision in the dedicated RAM worker.
+        storage_dtype = torch.bfloat16 if is_offload_process() else None
+        self.ngram_embedding = PLEVocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim,
             padding_size=divisor,
+            params_dtype=storage_dtype,
             prefix=f"{prefix}.ngram_embedding",
         )
         self._max_total_tokens = int(max_total_tokens)
@@ -288,9 +295,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # These two are persistent buffers, so a to_empty() materialization
         # leaves them uninitialized; a zeroed vocab-size table divides by zero
         # in the n-gram hash. They are config-derived, so restore them exactly.
-        if self.ngram_heads_vocab_sizes.is_meta or int(
-            self.ngram_heads_vocab_sizes.sum()
-        ) == 0:
+        if (
+            self.ngram_heads_vocab_sizes.is_meta
+            or int(self.ngram_heads_vocab_sizes.sum()) == 0
+        ):
             self.ngram_heads_vocab_sizes = torch.tensor(
                 self._ngram_sizes, dtype=torch.long, device=device
             )
@@ -460,7 +468,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # the GPU worker so the huge table is never allocated there -- which also
         # means none of the buffers below exist. The CPU process owns the weights;
         # the GPU side keeps only the global scale. Mirrors nvidia/ple_layer.py.
-        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+        if is_ple_cpu_offload_enabled() and not is_offload_process():
             retained: set[str] = set()
             for name, loaded_weight in weights:
                 if name != "ngram_embedding.weight_scale":
@@ -532,12 +540,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
-                copy_ple_embedding_shard_(
-                    embedding.weight.data,
+                embedding.weight.weight_loader(
+                    embedding.weight,
                     loaded_weight,
                     checkpoint_start=checkpoint_start,
-                    tp_start=embedding.shard_indices.org_vocab_start_index,
-                    tp_end=embedding.shard_indices.org_vocab_end_index,
                 )
                 loaded.add("ngram_embedding.weight")
                 continue

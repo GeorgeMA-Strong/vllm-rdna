@@ -275,8 +275,8 @@ class TestEpFilterOnSyntheticMoeWeights:
     """Create synthetic safetensors files with expert-like naming and verify
     that the filter correctly skips non-local experts."""
 
-    @pytest.fixture
-    def synthetic_moe_files(self, tmp_path):
+    @pytest.fixture(params=["weight", "qweight"])
+    def synthetic_moe_files(self, tmp_path, request):
         """Create synthetic safetensors with expert-patterned tensor names."""
         from safetensors.torch import save_file
 
@@ -285,17 +285,20 @@ class TestEpFilterOnSyntheticMoeWeights:
         tensors["model.embed_tokens.weight"] = torch.randn(100, 64)
         tensors["model.layers.0.self_attn.q_proj.weight"] = torch.randn(64, 64)
         tensors["model.layers.0.input_layernorm.weight"] = torch.randn(64)
+        # Also exercise GPTQ/AWQ packed weights with their integer storage.
+        weight_suffix = request.param
+
+        def expert_weight(rows, cols):
+            if weight_suffix == "qweight":
+                return torch.randint(0, 2**31, (rows, cols), dtype=torch.int32)
+            return torch.randn(rows, cols)
+
         # Expert weights: 8 experts
         for expert_id in range(8):
-            tensors[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = (
-                torch.randn(128, 64)
-            )
-            tensors[f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = (
-                torch.randn(128, 64)
-            )
-            tensors[f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight"] = (
-                torch.randn(64, 128)
-            )
+            prefix = f"model.layers.0.mlp.experts.{expert_id}"
+            tensors[f"{prefix}.gate_proj.{weight_suffix}"] = expert_weight(128, 64)
+            tensors[f"{prefix}.up_proj.{weight_suffix}"] = expert_weight(128, 64)
+            tensors[f"{prefix}.down_proj.{weight_suffix}"] = expert_weight(64, 128)
         # Shared expert (should never be filtered)
         tensors["model.layers.0.mlp.shared_experts.gate_proj.weight"] = torch.randn(
             128, 64

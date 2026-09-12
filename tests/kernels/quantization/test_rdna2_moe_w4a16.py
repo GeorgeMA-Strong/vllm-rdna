@@ -69,10 +69,9 @@ def _make_packed_weights(E, K, N):
     packed = torch.zeros(E, K // 8, N, dtype=torch.int32, device=device)
     for i in range(8):
         packed |= (w[:, i::8, :] & 0xF) << (i * 4)
-    g_idx = torch.empty(0, dtype=torch.int32, device=device)
     for e in range(E):
         we = packed[e].contiguous()
-        ops.gptq_shuffle(we, g_idx, 4)
+        ops.gptq_shuffle(we, 4)
         packed[e] = we
     return packed
 
@@ -97,6 +96,85 @@ def _make_qzeros(E, groups, N):
 
 
 @gfx1030_only
+@pytest.mark.parametrize("M", [1, 4])
+@pytest.mark.parametrize("scale", [0.003, 0.01, 0.03125, 1.0])
+def test_moe_quantized_zero_is_exact_zero(M, scale):
+    """Use an independent invariant; dense and MoE share dequantization."""
+    K, N, G = 256, 256, 128
+    x = torch.ones((M, K), dtype=torch.float16, device=device)
+    # Every nibble is 8, so the GPTQ shuffle leaves this word unchanged.
+    weights = torch.full((1, K // 8, N), -2004318072, dtype=torch.int32, device=device)
+    scales = torch.full((1, K // G, N), scale, dtype=torch.float16, device=device)
+    zeros = _make_qzeros(1, K // G, N)
+    topk_ids = torch.zeros((M, 1), dtype=torch.int32, device=device)
+    si, ei, ntp = moe_align_block_size(topk_ids, M, 1)
+    out = torch.zeros((M, N), dtype=torch.float16, device=device)
+
+    ops.moe_gptq_gemm_rdna2(
+        x,
+        out,
+        weights,
+        scales,
+        zeros,
+        torch.empty(0, device=device),
+        si,
+        ei,
+        ntp,
+        1,
+        M,
+        False,
+        0,
+    )
+
+    torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@gfx1030_only
+@pytest.mark.parametrize("M,K,N", [(1, 256, 256), (4, 640, 2560), (4, 2560, 1280)])
+def test_moe_dequantization_matches_independent_reference(M, K, N):
+    """Check group-128 Intel expert shapes without sharing native dequant code."""
+    torch.manual_seed(42)
+    E, G, top_k = 3, 128, 2
+    x = (torch.randn(M, K, device=device) * 0.25).half()
+    packed = _make_packed_weights(E, K, N)
+    scales = _make_scales(E, K // G, N, torch.float16)
+    zeros = _make_qzeros(E, K // G, N)
+    topk_ids = torch.randint(0, E, (M, top_k), device=device, dtype=torch.int32)
+    si, ei, ntp = moe_align_block_size(topk_ids, 1, E)
+    out = torch.zeros(M * top_k, N, dtype=torch.float16, device=device)
+    ops.moe_gptq_gemm_rdna2(
+        x,
+        out,
+        packed,
+        scales,
+        zeros,
+        torch.empty(0, device=device),
+        si,
+        ei,
+        ntp,
+        top_k,
+        1,
+        False,
+        0,
+    )
+
+    # Packed storage places even nibbles in the low half, odd in the high half.
+    raw = torch.stack(
+        [(packed >> ((i // 2) * 4 + (i % 2) * 16)) & 15 for i in range(8)], dim=2
+    ).reshape(E, K, N)
+    weights = ((raw.float() - 8) * scales.float().repeat_interleave(G, dim=1)).half()
+    reference = torch.stack(
+        [
+            x[row].float() @ weights[int(topk_ids[row, slot])].float()
+            for row in range(M)
+            for slot in range(top_k)
+        ]
+    ).half()
+    relative_l2 = (out.float() - reference.float()).norm() / reference.float().norm()
+    assert relative_l2 < 0.002, f"relative L2 error: {relative_l2.item()}"
+
+
+@gfx1030_only
 @pytest.mark.parametrize("E, K, N_inter, top_k, group_size", MODEL_CONFIGS)
 @pytest.mark.parametrize("M", NUM_TOKENS)
 @pytest.mark.parametrize(
@@ -106,9 +184,8 @@ def _make_qzeros(E, groups, N):
         pytest.param(
             torch.bfloat16,
             marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
-                "fallback not yet wired into dispatch",
-                
+                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); "
+                "bf16 path uses fp16 dot fallback not yet wired into dispatch",
             ),
         ),
     ],
@@ -183,9 +260,8 @@ def test_fused_moe_w1_matches_dense(
         pytest.param(
             torch.bfloat16,
             marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
-                "fallback not yet wired into dispatch",
-                
+                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); "
+                "bf16 path uses fp16 dot fallback not yet wired into dispatch",
             ),
         ),
     ],
@@ -262,9 +338,8 @@ def test_fused_moe_output_topk_reduces(E, K, N_inter, top_k, group_size, M, dtyp
         pytest.param(
             torch.bfloat16,
             marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
-                "fallback not yet wired into dispatch",
-                
+                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); "
+                "bf16 path uses fp16 dot fallback not yet wired into dispatch",
             ),
         ),
     ],
@@ -372,7 +447,6 @@ def test_full_moe_e2e(E, K, N_inter, top_k, group_size, M, dtype):
     reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot fallback "
     "not yet wired into dispatch. Test hardcodes bfloat16; sentinel-expert test "
     "should be re-added when bf16 kernel lands.",
-    
 )
 def test_expert_id_minus_one():
     """Kernel handles expert_id == -1 (expert parallelism) without crash."""

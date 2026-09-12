@@ -7,17 +7,16 @@ from __future__ import annotations
 from typing import cast
 
 import torch
-
-from vllm import _custom_ops as ops
-from vllm.platforms import current_platform
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -121,10 +120,6 @@ class QSAIndexer(nn.Module):
             raise ValueError("QSA requires a paged KV cache")
         if vllm_config.model_config.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP16")
-        # gfx1030 has no native BF16; FP16 measures both faster and ~7x more
-        # accurate there, so the caches follow the model dtype rather than
-        # pinning BF16.
-        qsa_dtype = vllm_config.model_config.dtype
 
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
@@ -158,7 +153,7 @@ class QSAIndexer(nn.Module):
         cache_prefix = f"{prefix}." if prefix else ""
         self.raw_key_cache = QSAKeyStateCache(
             head_size=self.index_head_dim,
-            dtype=qsa_dtype,
+            dtype=vllm_config.model_config.dtype,
             cache_rope_positions=vllm_config.model_config.uses_mrope,
             prefix=f"{cache_prefix}raw_key_cache",
             cache_config=cache_config,
@@ -167,7 +162,7 @@ class QSAIndexer(nn.Module):
         )
         self.compressed_key_cache = QSACompressedKeyCache(
             head_size=self.index_head_dim,
-            dtype=qsa_dtype,
+            dtype=vllm_config.model_config.dtype,
             compress_ratio=self.compress_ratio,
             prefix=f"{cache_prefix}compressed_key_cache",
             cache_config=cache_config,
@@ -306,6 +301,7 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
+            max_seq_len=metadata.max_seq_len if metadata.num_prefills else None,
         )
 
     def forward(

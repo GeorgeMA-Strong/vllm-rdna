@@ -26,11 +26,13 @@ namespace gptq_rdna2 {
 // fp16 path
 // ---------------------------------------------------------------------------
 
-// Precompute scale-baked constants for a single zero/scale pair.
-//   z1z16[0] = scale * (-1024 - zero)            (used for "low" pairs)
-//   z1z16[1] = scale * (-64   - zero)            (used for "high" pairs)
-//   y1y16[0] = scale * 1                          (low pairs are q + 1024)
-//   y1y16[1] = scale * (1/16)                     (high pairs are q*16 + 1024)
+// Keep the integer offset separate from the scale. Baking the scale into
+// (-1024 - zero) rounds away significant bits in fp16: even q == zero then
+// dequantizes to a nonzero value. Subtract first, while every integer is exact.
+//   z1z16[0] = -1024 - zero                  (low pairs are q + 1024)
+//   z1z16[1] = -64 - zero                    (high pairs are q*16 + 1024)
+//   y1y16[0] = scale
+//   y1y16[1] = 1/16
 __forceinline__ __device__ void prep_zero_scale_fp16(uint32_t zero, half scale,
                                                      half2 (&z1z16)[2],
                                                      half2 (&y1y16)[2]) {
@@ -44,14 +46,10 @@ __forceinline__ __device__ void prep_zero_scale_fp16(uint32_t zero, half scale,
   half z1 = z1u.h;
   half z16 = __hsub(__int2half_rn(-64), __int2half_rn((int)zero));
 
-  half2 scale2 = __half2half2(scale);
-  z1z16[0] = __hmul2(scale2, __half2half2(z1));
-  z1z16[1] = __hmul2(scale2, __half2half2(z16));
-
-  half y1 = __float2half_rn(1.0f);
-  half y16 = __float2half_rn(1.0f / 16.0f);
-  y1y16[0] = __hmul2(scale2, __half2half2(y1));
-  y1y16[1] = __hmul2(scale2, __half2half2(y16));
+  z1z16[0] = __half2half2(z1);
+  z1z16[1] = __half2half2(z16);
+  y1y16[0] = __half2half2(scale);
+  y1y16[1] = __float2half2_rn(1.0f / 16.0f);
 }
 
 // Dequantize one int32 (8 shuffled 4-bit weights) into 4 half2 pairs:
@@ -74,10 +72,10 @@ __forceinline__ __device__ void dequant_4bit_8_fp16(uint32_t qa, half2 (&dq)[4],
   q2.u = (qa_hi & 0x000F000F) | c0;  // half2(q[4]+1024, q[5]+1024)
   q3.u = (qa_hi & 0x00F000F0) | c0;  // half2(q[6]*16+1024, q[7]*16+1024)
 
-  dq[0] = __hfma2(q0.h2, y1y16[0], z1z16[0]);
-  dq[1] = __hfma2(q1.h2, y1y16[1], z1z16[1]);
-  dq[2] = __hfma2(q2.h2, y1y16[0], z1z16[0]);
-  dq[3] = __hfma2(q3.h2, y1y16[1], z1z16[1]);
+  dq[0] = __hmul2(__hadd2(q0.h2, z1z16[0]), y1y16[0]);
+  dq[1] = __hmul2(__hfma2(q1.h2, y1y16[1], z1z16[1]), y1y16[0]);
+  dq[2] = __hmul2(__hadd2(q2.h2, z1z16[0]), y1y16[0]);
+  dq[3] = __hmul2(__hfma2(q3.h2, y1y16[1], z1z16[1]), y1y16[0]);
 }
 
 }  // namespace gptq_rdna2

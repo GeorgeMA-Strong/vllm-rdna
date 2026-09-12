@@ -281,11 +281,12 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        assert hidden_states is not None
         hidden_states = self.model(
             input_ids,
             positions,
@@ -350,6 +351,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
                 if param is not None:
                     weight_loader = getattr(param, "weight_loader", None)
                     if weight_loader is not None:
+                        assert weight_loader is not None
                         weight_loader(param, loaded_weight)
                     else:
                         param.data.copy_(loaded_weight)
@@ -518,6 +520,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        assert weight_loader is not None
                         weight_loader(param, loaded_weight)
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)

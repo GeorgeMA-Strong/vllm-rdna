@@ -563,6 +563,9 @@ class QSAForwardMetadata(AttentionMetadata):
     storage_block_size: int
     compress_ratio: int
 
+    num_prefills: int = 0
+    max_seq_len: int = 0
+
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
@@ -577,6 +580,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             compress_ratio = kv_cache_spec.tokens_per_state
@@ -651,6 +655,15 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             logical_positions=logical_positions,
             k_work_metadata=k_work_metadata,
             num_actual_tokens=num_tokens,
+            num_prefills=int(
+                (
+                    torch.diff(common_attn_metadata.query_start_loc_cpu)
+                    > (self.reorder_batch_threshold or 1)
+                )
+                .sum()
+                .item()
+            ),
+            max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
         )

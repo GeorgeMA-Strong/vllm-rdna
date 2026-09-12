@@ -4,18 +4,18 @@
 
 On startup, vLLM measures how much GPU memory the KV cache can use and
 computes the ``--kv-cache-memory`` value that reproduces that allocation.
-For a fixed (model, config, hardware, library) combination the result is
-deterministic, yet it is re-measured on every boot.
+For an unchanged model, configuration and runtime, this result can be
+reused instead of being re-measured on every boot.
 
 When ``VLLM_ENABLE_STARTUP_PLAN=1``, each worker persists that value under
 ``{VLLM_CACHE_ROOT}/startup_plan/`` (regenerable derived state, alongside
-the torch.compile cache), keyed by a fingerprint of everything the value
-depends on, and later boots apply it automatically -- skipping the
+the torch.compile cache), keyed by configuration and runtime properties.
+Later boots apply it automatically -- skipping the
 memory-profiling measurement and the CUDA-graph memory estimation pass --
-if and only if the fingerprint matches and the device has at least as much
+when the fingerprint matches and the device has at least as much
 free memory as when the plan was recorded. On any mismatch the worker
-falls back to full profiling, so a stale plan costs nothing and is never
-trusted.
+falls back to full profiling. This opt-in cache does not identify in-place
+checkpoint edits or every runtime change; re-profile after such changes.
 """
 
 import hashlib
@@ -35,13 +35,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
 
 
 def compute_plan_fingerprint(
-    vllm_config: VllmConfig, rank: int, world_size: int
+    vllm_config: VllmConfig, rank: int, world_size: int, device_id: int = 0
 ) -> str:
-    """Hash everything the profiled KV-cache memory value depends on.
+    """Hash graph configuration and additional memory-plan dependencies.
 
     ``VllmConfig.compute_hash()`` covers the vLLM version and the model,
     cache, parallel, and compilation configs, but deliberately contains no
@@ -49,24 +49,28 @@ def compute_plan_fingerprint(
     name, total memory, compute capability, and the torch/CUDA build are
     added here. The vLLM version is also pinned as an explicit factor so
     version invalidation holds no matter how ``compute_hash`` evolves.
+    Graph hashes omit the requested memory budget and request capacity;
+    both affect the profiled memory allocation and are included explicitly.
     Rank is included because per-rank memory use differs under TP/PP.
-    Driver-only changes are not part of the key; the free-memory gate at
-    apply time bounds the residual risk.
+    Driver-only changes are not part of the key.
     """
     # Imported here (as VllmConfig.compute_hash does) to avoid a cycle with
     # the top-level vllm package.
     from vllm import __version__ as vllm_version
 
-    capability = current_platform.get_device_capability()
+    capability = current_platform.get_device_capability(device_id)
     factors = {
         "schema": PLAN_SCHEMA_VERSION,
         "vllm": vllm_version,
         "vllm_config": vllm_config.compute_hash(),
-        "device_name": current_platform.get_device_name(),
-        "device_total_memory": current_platform.get_device_total_memory(),
+        "gpu_memory_utilization": vllm_config.cache_config.gpu_memory_utilization,
+        "max_num_seqs": vllm_config.scheduler_config.max_num_seqs,
+        "device_name": current_platform.get_device_name(device_id),
+        "device_total_memory": current_platform.get_device_total_memory(device_id),
         "device_capability": str(capability) if capability else "",
         "torch": torch.__version__,
         "cuda": torch.version.cuda or "",
+        "hip": torch.version.hip or "",
         "rank": rank,
         "world_size": world_size,
     }
@@ -92,11 +96,12 @@ def _load_plan(fingerprint: str) -> dict | None:
             plan = json.load(f)
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         logger.warning("Ignoring unreadable startup plan %s: %s", path, e)
         return None
     if (
-        plan.get("schema") != PLAN_SCHEMA_VERSION
+        not isinstance(plan, dict)
+        or plan.get("schema") != PLAN_SCHEMA_VERSION
         or plan.get("fingerprint") != fingerprint
     ):
         return None
@@ -115,9 +120,9 @@ def _applicable_kv_cache_memory_bytes(
     """
     kv_bytes = plan.get("kv_cache_memory_bytes")
     baseline = plan.get("free_memory_baseline")
-    if not isinstance(kv_bytes, int) or not isinstance(baseline, int):
+    if type(kv_bytes) is not int or type(baseline) is not int:
         return None
-    if kv_bytes <= 0:
+    if not 0 < kv_bytes <= baseline:
         return None
     if current_free_memory < baseline:
         logger.info(
@@ -138,10 +143,14 @@ def maybe_apply_startup_plan(worker: "Worker") -> None:
     if (
         not envs.VLLM_ENABLE_STARTUP_PLAN
         or worker.cache_config.kv_cache_memory_bytes is not None
+        or worker.device is None
     ):
         return
     fingerprint = compute_plan_fingerprint(
-        worker.vllm_config, worker.rank, worker.parallel_config.world_size
+        worker.vllm_config,
+        worker.rank,
+        worker.parallel_config.world_size,
+        worker.device.index or 0,
     )
     plan = _load_plan(fingerprint)
     if plan is None:
@@ -168,10 +177,13 @@ def maybe_save_startup_plan(worker: "Worker", kv_cache_memory_bytes: int) -> Non
     """Atomically persist this boot's profiling result for future boots.
     No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``; failures are logged,
     never raised."""
-    if not envs.VLLM_ENABLE_STARTUP_PLAN:
+    if not envs.VLLM_ENABLE_STARTUP_PLAN or worker.device is None:
         return
     fingerprint = compute_plan_fingerprint(
-        worker.vllm_config, worker.rank, worker.parallel_config.world_size
+        worker.vllm_config,
+        worker.rank,
+        worker.parallel_config.world_size,
+        worker.device.index or 0,
     )
     path = _plan_path(fingerprint)
     try:

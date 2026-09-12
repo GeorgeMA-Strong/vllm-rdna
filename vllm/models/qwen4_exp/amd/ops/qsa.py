@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import logging as _logging
 import math
+import os as _os
 
 import torch
 
@@ -14,6 +16,13 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx1030
+
+    _IS_GFX1030 = on_gfx1030()
+else:
+    _IS_GFX1030 = False
 
 
 @triton.jit
@@ -583,30 +592,42 @@ def _compress_qsa_groups_kernel(
     )
 
 
-import os as _os
-import logging as _logging
-
-
 def _qsa_env_int(name: str, default):
     v = _os.environ.get(name)
     return default if v is None or v == "" else int(v)
 
 
-# gfx1030 tuning knobs. Defaults = 2026-09-05 sweep winners (sparse prefill BLOCK_N 64->32, warps 2->4;
-# MQA scoring BLOCK_N 32->128, warps 4->8): +3% @3.3k / +5% @30k prefill in-serve, decode unchanged.
+# gfx1030 tuning knobs. Defaults = 2026-09-05 sweep winners (sparse prefill BLOCK_N
+# 64->32, warps 2->4;
+# MQA scoring BLOCK_N 32->128, warps 4->8): +3% @3.3k / +5% @30k prefill in-serve,
+# decode unchanged.
 _QSA_MQA_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_MQA_BLOCK_N", 128)
 _QSA_MQA_WARPS = _qsa_env_int("VLLM_RDNA_QSA_MQA_WARPS", 8)
-_QSA_MQA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_MQA_STAGES", None)  # None -> Triton default (2 on AMD)
-_QSA_PREFILL_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_BLOCK_N", 32)  # prefill branch only (base_programs > 512)
+_QSA_MQA_STAGES = _qsa_env_int(
+    "VLLM_RDNA_QSA_MQA_STAGES", None
+)  # None -> Triton default (2 on AMD)
+_QSA_PREFILL_BLOCK_N = _qsa_env_int(
+    "VLLM_RDNA_QSA_BLOCK_N", 32
+)  # prefill branch only (base_programs > 512)
 _QSA_PREFILL_SPLITS = _qsa_env_int("VLLM_RDNA_QSA_SPLITS", 1)
 _QSA_PREFILL_WARPS = _qsa_env_int("VLLM_RDNA_QSA_WARPS", 4)
-_QSA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_STAGES", None)  # None -> 1 on ROCm, 2 elsewhere
-_QSA_OVERRIDES = {k: v for k, v in _os.environ.items() if k.startswith("VLLM_RDNA_QSA_")}
+_QSA_STAGES = _qsa_env_int(
+    "VLLM_RDNA_QSA_STAGES", None
+)  # None -> 1 on ROCm, 2 elsewhere
+_QSA_OVERRIDES = {
+    k: v for k, v in _os.environ.items() if k.startswith("VLLM_RDNA_QSA_")
+}
 if _QSA_OVERRIDES:
     _logging.getLogger(__name__).warning("QSA overrides active: %s", _QSA_OVERRIDES)
 _logging.getLogger(__name__).info(
-    "QSA launch params: mqa_bn=%s mqa_warps=%s mqa_stages=%s prefill_bn=%s prefill_splits=%s prefill_warps=%s",
-    _QSA_MQA_BLOCK_N, _QSA_MQA_WARPS, _QSA_MQA_STAGES, _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS,
+    "QSA launch params: mqa_bn=%s mqa_warps=%s mqa_stages=%s "
+    "prefill_bn=%s prefill_splits=%s prefill_warps=%s",
+    _QSA_MQA_BLOCK_N,
+    _QSA_MQA_WARPS,
+    _QSA_MQA_STAGES,
+    _QSA_PREFILL_BLOCK_N,
+    _QSA_PREFILL_SPLITS,
+    _QSA_PREFILL_WARPS,
 )
 
 
@@ -660,7 +681,7 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = _QSA_MQA_BLOCK_N
-    _qsa_mqa_extra = {} if _QSA_MQA_STAGES is None else {'num_stages': _QSA_MQA_STAGES}
+    _qsa_mqa_extra = {} if _QSA_MQA_STAGES is None else {"num_stages": _QSA_MQA_STAGES}
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         k_cache,
@@ -765,6 +786,8 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    *,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -779,6 +802,13 @@ def qsa_select_paged_tokens(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
+    if max_seq_len is not None:
+        if max_seq_len < 0:
+            raise ValueError("QSA context bound must be non-negative")
+        # Match the live-context bound used by the NVIDIA prefill indexer.
+        # Keep enough columns for top-k even when only a few blocks are visible.
+        live_columns = triton.cdiv(triton.cdiv(max_seq_len, compress_ratio), 64) * 64
+        columns = min(columns, max(block_topk, live_columns))
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
@@ -798,6 +828,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
@@ -876,8 +907,6 @@ def qsa_sparse_paged_attention(
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     assert q.dtype == k_cache.dtype == v_cache.dtype
-    # gfx1030 lacks native BF16; FP16 measured faster and ~7x more accurate
-    # against an FP32 reference on this kernel, so both are permitted.
     assert q.dtype in (torch.bfloat16, torch.float16)
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
@@ -912,10 +941,19 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
-        block_n, target_splits, partial_warps = _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS
+        block_n, target_splits, partial_warps = (
+            _QSA_PREFILL_BLOCK_N,
+            _QSA_PREFILL_SPLITS,
+            _QSA_PREFILL_WARPS,
+        )
+    if _IS_GFX1030 and group_size == 6 and head_dim == 256 and partial_warps == 2:
+        # Four warps avoid severe register spilling in the TP4 prefill tile.
+        partial_warps = 4
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
-    partial_stages = (1 if current_platform.is_rocm() else 2) if _QSA_STAGES is None else _QSA_STAGES
+    partial_stages = (
+        (1 if current_platform.is_rocm() else 2) if _QSA_STAGES is None else _QSA_STAGES
+    )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.

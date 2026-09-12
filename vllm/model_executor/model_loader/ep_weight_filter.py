@@ -76,6 +76,6 @@ def should_skip_weight(
     # Only skip heavy weight tensors, never scale/metadata tensors.
     # Scale tensors are tiny and some backends need them from ALL experts
     # (e.g. FlashInfer NVFP4 computes a global max of activation scales).
-    if not weight_name.endswith((".weight", ".weight_packed")):
+    if not weight_name.endswith((".weight", ".weight_packed", ".qweight")):
         return False
     return eid not in local_expert_ids

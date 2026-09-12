@@ -862,8 +862,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             parallel_config.enable_dbo or parallel_config.ubatch_size > 1
         ):
             raise NotImplementedError(
-                "Qwen4Exp PLE/QSA does not support dual-batch overlap or "
-                "microbatching"
+                "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:

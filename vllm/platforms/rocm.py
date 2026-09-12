@@ -201,6 +201,8 @@ def _get_gcn_arch() -> str:
     Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
     Called once at module level; result stored in _GCN_ARCH.
     """
+    if torch.version.hip is None:
+        return ""
     try:
         return _query_gcn_arch_from_amdsmi()
     except Exception as e:
@@ -310,6 +312,10 @@ def on_gfx1x() -> bool:
 
 def on_gfx10x() -> bool:
     return _ON_GFX10X
+
+
+def on_gfx1030() -> bool:
+    return _GCN_ARCH.split(":", 1)[0] == "gfx1030"
 
 
 def on_gfx11() -> bool:

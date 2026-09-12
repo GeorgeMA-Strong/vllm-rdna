@@ -164,8 +164,7 @@ logger = init_logger(__name__)
 
 # --- DEBUG: per-step phase timing (gated by DBG_VLLM_STEP_TIMING=1) ---
 _DBG_STEP_TIMING = os.environ.get("DBG_VLLM_STEP_TIMING") == "1"
-_dbg_phase_ns = {}
-print(f"[DIAG_GMR_SUB] gpu/model_runner.py imported: _DBG_STEP_TIMING={_DBG_STEP_TIMING}, DBG_VLLM_STEP_TIMING env={os.environ.get('DBG_VLLM_STEP_TIMING')!r}", flush=True)
+_dbg_phase_ns: dict[str, float] = {}
 
 
 class _DbgPhase:
@@ -189,9 +188,7 @@ class _DbgPhase:
 def _dbg_flush_step(rank: int, step: int) -> None:
     if not _DBG_STEP_TIMING or not _dbg_phase_ns:
         return
-    parts = " ".join(
-        f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items()
-    )
+    parts = " ".join(f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items())
     print(f"[STEP_TIMING rank={rank} step={step}] {parts}", flush=True)
     _dbg_phase_ns.clear()
 
@@ -1707,7 +1704,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # inputs); wrappers only replay when the runtime mode is PIECEWISE.
         runtime_mode = (
             CUDAGraphMode.PIECEWISE
-            if rocm_full_executes_as_piecewise(batch_desc.cg_mode)
+            if rocm_full_executes_as_piecewise(
+                batch_desc.cg_mode, self.compilation_config
+            )
             else batch_desc.cg_mode
         )
         batch_descriptor = BatchDescriptor(
@@ -1727,7 +1726,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_padding=input_batch.is_padding,
         ):
             self.kv_connector.pre_forward(scheduler_output)
-            if rocm_full_executes_as_piecewise(batch_desc.cg_mode):
+            if rocm_full_executes_as_piecewise(
+                batch_desc.cg_mode, self.compilation_config
+            ):
                 assert self.cudagraph_manager is not None
                 model_output = self.cudagraph_manager.run_pw_graph(
                     self.model, model_inputs
