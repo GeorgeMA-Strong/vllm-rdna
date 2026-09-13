@@ -7,8 +7,8 @@ different rocBLAS build, even when version strings match.
 
 ## Qualified build
 
-`rocblas-c27e2252cc7a` contains 21 FP16 dense matrix shapes for 1,024, 2,048, and
-4,096 input rows. All shapes passed independent FP32 comparisons on all four
+`rocblas-c27e2252cc7a` contains 28 FP16 dense matrix shapes for 1,024, 2,048,
+4,096, and 8,192 input rows. All shapes passed independent FP32 comparisons on all four
 GPUs. `provenance.json` records the full library hash and package versions.
 Each rank uses an identical copy of the qualified rows.
 
@@ -22,7 +22,7 @@ V620_MTP_TOKENS=0 \
 VLLM_RDNA_AR=1 VLLM_RDNA_AR_MAX_KB=64 HSA_FORCE_FINE_GRAIN_PCIE=1 \
 V620_TUNABLEOP=1 \
 V620_ROCBLAS_LIBRARY=/path/to/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5 \
-bash tools/rdna2/serve_v620_candidate.sh --max-num-batched-tokens 4096
+bash tools/rdna2/serve_v620_candidate.sh --max-num-batched-tokens 8192
 ```
 
 ## Full-model validation
@@ -37,21 +37,31 @@ The unmodified `llm-context-bench` runner at
 1,024 output tokens. An explicit 11% input-size tolerance accommodates this
 tokenizer; actual prompt counts are shown below.
 
-| Workload | Actual prompt tokens | Before prefill tok/s | Tuned prefill tok/s | Tuned decode tok/s | Trial |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Code 16k | 18,063 | 1,194.77 | 1,441.48 | 41.21 | Valid |
-| Code 32k | 36,135 | 1,194.31 | 1,441.21 | 41.10 | Valid |
-| Prose 16k | 16,750 | 1,031.65 | 1,403.52 | 41.32 | Invalid: stopped at 731 output tokens |
-| Prose 32k | 33,455 | — | 1,444.13 | 41.20 | Invalid: stopped at 776 output tokens |
+| Workload | Actual prompt tokens | 4k batch prefill tok/s | 8k batch prefill tok/s | 8k batch decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Prose 16k | 16,750 | 1,400.49 | 1,418.08 | 42.12 |
+| Prose 32k | 33,455 | 1,442.87 | 1,458.51 | 42.01 |
+| Code 16k | 18,063 | 1,443.85 | 1,470.56 | 42.05 |
+| Code 32k | 36,135 | 1,441.24 | 1,467.69 | 41.98 |
 
-The prose timings are retained observations and are excluded from valid trial
-comparisons. The untuned prose 32k trial also stopped early. Both configurations
-passed all four long-context quality cases and the single/four-request smoke
-checks. This is a bounded regression evaluation, not a broad accuracy benchmark.
+All eight performance trials completed 1,024 output tokens and passed the runner's
+validity checks. Both configurations include the donor's independent `wvSplitK`
+output allocation. The earlier shared-output implementation could overwrite a
+retained projection result; its earlier apparent quality successes are not a
+reliable correctness baseline.
 
-The tuned run reached a healthy API in 243.25 seconds, versus 255.26 seconds for
-the untuned MTP0 run. These were successive boots with existing filesystem caches,
-not a controlled cold-storage startup comparison.
+Both corrected configurations passed the single/four-request smoke checks but
+passed only two of four long-context quality cases. Both code cases returned
+`billing_units: 59` instead of `61`. An untuned FP16 control with the same output
+ownership fix produced the same failure. These results do not establish broad
+model accuracy, and the candidate remains experimental pending that investigation.
+The benchmark fixtures and scoring were not changed.
+
+The 8k-batch run reached a healthy API in 248.30 seconds; the 4k-batch run took
+243.26 seconds. Maximum worker model-loading time was 90.73 and 92.11 seconds,
+respectively. These were successive starts with existing filesystem caches,
+not a controlled cold-storage startup comparison. Model-loading memory was
+19.18 GiB per GPU at batch 8k, plus the separately allocated 4 GiB KV cache.
 
 ## Regenerate for another rocBLAS build
 

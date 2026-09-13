@@ -1,21 +1,16 @@
 {
+  "library": "/home/george/v620-vllm-testing/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5",
   "sha256": "c27e2252cc7a4b6e174601a180a169822dcf15a29e634046daecb61498e3bd2a",
   "torch": "2.13.0+rocm10.0.0",
   "hip": "7.15.26333",
   "dtype": "float16",
   "seed": 620,
+  "batch_tokens": [
+    1024,
+    2048,
+    4096,
+    8192
+  ],
   "source": "Adapted existing v620-probe-dense-tunable.py",
-  "library_relative_path": "_rocm_sdk_libraries/lib/librocblas.so.5",
-  "validation": {
-    "gpus": 4,
-    "fp16_dense_shapes_per_gpu": 21,
-    "reference": "Independent FP32 matrix products",
-    "atol": 0.01,
-    "rtol": 0.01,
-    "relative_l2_limit": 0.002,
-    "long_context_quality_passed": 4,
-    "long_context_quality_total": 4,
-    "dense_int8": false,
-    "mtp_tokens": 0
-  }
+  "base_rows": "/home/george/v620-vllm-testing/tunableop/rocblas-c27e2252cc7a"
 }
