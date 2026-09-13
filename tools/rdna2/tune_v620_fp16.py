@@ -9,6 +9,16 @@ hash; serving only looks up measured rows and never tunes on a request.
 import argparse
 from pathlib import Path
 
+DENSE_SHAPES = (
+    (336, 10240),
+    (10240, 320),
+    (4096, 2560),
+    (2560, 1536),
+    (512, 2560),
+    (10240, 2560),
+    (3584, 2560),
+)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -97,15 +107,7 @@ def main():
         return start.elapsed_time(end) / 10
 
     for m in args.batch_tokens:
-        for n, k in (
-            (336, 10240),
-            (10240, 320),
-            (4096, 2560),
-            (2560, 1536),
-            (512, 2560),
-            (10240, 2560),
-            (3584, 2560),
-        ):
+        for n, k in DENSE_SHAPES:
             a = torch.randn((m, k), device="cuda", dtype=torch.float16) * 0.1
             w = torch.randn((n, k), device="cuda", dtype=torch.float16) * 0.1
             tunable.enable(False)

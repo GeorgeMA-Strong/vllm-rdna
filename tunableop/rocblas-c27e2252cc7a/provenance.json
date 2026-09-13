@@ -6,11 +6,17 @@
   "dtype": "float16",
   "seed": 620,
   "batch_tokens": [
+    800,
     1024,
+    1600,
     2048,
+    2400,
+    3072,
+    3200,
+    4000,
     4096,
     8192
   ],
   "source": "Adapted existing v620-probe-dense-tunable.py",
-  "base_rows": "/home/george/v620-vllm-testing/tunableop/rocblas-c27e2252cc7a"
+  "base_rows": "/home/george/v620-vllm-testing/cache-prefill-recovery-2026-09-13/qualified/rocblas-c27e2252cc7a"
 }

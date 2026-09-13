@@ -59,6 +59,7 @@ command=("$venv/bin/python" -m vllm.entrypoints.openai.api_server
     --host 127.0.0.1 --port "$port"
     --tensor-parallel-size 4 --enable-expert-parallel --enable-ep-weight-filter
     --dtype float16 --max-model-len 262144
+    --block-size 1024
     --max-num-seqs 4 --max-num-batched-tokens 2048
     --kv-cache-memory-bytes 4294967296
     --compilation-config "$compilation_config"
@@ -99,7 +100,11 @@ if [[ ${V620_TUNABLEOP:-0} == 1 ]]; then
     if [[ ! -d $rows_root && -z ${V620_TUNABLEOP_ROOT:-} ]]; then
         rows_root=$source_dir/tunableop
     fi
-    configure_v620_tunableop "${V620_ROCBLAS_LIBRARY:?Set the matching rocBLAS library}" "$rows_root"
+    configure_v620_tunableop "${V620_ROCBLAS_LIBRARY:-}" "$rows_root"
+    if [[ $PYTORCH_TUNABLEOP_ENABLED == 1 ]]; then
+        "$venv/bin/python" "$source_dir/tools/rdna2/check_v620_tuning.py" \
+            --rows-template "$PYTORCH_TUNABLEOP_FILENAME" "${command[@]:1}" "$@"
+    fi
 fi
 "$venv/bin/python" - "$test_root" "$source_dir" <<'PY'
 import sys

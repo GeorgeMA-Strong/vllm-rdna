@@ -10,6 +10,9 @@ All selected short single/four-request checks pass, but the separate long-contex
 quality suite passes only 2/4 cases. Performance validity checks do not establish
 model accuracy. No configuration here establishes 90 tok/s sustained decode.
 
+The tables in the initial campaign precede the conversation-cache correction.
+See the recovery section below for the current cache-enabled deployment.
+
 ## Reused code and measured changes
 
 - Reuse opengfx1030 PRs #6/#7/#8, selected PR #3 GDN tuning, and Leapdragon's
@@ -212,3 +215,70 @@ metrics/results, and checks output, cache reuse and TTFT. Artifacts and the
 pre-fix Python rollback archives are saved in the testing workspace under
 `followup-latency-2026-09-13`. The enhanced manual service remains on port 8080;
 the original saved build and boot unit are preserved.
+
+## Cache-enabled prefill recovery (September 13)
+
+The cache correction changed ordinary prefill chunks from 4,096 to 4,000 tokens
+on the automatic 800-token state grid. The original 28 exact-shape FP16 solver
+rows did not cover these shapes. Fresh uncached 16k probes reproduced the
+regression at 1,145 and 1,142 tok/s.
+
+Reuse the existing donor TunableOp tooling, adding 42 rows while retaining the
+original 28 unchanged. All 70 rows pass independent FP32 comparisons on all four
+V620s. For example, the 4,000-token router improved from 10.063 to 1.244 ms;
+the previously uncovered 3,072-token router improved from 8.579 to 0.859 ms.
+Set `--block-size 1024 --max-num-batched-tokens 4096` to preserve ordinary
+4,096-token chunks while retaining conversation caching. The 3,072-token rows
+also cover intermediate stops on this grid. No native kernels, weight precision,
+MTP count or all-reduce settings changed during this recovery.
+
+The following are raw timings from the final configuration, one trial per case,
+using the same unmodified benchmark revision and locked sampling described
+above. A loopback streaming adapter adds a unique `cache_salt` per request;
+server metric deltas confirm zero prefix-cache hits during the benchmark runs.
+Every request produced the requested 1,024 output tokens.
+
+| Workload | Actual prompt tokens | Prefill tok/s | Decode tok/s | TTFT s | Harness valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Prose 16k | 16,750 | 1,369.83 | 59.23 | 12.23 | yes |
+| Prose 32k | 33,455 | 1,390.23 | 55.71 | 24.06 | yes |
+| Code 16k | 18,063 | 1,387.70 | 66.12 | 13.02 | yes |
+| Code 32k | 36,135 | 1,391.18 | 67.94 | 25.97 | no: repeated-token flag |
+| Prose 64k | 66,913 | 1,378.53 | 60.21 | 48.54 | yes |
+| Prose 128k | 133,816 | 1,318.74 | 53.69 | 101.47 | yes |
+| Code 64k | 71,971 | 1,372.64 | 65.95 | 52.43 | yes |
+| Code 128k | 143,855 | 1,288.27 | 66.24 | 111.67 | yes |
+
+A single fixed repeat of code 32k/128k measured 1,402.00/1,301.56 tok/s prefill
+and 73.85/67.82 tok/s decode. Both code 32k trials triggered the unchanged
+`dominant_repeated_token` check: generated TypeScript contains long hyphen
+separator lines. Their raw timings are retained but excluded from valid
+performance aggregates. The code 128k repeat passed. No retry-until-pass or
+scoring changes were used. The earlier 80.61 tok/s code 128k decode result was
+not reproduced: the two current trials measured 66.24 and 67.82 tok/s.
+
+Final validation: eight arithmetic requests at concurrency four and two vision
+requests pass; deterministic prose/code cold and cached outputs match exactly;
+two concurrent chats retain separate requested words. A direct 16k follow-up
+reused 15,360 tokens and started in 1.660 s, versus 11.988 s for its initial
+16,828-token request. Launch to healthy API took 257.945 s with existing
+filesystem caches. These checks do not resolve the earlier 2/4 long-context
+quality result or establish BF16-equivalent accuracy.
+
+Tuning tables and provenance are versioned with the launcher. Normal launches
+warn about incomplete known-shape coverage and continue using default FP16
+algorithms for missing shapes. Missing or incompatible library tables disable
+TunableOp with a warning. `check_v620_tuning.py --strict` is an optional release
+check, not a normal-service availability requirement. Four CPU regression tests
+cover valid tables, missing shapes, final CLI overrides and incompatible-library
+fallback. New runner shapes, arbitrary tails and mixed batches still require
+benchmarking; passing static coverage does not guarantee optimal performance.
+
+Reproduction artifacts, exact launch arguments, per-rank tuning hashes, raw
+benchmark JSON, metrics and GPU telemetry are saved under
+`/home/george/v620-vllm-testing/cache-prefill-recovery-2026-09-13` and the local
+workspace's matching `review-artifacts/cache-prefill-recovery-2026-09-13`.
+The current manual service uses the isolated testing installation on port 8080,
+with model alias `active`, MTP2, FP16 dense weights and CPU BF16 PLE. The original
+stable installation and boot unit remain preserved; this manual deployment
+does not change which service starts at reboot.

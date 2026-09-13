@@ -7,25 +7,59 @@ different rocBLAS build, even when version strings match.
 
 ## Qualified build
 
-`rocblas-c27e2252cc7a` contains 28 FP16 dense matrix shapes for 1,024, 2,048,
-4,096, and 8,192 input rows. All shapes passed independent FP32 comparisons on all four
-GPUs. `provenance.json` records the full library hash and package versions.
+`rocblas-c27e2252cc7a` contains 70 FP16 dense matrix shapes for 800, 1,024,
+1,600, 2,048, 2,400, 3,072, 3,200, 4,000, 4,096, and 8,192 input rows. All shapes
+passed independent FP32 comparisons on all four GPUs. `provenance.json` records
+the full library hash and package versions.
 Each rank uses an identical copy of the qualified rows.
 
-The launcher checks the library hash and requires all four rank files. It keeps
-online tuning disabled. Runtime-generated rows under the testing directory take
+The launcher checks the library hash and all four rank files. If the matching
+table is unavailable, it logs a warning and uses default FP16 algorithms instead
+of loading incompatible solver IDs. Missing aligned chunk shapes also produce
+an explicit warning; normal serving continues. Online tuning stays disabled.
+`check_v620_tuning.py --strict` makes incomplete coverage fail a release check;
+it reads the final cache/batch CLI overrides. Runtime-generated rows under the testing directory take
 precedence over these bundled rows; `V620_TUNABLEOP_ROOT` selects an explicit root.
 
 ```bash
 V620_MM_LIMIT='{"image":4,"video":1}' \
-V620_MTP_TOKENS=0 \
+V620_MTP_TOKENS=2 \
 VLLM_RDNA_AR=1 VLLM_RDNA_AR_MAX_KB=64 HSA_FORCE_FINE_GRAIN_PCIE=1 \
 V620_TUNABLEOP=1 \
 V620_ROCBLAS_LIBRARY=/path/to/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5 \
-bash tools/rdna2/serve_v620_candidate.sh --max-num-batched-tokens 8192
+bash tools/rdna2/serve_v620_candidate.sh --max-num-batched-tokens 4096
 ```
 
-## Full-model validation
+## Cache-aligned prefill
+
+With automatic block sizing, Flash-Next TP4 conversation caching aligns
+intermediate chunk ends to an 800-token recurrent-state grid. With a 4,096-token scheduling budget, ordinary
+chunks therefore contain 4,000 tokens. Exact-shape TunableOp lookup cannot use
+4,096-token rows for these chunks. The table now includes the five multiples of
+800 up to 4,000, retaining every previously qualified entry unchanged.
+
+These added entries were generated with `tune_v620_fp16.py --batch-tokens 4000
+800 1600 2400 3200`, merged with the existing entries for the same library hash,
+and replayed with `qualify_v620_fp16.py` on all four V620s. The 3,072-token entries
+were generated and qualified in the same way.
+
+Use `--block-size 1024` with the 4,096-token MTP2 scheduling budget to retain
+4,096-token ordinary chunks. The 1,024/2,048/3,072 rows cover intermediate stops
+on this grid. The original 800-token automatic grid remains covered by the
+additional 800/1,600/2,400/3,200/4,000 entries. Keep cache-aligned scheduling
+enabled; disabling it breaks reusable conversation state.
+
+The coverage check covers the known seven dense projection dimensions and aligned
+chunks. Arbitrary prompt tails, mixed batches, or model/runner changes can still
+introduce other shapes. Re-run the cold-context performance and prefix-reuse
+checks before promoting any later optimization. Retain the previous release's
+source, environment, tuning files and launch command for rollback.
+
+An 8,192-token budget on the 1,024 grid additionally requires qualifying 5,120,
+6,144 and 7,168-token rows; the older standalone 8,192 entries alone are not full
+coverage. A different rocBLAS hash requires a separately qualified table.
+
+## Earlier full-model validation
 
 Tested with the existing Intel AutoRound INT4 expert checkpoint, FP16 dense
 weights, original BF16 PLE in CPU RAM, TP4/EP4, and MTP disabled. Dense INT8 shadows
@@ -71,7 +105,9 @@ removes the serving environment's TunableOp enable/tuning overrides before
 importing Torch: those environment variables take precedence over the Python API.
 
 ```bash
-.venv/bin/python tools/rdna2/tune_v620_fp16.py --output-root /path/to/testing/tunableop
+.venv/bin/python tools/rdna2/tune_v620_fp16.py \
+  --output-root /path/to/testing/tunableop \
+  --batch-tokens 800 1024 1600 2048 2400 3072 3200 4000 4096 8192
 .venv/bin/python tools/rdna2/qualify_v620_fp16.py /path/to/testing/tunableop/rocblas-HASH
 ```
 
