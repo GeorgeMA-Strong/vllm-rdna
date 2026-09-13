@@ -214,6 +214,7 @@ cython_debug/
 
 # Results
 *.csv
+!tunableop/rocblas-*/tunableop_results[0-3].csv
 
 # Python pickle files
 *.pkl

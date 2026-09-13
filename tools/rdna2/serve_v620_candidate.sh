@@ -95,7 +95,11 @@ if [[ ${V620_TUNABLEOP:-0} == 1 ]]; then
     # V620_ROCBLAS_LIBRARY must identify the library loaded by this wheel SDK.
     # shellcheck source=tools/rdna2/tunableop_env.sh
     source "$source_dir/tools/rdna2/tunableop_env.sh"
-    configure_v620_tunableop "${V620_ROCBLAS_LIBRARY:?Set the matching rocBLAS library}" "$test_root/tunableop"
+    rows_root=${V620_TUNABLEOP_ROOT:-$test_root/tunableop}
+    if [[ ! -d $rows_root && -z ${V620_TUNABLEOP_ROOT:-} ]]; then
+        rows_root=$source_dir/tunableop
+    fi
+    configure_v620_tunableop "${V620_ROCBLAS_LIBRARY:?Set the matching rocBLAS library}" "$rows_root"
 fi
 "$venv/bin/python" - "$test_root" "$source_dir" <<'PY'
 import sys
