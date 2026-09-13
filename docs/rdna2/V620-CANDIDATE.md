@@ -1,4 +1,4 @@
-# V620 candidate integration — 2026-09-12
+# V620 candidate integration — 2026-09-13
 
 This remains a development candidate. The initial integration was local only.
 After remote testing was authorized, its native extensions were built and tested
@@ -7,7 +7,7 @@ it has not been replaced. Historical benchmark results are not candidate results
 
 ## Isolation and stable baseline
 
-- Published source: `fa961c2250aa0eb6797b0787b5f04381895c017d` (PR #5).
+- Preserved original deployment source: `fa961c2250aa0eb6797b0787b5f04381895c017d` (PR #5).
 - Local preservation tag: `stable/v620-fp16-2026-09-12`.
 - A checksummed source archive is outside this checkout, under the workspace's
   `stable-releases/v620-fp16-2026-09-12/` directory.
@@ -15,7 +15,8 @@ it has not been replaced. Historical benchmark results are not candidate results
   now preserves source, built extensions, environment, Python runtime, tools and
   the boot unit at
   `/home/george/v620-stable-releases/2026-09-12-before-refresh`.
-- Local candidate: `vllm-rdna-testing`, branch `codex/v620-rdna-refresh`.
+- Local testing: `vllm-rdna-testing`, branch `codex/v620-rdna-refresh`.
+- Clean PR worktree: `vllm-rdna-pr-clean`, branch `codex/v620-pr-clean`.
 - Remote candidate root: `/home/george/v620-vllm-testing`; use `source`,
   `.venv`, build outputs, caches, logs, and any test service exclusively there.
 - Protected deployment: `/home/george/v620-vllm/source`, its sibling `.venv`,
@@ -38,7 +39,9 @@ the existing stable boot unit is unchanged.
 
 The branch starts directly from
 [`opengfx1030:rdna_extras` at c6b5cfb90](https://github.com/opengfx1030/vllm-rdna/tree/c6b5cfb904f2edf99585a8b23c920dbb018ff54e).
-It does not merge mainline vLLM history.
+It merges subsequent target updates through `f86faadbd` without adding mainline
+vLLM history. The replacement contains 17 commits above that target before final
+reporting changes, rather than the original 795-commit dependency history.
 
 | Source | Integrated work |
 | --- | --- |
@@ -54,7 +57,9 @@ The imported code needed integration fixes: missing QSA live-context metadata,
 the preselected embedding quantization argument, variable-length Mamba dtype
 annotations, and PP drafter typing. Native MoE eligibility now rejects explicit
 zero points on **either** projection, since that kernel only implements symmetric
-weights. Intel asymmetric experts retain the existing Triton path.
+weights. The Intel checkpoint is symmetric INT4/group128; its AutoRound packing
+and selected WNA16 runtime path are distinct from the alternative native AWQ
+path. It retains the qualified sequential Triton expert implementation.
 
 The target branch's broad FULL-to-PIECEWISE policy is restricted to compiled
 configurations that actually have piecewise captures. Compilation mode 0 retains
@@ -93,8 +98,11 @@ TunableOp remains lookup-only. After offline qualification, set `V620_TUNABLEOP=
 and `V620_ROCBLAS_LIBRARY` to the actual library loaded by the testing wheel SDK.
 The helper requires all four per-device CSVs under
 `<test-root>/tunableop/rocblas-<library-sha256-first-12>/`. No donor solution IDs
-are assumed valid for the server's different ROCm build. The offline probe checks
-whether recorded solutions execute; it is not an accuracy or throughput test.
+are assumed valid for the server's different ROCm build. The offline qualifier compares every selected FP16 dense solution with an FP32
+reference on all four cards. Full-model measurements and limitations are recorded
+in [the TunableOp report](../../tunableop/README.md). Bundled rows are used when
+no runtime-generated rows root exists; an explicit `V620_TUNABLEOP_ROOT` overrides
+that selection.
 
 ## Local validation
 
@@ -114,6 +122,7 @@ Reproduce the CPU checks without downloading weights:
 .venv/bin/python tools/rdna2/test_startup_plan_cpu.py
 .venv/bin/python -m pytest --noconftest -q \
   tests/distributed/test_rdna_p2p.py \
+  tests/kernels/quantization/test_rdna2_w4a16_selection.py \
   tests/v1/worker/test_ple_offload_worker.py \
   tests/compile/test_cudagraph_replay_inputs.py \
   tests/model_executor/model_loader/test_ep_weight_filter.py \
@@ -141,9 +150,9 @@ Reproduce the CPU checks without downloading weights:
 6. Later candidates remain in the reuse audit: mainline PLE/QSA output fusion,
    QSA workspace reuse, portable V2 GDN changes, GPTQ loader exclusions, and
    alternative dense prefill kernels. These are not claimed as integrated here.
-7. Replace PR #5's bloated branch only after the replacement's dependencies,
-   model behavior and benchmark descriptions have been reviewed and qualified.
-   The published PR has not been force-pushed by this local integration.
+7. Keep PR #5 as a draft while the bounded code-answer regression remains
+   unresolved. Publishing the clean integration for review does not promote it
+   over the preserved stable installation.
 
 ## Server regression results
 
@@ -182,3 +191,54 @@ bounded driver stopped the candidate and restarted the original stable service.
 
 AI assistance was used. Full-model results must be recorded separately from
 kernel correctness and historical stable benchmarks.
+
+## Current FP16 performance campaign
+
+Dense INT8 shadows are disabled. The original INT4 expert weights and BF16 CPU
+PLE table are unchanged. Current code improvements reuse the donor V620 MoE tile
+configuration, qualified FP16 rocBLAS tuning and PCIe push all-reduce. The latter
+required correcting its Torch device-context API; the old call silently disabled
+that backend. Exact four-rank sums pass repeated changing-input graph replays.
+
+The donor's per-call `wvSplitK` output allocation is restored. A global output
+buffer in the target overwrote retained projection results on the next call.
+The regression failed on all four cards before the fix and passes afterward;
+174 native numerical/lifetime cases pass, including eager and graph FP16/BF16
+at batch sizes 1/2/4. Earlier apparent quality passes using the shared buffer
+are not sufficient evidence of correct execution.
+
+The latest target merge preserves the tested GDN initialization and separation
+of eager/capture buffers. It does not adopt whole-cache resets or eager writes
+into captured storage. The alternative native TP4 W4A16 selector is enabled only
+in the breakable graph mode qualified by that upstream change. Our Flash-Next
+launch continues to use full-decode graphs and its existing expert/QSA paths.
+
+Post-merge CPU checks pass 133 cases, with ten accelerator cases skipped and
+five explicitly excluded model-download/configuration-dependent cases. The
+startup-plan suite passes 16 cases. All normal hooks pass on the merge and
+subsequent tuning changes. These checks do not replace GPU model evaluation.
+
+At MTP0, the corrected 8k-batch run measured 1,418–1,471 prefill tok/s and
+41.98–42.12 decode tok/s across the 16k/32k prose/code tiers. All four performance
+trials reached the requested 1,024 output tokens. API readiness took 248.30 s,
+including 90.73 s maximum per-worker model loading; this was a cached-filesystem
+start. Single/four-request smoke checks pass, but long-context quality is only
+2/4: both code cases answer 59 rather than 61 for the fixture's arithmetic.
+The untuned corrected FP16 control gives the same failure. This remains an
+experimental candidate, with no claim of broad accuracy or BF16 equivalence.
+
+The measured setup uses `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` revision
+`4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`: AutoRound 0.15.0, symmetric INT4,
+group size 128. Original PLE comes from checkpoint shard
+`model-00016-of-00017.safetensors`: 128 table shards combine to
+`[320001536, 160]` BF16 values, approximately 95.37 GiB in CPU RAM. No quantized
+PLE sidecar was used in these measurements. The group16 sidecar is not yet
+qualified for coherent model output.
+
+Runtime: Python 3.12.14, Torch 2.13.0+rocm10.0.0, HIP 7.15.26333,
+Triton 3.8.0+git4cff872c.rocm10.0.0, Transformers 5.17.0, AMD-SMI
+27.0.0+6b0e43f3 from the matching wheel SDK. Installed vLLM version metadata
+predates this exported source; use the tested commit and source/native hashes.
+
+The explicit 4 GiB KV allocation already bypasses the profiling that the startup
+plan caches; turning that cache on would not further shorten this launch.
