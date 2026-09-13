@@ -70,7 +70,8 @@ def main():
         else:
             target.write_bytes(source.read_bytes())
     (directory / "QUALIFIED").write_text(
-        "Four V620s: all 21 FP16 TN shapes matched independent FP32 calculations.\n"
+        f"Four V620s: all {len(rows)} FP16 TN shapes matched independent FP32 "
+        "calculations.\n"
     )
 
 

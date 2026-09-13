@@ -13,7 +13,12 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument(
+        "--batch-tokens", nargs="+", type=int, default=[1024, 2048, 4096]
+    )
     args = parser.parse_args()
+    if any(n <= 0 for n in args.batch_tokens):
+        parser.error("Batch token counts must be positive")
     import csv
     import hashlib
     import json
@@ -55,6 +60,7 @@ def main():
                 hip=torch.version.hip,
                 dtype="float16",
                 seed=620,
+                batch_tokens=args.batch_tokens,
                 source="Adapted existing v620-probe-dense-tunable.py",
             )
         )
@@ -88,7 +94,7 @@ def main():
         end.synchronize()
         return start.elapsed_time(end) / 10
 
-    for m in (1024, 2048, 4096):
+    for m in args.batch_tokens:
         for n, k in (
             (336, 10240),
             (10240, 320),
