@@ -72,14 +72,22 @@ NKM_FACTORS_WVSPLITK = [
     # Small-output shared-expert gates must also avoid generic BF16 GEMM.
     (1, 2560, 1),
     (2, 2560, 1),
+    (3, 2560, 1),
     (4, 2560, 1),
+    (5, 2560, 1),
     (5, 640, 2),
     (2, 2560, 4),
     # Flash-Next hyperconnection and attention projections on four V620s.
     (2, 10240, 336),
+    (3, 10240, 336),
+    (5, 10240, 336),
     (4, 10240, 320),
     (2, 2560, 4096),
+    (3, 2560, 4096),
+    (5, 2560, 4096),
     (2, 320, 10240),
+    (3, 320, 10240),
+    (5, 320, 10240),
     # Different batch sizes with key dimensions
     (1, 32, 16),
     (1, 64, 64),
@@ -289,7 +297,7 @@ def test_rocm_wvsplitk_kernel(
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm kernel")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("tokens", [1, 2, 4])
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("capture", [False, True])
 def test_wvsplitk_retained_output_survives_later_call(dtype, tokens, capture):
     """Parallel projections and HC injection retain outputs across GEMV calls."""
