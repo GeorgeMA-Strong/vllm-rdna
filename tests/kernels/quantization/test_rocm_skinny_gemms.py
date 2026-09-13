@@ -287,6 +287,39 @@ def test_rocm_wvsplitk_kernel(
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm kernel")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("tokens", [1, 2, 4])
+@pytest.mark.parametrize("capture", [False, True])
+def test_wvsplitk_retained_output_survives_later_call(dtype, tokens, capture):
+    """Parallel projections and HC injection retain outputs across GEMV calls."""
+    torch.manual_seed(620)
+    x = torch.ones((tokens, 10240), device="cuda", dtype=dtype)
+    weight = torch.randn((336, 10240), device="cuda", dtype=dtype) * 0.03
+    zero_weight = torch.zeros_like(weight)
+    cu_count = num_compute_units()
+
+    def projections():
+        first = ops.wvSplitK(weight, x, cu_count)
+        second = ops.wvSplitK(zero_weight, x, cu_count)
+        return first, second
+
+    projections()
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            first, second = projections()
+    for value in (1, 2, 3):
+        x.fill_(value)
+        if capture:
+            graph.replay()
+        else:
+            first, second = projections()
+        expected = torch.nn.functional.linear(x.float(), weight.float()).to(dtype)
+        torch.testing.assert_close(first, expected, atol=0.02, rtol=0.02)
+        torch.testing.assert_close(second, torch.zeros_like(second), atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm dispatch")
 @pytest.mark.parametrize(
     "gfx1030,dtype,tokens,strided_weight,outputs,expected_skinny",

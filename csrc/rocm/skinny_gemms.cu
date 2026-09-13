@@ -1204,9 +1204,10 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   TORCH_CHECK(in_a.dtype() == torch::kFloat16 ||
               in_a.dtype() == torch::kBFloat16);
 
-  static Rdna2PersistBuf g_wvsplitk_c;
-  auto out_c = rdna2_persist_zeros(
-      g_wvsplitk_c, {N_in, M_in},
+  // Outputs can remain live across projections and graph nodes.
+  // Match the donor's per-call allocation instead of aliasing shared storage.
+  auto out_c = torch::empty(
+      {N_in, M_in},
       torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
 
   dim3 grid(CuCount);
