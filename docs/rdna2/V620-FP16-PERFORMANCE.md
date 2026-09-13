@@ -1,0 +1,157 @@
+# V620 FP16 performance results — 2026-09-13
+
+MTP2 is the fastest tested setting with four valid 16k/32k performance trials.
+MTP0 with an 8k scheduled batch has the best measured prefill. Dense INT8 shadows
+are disabled throughout this comparison. The existing Intel INT4 experts and
+original BF16 PLE table in CPU RAM are unchanged.
+
+This remains a draft candidate, not a replacement for the saved stable service.
+All selected short single/four-request checks pass, but the separate long-context
+quality suite passes only 2/4 cases. Performance validity checks do not establish
+model accuracy. No configuration here establishes 90 tok/s sustained decode.
+
+## Reused code and measured changes
+
+- Reuse opengfx1030 PRs #6/#7/#8, selected PR #3 GDN tuning, and Leapdragon's
+  Flash-Next/FP16 fusion implementation. The integration is based on
+  `opengfx1030:rdna_extras` through `f86faadbd`, without mainline commit history.
+- Enable the reused RDNA all-reduce after fixing the Torch device-context API
+  that silently disabled it. Four-rank graph replay tests pass changing-input
+  exact sums. The selected threshold is 64 KiB; larger transfers use RCCL.
+- Reuse donor V620 MoE tiling. Alternative 4k/8k tile measurements did not beat
+  the existing selection, so its configuration is retained.
+- Qualify 28 FP16 rocBLAS solver rows against FP32 references on all four GPUs,
+  with lookup-only execution and a library-hash guard. A 4k hyperconnection-down
+  microbenchmark improved from 9.00 to 1.34 ms. Full-model code prefill in the
+  campaign rose from approximately 1,195 to 1,470 tok/s; this includes intervening
+  correctness changes and is not a single-variable numerical-parity comparison.
+- Restore donor per-call `wvSplitK` output ownership. The target's shared output
+  buffer allowed a later projection to overwrite retained results. The expanded
+  native suite passes 230 cases, including FP16/BF16, eager/graph lifetime checks
+  and the three/five-row shapes needed for higher MTP counts. No tolerances changed.
+- Derive capture sizes from the speculative width: `(MTP + 1) * [1,2,4]`.
+  MTP0, 1, 2, 3 and 4 were compared on the corrected FP16 base.
+
+The optional general FP16 GEMV override did not improve MTP0 decode and remains
+off. MTP1 with an 8k batch ran out of memory during PLE prefill; MTP-enabled
+measurements use 4k. The separate mainline PLE gate fusion experiment reduced
+temporary memory but did not meet its strict FP16 comparison. It was removed
+from the candidate and retained only as an unqualified experiment. Dense INT8
+experiments are excluded from the selected results and remain deferred.
+
+## Benchmark method
+
+Unmodified `llm-context-bench` at
+`92286b24065565f4929e78c45f776029480e9939`, prose and code, one measured trial per
+case, 1,024 requested output tokens after the runner's warmup. Thinking is off;
+temperature 1, top-p 0.95, top-k 20, min-p 0, seed 3407. Input tolerance is
+explicitly 11% for this tokenizer. All actual token counts are reported.
+
+Prefill is prompt tokens / TTFT. Decode excludes the first output token's
+latency. Early termination and repetition remain flagged in the raw results;
+invalid trials are not retried until they pass. One trial per case does not
+provide a confidence interval or prove a global optimum.
+
+TP4/EP4, max context 262,144, four request slots, 4 GiB KV per GPU, full-decode
+graphs, RDNA AR 64 KiB, qualified FP16 TunableOp lookup, hipBLASLt off, SDMA off.
+Each V620 remains at its existing 180 W cap; clocks and power limits were not
+changed. Configured capacity is distinct from a successful full-length request.
+
+## MTP0 base versus selected MTP2
+
+Every row in this table completed 1,024 output tokens and passed the runner's
+performance checks. MTP0 uses batch 8,192; MTP2 uses batch 4,096.
+
+| Workload | Prompt tokens | MTP0 prefill tok/s | MTP0 decode tok/s | MTP2 prefill tok/s | MTP2 TTFT s | MTP2 decode tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prose 16k | 16,750 | 1,418.95 | 42.21 | 1,364.47 | 12.28 | 56.94 |
+| Prose 32k | 33,455 | 1,459.13 | 42.07 | 1,401.13 | 23.88 | 53.43 |
+| Code 16k | 18,063 | 1,473.17 | 42.10 | 1,404.55 | 12.86 | 64.23 |
+| Code 32k | 36,135 | 1,467.82 | 42.07 | 1,401.87 | 25.78 | 66.79 |
+
+MTP2 code decode is 53–59% above this MTP0 base, while its smaller scheduled
+batch costs roughly 4–5% prefill. Across these four measured requests, summed
+TTFT plus decode duration is 168.78 s for MTP0, 147.16 s for MTP1 and 143.15 s
+for MTP2. This comparison includes different generated text under speculative
+sampling; it is not a fixed-output microbenchmark.
+
+## MTP comparison
+
+| Workload | MTP1 decode tok/s | MTP2 decode tok/s | MTP3 decode tok/s | MTP4 decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Prose 16k | 53.92 | 56.94 | 85.36 | 58.52 |
+| Prose 32k | 54.98 | 53.43 | 49.69 | 62.90 |
+| Code 16k | 58.46 | 64.23 | 66.39 | Invalid: repetition |
+| Code 32k | 58.65 | 66.79 | Invalid: repetition | 67.53 |
+
+MTP3/MTP4 each have one invalid performance case and are not selected. Their
+invalid observed rates (70.93 and 70.33 tok/s) are retained in raw data, not used
+as speed achievements. Aggregate accepted draft-token fractions were 76.48%,
+53.95%, 56.93% and 49.45% for counts 1–4; fractions across different widths are
+not sufficient to choose throughput. All four MTP counts still pass only 2/4
+long-context quality cases.
+
+## Larger context
+
+A fresh launch of the selected MTP2 configuration completed all four larger
+trials with 1,024 output tokens each. All passed performance validity checks.
+
+| Workload | Actual prompt tokens | Prefill tok/s | TTFT s | Decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Prose 64k | 66,913 | 1,376.67 | 48.60 | 54.67 |
+| Prose 128k | 133,816 | 1,312.29 | 101.97 | 55.71 |
+| Code 64k | 71,971 | 1,370.57 | 52.51 | 66.85 |
+| Code 128k | 143,855 | 1,316.92 | 109.24 | 80.61 |
+
+Code128k's 80.61 tok/s is this individual valid trial, not a general decode
+guarantee. The larger tiers were performance tests; they do not override the
+2/4 quality result at 16k/32k. Synthetic vision and a four-request answer check
+after the long run passed. Video was not tested.
+
+The engine reported KV capacity for 287,978 tokens, or 1.10 requests at the
+configured 262,144-token limit. No 262k prompt was run; the longest measured
+request contained 143,855 prompt tokens plus 1,024 generated tokens.
+
+## Loading and memory
+
+| Profile | Launch to healthy API s | Maximum worker loading s | Model-loading memory GiB/GPU |
+| --- | ---: | ---: | ---: |
+| MTP0 / batch 8192 | 252.27 | 96.63 | 19.18 |
+| MTP1 / batch 4096 | 255.37 | 102.32 | 20.32 |
+| MTP2 / batch 4096 | 259.36 | 112.50 | 20.45 |
+| MTP3 / batch 4096 | 259.46 | 103.45 | 20.54 |
+| MTP4 / batch 4096 | 269.77 | 120.09 | 20.67 |
+| MTP2 / fresh larger-context run | 260.56 | 113.43 | 20.45 |
+
+These are successive cached-filesystem starts, not controlled cold-storage
+measurements. Worker loading is a stage of full startup, not an additional time
+to add to readiness. Reported model-loading memory excludes the explicit 4 GiB
+KV allocation and later graph/workspace allocations. The original CPU PLE table
+is approximately 95.37 GiB. The explicit KV allocation bypasses startup profiling,
+so enabling startup-plan caching would not skip another profiling stage here.
+
+## Quality limitation and reproducibility
+
+The long-context fixture expects `billing_units: 61`. Corrected MTP0 returns
+59/59 for the code tiers; MTP1/2/4 return 54/59. The untuned corrected FP16 control
+also returns 59/59. A separate step-by-step diagnostic computes the correct
+54 + 7 = 61, but that does not repair the failed benchmark. Earlier apparent
+quality passes under the shared-output kernel are not a safe reference. Packing,
+weight sampling and isolated kernel checks do not establish end-to-end accuracy.
+
+Model: `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`, revision
+`4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`, symmetric INT4/group128 experts.
+PLE uses original BF16 checkpoint shard `model-00016-of-00017.safetensors`,
+128 shards combined to `[320001536,160]`, in CPU RAM. No group16 sidecar was used.
+
+See [candidate integration](V620-CANDIDATE.md) for reused commits, exact runtime
+and CPU/native checks, and [FP16 tuning](../../tunableop/README.md) for qualified
+solver rows. The campaign's raw benchmark JSON, generated output, metrics, logs,
+source/native hashes, packages, source archive and replay helpers are preserved
+under `/home/george/v620-vllm-testing/benchmarks/performance-2026-09-13`, with a
+local copy under the workspace's `review-artifacts/performance-2026-09-13`.
+
+The original installation and boot unit remain under `/home/george/v620-vllm`
+and its saved release under `/home/george/v620-stable-releases`. This draft needs
+human review and further model-quality investigation before stable promotion.
+AI assistance was used for integration, testing and reporting.

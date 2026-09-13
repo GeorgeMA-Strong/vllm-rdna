@@ -4,6 +4,8 @@ This remains a development candidate. The initial integration was local only.
 After remote testing was authorized, its native extensions were built and tested
 in a separate installation on the four V620s. The stable installation is preserved;
 it has not been replaced. Historical benchmark results are not candidate results.
+The [FP16 performance report](V620-FP16-PERFORMANCE.md) records the current
+MTP0–4 comparison, selected settings, loading times and quality limitation.
 
 ## Isolation and stable baseline
 
@@ -40,8 +42,8 @@ the existing stable boot unit is unchanged.
 The branch starts directly from
 [`opengfx1030:rdna_extras` at c6b5cfb90](https://github.com/opengfx1030/vllm-rdna/tree/c6b5cfb904f2edf99585a8b23c920dbb018ff54e).
 It merges subsequent target updates through `f86faadbd` without adding mainline
-vLLM history. The replacement contains 17 commits above that target before final
-reporting changes, rather than the original 795-commit dependency history.
+vLLM history. The replacement contains 20 commits above that target, including
+final testing/reporting changes, rather than the original 795-commit history.
 
 | Source | Integrated work |
 | --- | --- |
@@ -203,8 +205,8 @@ that backend. Exact four-rank sums pass repeated changing-input graph replays.
 The donor's per-call `wvSplitK` output allocation is restored. A global output
 buffer in the target overwrote retained projection results on the next call.
 The regression failed on all four cards before the fix and passes afterward;
-174 native numerical/lifetime cases pass, including eager and graph FP16/BF16
-at batch sizes 1/2/4. Earlier apparent quality passes using the shared buffer
+230 native numerical/lifetime cases pass, including eager and graph FP16/BF16
+at batch sizes 1/2/3/4/5. Earlier apparent quality passes using the shared buffer
 are not sufficient evidence of correct execution.
 
 The latest target merge preserves the tested GDN initialization and separation
