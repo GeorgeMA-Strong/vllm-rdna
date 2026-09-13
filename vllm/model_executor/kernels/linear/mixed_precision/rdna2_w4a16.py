@@ -97,17 +97,21 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         if not on_gfx10x():
             return False, "RDNA2 W4A16 kernel requires gfx1030"
 
-        # TP>2 on gfx1030: the kernel's captured-graph replay corrupts decode
-        # (garbage from the first token at TP=4, verified 2026-09-12; eager is
-        # correct). The Triton W4A16 fallback is graph-safe.
+        # Upstream qualifies TP4 native W4A16 with breakable graphs. Preserve
+        # the fallback for the non-breakable graph mode used by Flash-Next.
         try:
+            from vllm import envs
             from vllm.config import get_current_vllm_config
 
             _cfg = get_current_vllm_config()
-            if _cfg is not None and _cfg.parallel_config.tensor_parallel_size > 2:
+            if (
+                _cfg is not None
+                and _cfg.parallel_config.tensor_parallel_size > 2
+                and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            ):
                 return (
                     False,
-                    "RDNA2 W4A16 kernel disabled at TP>2 (cudagraph corruption)",
+                    "RDNA2 W4A16 at TP>2 requires breakable cudagraphs",
                 )
         except Exception:
             pass

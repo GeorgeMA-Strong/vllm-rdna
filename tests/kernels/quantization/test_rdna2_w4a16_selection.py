@@ -6,6 +6,8 @@
 Run `pytest tests/kernels/quantization/test_rdna2_w4a16_selection.py`.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -16,6 +18,43 @@ from vllm.model_executor.kernels.linear import (
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx10x
 from vllm.scalar_type import scalar_types
+
+
+@pytest.mark.parametrize("breakable", [False, True])
+def test_native_tp4_requires_qualified_breakable_graph_mode(monkeypatch, breakable):
+    from vllm import config as config_module
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna2_w4a16 import (
+        RDNA2W4A16LinearKernel,
+    )
+    from vllm.platforms import rocm
+
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(rocm, "on_gfx10x", lambda: True)
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(breakable)))
+    monkeypatch.setattr(
+        config_module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=4)
+        ),
+    )
+    monkeypatch.setattr(
+        torch.ops._rocm_C, "gptq_gemm_rdna2", lambda: None, raising=False
+    )
+    config = MPLinearLayerConfig(
+        full_weight_shape=(1024, 256),
+        partition_weight_shape=(1024, 256),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.float16,
+        group_size=128,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    supported, reason = RDNA2W4A16LinearKernel.can_implement(config)
+    assert supported is breakable
+    if not breakable:
+        assert reason is not None
+        assert "breakable" in reason
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")

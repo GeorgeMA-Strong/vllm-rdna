@@ -12,6 +12,7 @@ Coverage: head_size {128, 256}, fp16, non-quantized KV cache; anything
 else is rejected by validate_configuration and the selector falls back
 to ROCM_ATTN/TRITON_ATTN.
 """
+
 from __future__ import annotations
 
 import os
@@ -20,6 +21,10 @@ from typing import ClassVar
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import (
+    eager_break_during_capture,
+)
+from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
@@ -31,9 +36,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MultipleOf,
-)
-from vllm.compilation.breakable_cudagraph import (
-    eager_break_during_capture,
 )
 from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
     has_native_kv_cache_layout,
@@ -86,6 +88,7 @@ def _get_fa_rdna2_module():
     global _fa_rdna2_module
     if _fa_rdna2_module is None:
         from vllm.v1.attention.ops import fa_rdna2_backend as _m
+
         _fa_rdna2_module = _m
     return _fa_rdna2_module
 
@@ -103,8 +106,11 @@ def _reinterpret_v_to_5d(
     .view() would produce. Split D into (D/x, x) while slot is still
     innermost, then permute slot back to dim 3.
     """
-    if (value_cache.dim() == 4 and key_cache.dim() == 5
-            and head_size in _SUPPORTED_HEAD_SIZES):
+    if (
+        value_cache.dim() == 4
+        and key_cache.dim() == 5
+        and head_size in _SUPPORTED_HEAD_SIZES
+    ):
         num_blocks, h_kv, head_size_d, block_sz = value_cache.shape
         x_dim = key_cache.shape[4]
         if head_size_d % x_dim == 0:
@@ -126,8 +132,7 @@ class RdnaAttentionMetadata:
     causal: bool = True
 
 
-class RdnaAttentionMetadataBuilder(
-        AttentionMetadataBuilder[RdnaAttentionMetadata]):
+class RdnaAttentionMetadataBuilder(AttentionMetadataBuilder[RdnaAttentionMetadata]):
     # fa_rdna2_decode_paged is single-token-only; MTP-verify batches (ql>1)
     # must stay on the piecewise path.
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
@@ -183,8 +188,8 @@ class RdnaAttentionImpl(AttentionImpl):
     ) -> None:
         if head_size not in _SUPPORTED_HEAD_SIZES:
             raise NotImplementedError(
-                f"RDNA_ATTN: head_size={head_size} not in "
-                f"{_SUPPORTED_HEAD_SIZES}")
+                f"RDNA_ATTN: head_size={head_size} not in {_SUPPORTED_HEAD_SIZES}"
+            )
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -196,7 +201,8 @@ class RdnaAttentionImpl(AttentionImpl):
         self.sinks = sinks
         self._alibi = (
             torch.tensor(alibi_slopes, dtype=torch.float32)
-            if alibi_slopes is not None else None
+            if alibi_slopes is not None
+            else None
         )
         if sliding_window is None:
             self.sliding_window = (-1, -1)
@@ -219,10 +225,9 @@ class RdnaAttentionImpl(AttentionImpl):
             return False
         num_q_heads = query.shape[1] if query.dim() >= 2 else 0
         num_kv_heads = key_cache.shape[1] if key_cache.dim() >= 2 else 0
-        if num_q_heads > 0 and num_kv_heads > 0 and \
-                num_q_heads % num_kv_heads != 0:
-            return False
-        return True
+        return not (
+            num_q_heads > 0 and num_kv_heads > 0 and num_q_heads % num_kv_heads != 0
+        )
 
     def forward(
         self,
@@ -242,13 +247,13 @@ class RdnaAttentionImpl(AttentionImpl):
         key_cache, value_cache = PagedAttention.split_kv_cache(
             kv_cache.transpose(0, 1), self.num_kv_heads, self.head_size
         )
-        value_cache = _reinterpret_v_to_5d(key_cache, value_cache,
-                                           self.head_size)
+        value_cache = _reinterpret_v_to_5d(key_cache, value_cache, self.head_size)
 
         if not self._can_run_fa_rdna2(query, key_cache, value_cache):
             raise NotImplementedError(
                 "RDNA_ATTN: outside FA-RDNA2 coverage (dtype/quant/layout); "
-                "selector should have routed this layer to ROCM_ATTN.")
+                "selector should have routed this layer to ROCM_ATTN."
+            )
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         max_seqlen_q = attn_metadata.max_query_len
@@ -264,20 +269,18 @@ class RdnaAttentionImpl(AttentionImpl):
         # 'RDNA_ATTN: MTP verify pass routed to fallback for numerics.'
         # crash on non-MTP probes. We have not measured MTP on this path
         # so the gate is opt-in via VLLM_FARDNA2_ENABLE_SPEC_GATE=1.
-        _spec_gate_enabled = os.environ.get(
-            "VLLM_FARDNA2_ENABLE_SPEC_GATE", "0") == "1"
+        _spec_gate_enabled = os.environ.get("VLLM_FARDNA2_ENABLE_SPEC_GATE", "0") == "1"
         if _spec_gate_enabled:
-            _spec_q = int(os.environ.get(
-                "VLLM_FARDNA2_SPEC_VERIFY_Q_LEN", "3"))
-            if (max_seqlen_q == _spec_q
-                    and num_actual_tokens <= 16 * seqused_k.size(0)):
+            _spec_q = int(os.environ.get("VLLM_FARDNA2_SPEC_VERIFY_Q_LEN", "3"))
+            if max_seqlen_q == _spec_q and num_actual_tokens <= 16 * seqused_k.size(0):
                 raise NotImplementedError(
-                    "RDNA_ATTN: MTP verify pass routed to fallback "
-                    "for numerics.")
+                    "RDNA_ATTN: MTP verify pass routed to fallback for numerics."
+                )
 
         fa = _get_fa_rdna2_module()
-        sliding_window = (self.sliding_window[0] + 1
-                          if self.sliding_window[0] >= 0 else 0)
+        sliding_window = (
+            self.sliding_window[0] + 1 if self.sliding_window[0] >= 0 else 0
+        )
         paged_block_size = key_cache.shape[3]
 
         if max_seqlen_q <= 1:
@@ -299,9 +302,28 @@ class RdnaAttentionImpl(AttentionImpl):
         else:
             _num_seqs = seqused_k.size(0)
             _kv_splits = min(8, (max_seqlen_k + 1023) // 1024)
+            if os.environ.get("VLLM_BT_DEBUG", "0") == "1" and max_seqlen_k >= 784:
+                try:
+                    _kb = key_cache
+                    _nblk = min(8, block_table.shape[1])
+                    _bt = (
+                        block_table[:1, :_nblk].tolist() if block_table.numel() else []
+                    )
+                    _kmax = (
+                        float(_kb[_bt[0][:4]].abs().max().item())
+                        if _bt and _bt[0][:4] and _kb.shape[0] > max(_bt[0][:4])
+                        else -1.0
+                    )
+                    with open("/tmp/fa_kv.log", "a") as _f:
+                        _f.write(
+                            f"nat={num_actual_tokens} seqk={max_seqlen_k} "
+                            f"bs={paged_block_size} bt={_bt} kv_absmax={_kmax} "
+                            f"kc_ptr={key_cache.data_ptr()}\n"
+                        )
+                except Exception:
+                    pass
             if not attn_metadata.causal:
-                raise NotImplementedError(
-                    "RDNA_ATTN: non-causal prefill not supported")
+                raise NotImplementedError("RDNA_ATTN: non-causal prefill not supported")
             if max_seqlen_k < 4096 and self.head_size == 128:
                 out_paged = fa.fa_rdna2_prefill_paged_varlen_short(
                     query[:num_actual_tokens],
@@ -314,17 +336,21 @@ class RdnaAttentionImpl(AttentionImpl):
                     causal=True,
                     sliding_window=sliding_window,
                 )
-            elif (self.head_size == 256
-                    and self.num_kv_heads
-                    and self.num_heads % self.num_kv_heads == 0
-                    and self.num_heads // self.num_kv_heads % 2 == 0
-                    and self.num_heads // self.num_kv_heads >= 2
-                    and _gqa_mode() == "subgroup"):
+            elif (
+                self.head_size == 256
+                and self.num_kv_heads
+                and self.num_heads % self.num_kv_heads == 0
+                and self.num_heads // self.num_kv_heads % 2 == 0
+                and self.num_heads // self.num_kv_heads >= 2
+                and _gqa_mode() == "subgroup"
+            ):
                 # 2 heads per CTA, (GROUP/2) CTAs per (q_block, h_kv).
                 if os.environ.get("VLLM_FA_RDNA2_GQA_DEBUG") == "1":
-                    print(f"[gqa-dispatch] mode=subgroup max_seqlen_k={max_seqlen_k} "
-                          f"heads={self.num_heads} kv_heads={self.num_kv_heads}",
-                          flush=True)
+                    print(
+                        f"[gqa-dispatch] mode=subgroup max_seqlen_k={max_seqlen_k} "
+                        f"heads={self.num_heads} kv_heads={self.num_kv_heads}",
+                        flush=True,
+                    )
                 out_paged = fa.fa_rdna2_prefill_paged_varlen_gqa(
                     query[:num_actual_tokens],
                     key_cache,
@@ -336,8 +362,9 @@ class RdnaAttentionImpl(AttentionImpl):
                     causal=True,
                     sliding_window=sliding_window,
                 )
-            elif (_kv_splits >= 2 and _num_seqs <= 4
-                    and self.num_heads * _kv_splits >= 64):
+            elif (
+                _kv_splits >= 2 and _num_seqs <= 4 and self.num_heads * _kv_splits >= 64
+            ):
                 out_paged = fa.fa_rdna2_prefill_paged_varlen_splitk(
                     query[:num_actual_tokens],
                     key_cache,
@@ -378,33 +405,57 @@ class RdnaAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
-        if self.attn_type in (AttentionType.ENCODER_ONLY,
-                              AttentionType.ENCODER):
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
         key_cache, value_cache = PagedAttention.split_kv_cache(
             kv_cache.transpose(0, 1), self.num_kv_heads, self.head_size
         )
         block_size = value_cache.shape[3]
         if block_size in (16, 32) and has_native_kv_cache_layout(
-                key_cache, value_cache):
+            key_cache, value_cache
+        ):
             PagedAttention.write_to_paged_cache(
-                key, value, key_cache, value_cache,
-                slot_mapping, self.kv_cache_dtype,
-                layer._k_scale, layer._v_scale,
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
             )
         else:
             # The native writer assumes densely packed blocks and corrupts
             # stride-padded hybrid layouts (Qwen3.5 GDN block sizes).
-            triton_reshape_and_cache_flash(
-                key, value, key_cache, value_cache,
-                slot_mapping, self.kv_cache_dtype,
-                layer._k_scale, layer._v_scale,
-            )
+            # gfx1030: prefer our HIP flash writer over the Triton one (the
+            # Triton flash at world_size=4 writes KV the attention misreads).
+            if (
+                hasattr(torch.ops, "_rocm_C")
+                and hasattr(torch.ops._rocm_C, "reshape_and_cache_flash_rdna2")
+                and key.dtype == torch.float16
+                and value.dtype == torch.float16
+                and key_cache.dim() == 5
+                and value_cache.dim() == 4
+            ):
+                torch.ops._rocm_C.reshape_and_cache_flash_rdna2(
+                    key, value, key_cache, value_cache, slot_mapping
+                )
+            else:
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
 
 class RdnaAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
-    supported_kv_cache_dtypes: ClassVar[list[str]] = ["auto", "float16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "float16"]
 
     forward_includes_kv_cache_update: bool = False
 

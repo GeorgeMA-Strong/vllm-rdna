@@ -322,9 +322,7 @@ class CUDAGraphWrapper:
                 CUDAGraphWrapper._clone_activations(x, num_tokens) for x in obj
             )
         if isinstance(obj, list):
-            return [
-                CUDAGraphWrapper._clone_activations(x, num_tokens) for x in obj
-            ]
+            return [CUDAGraphWrapper._clone_activations(x, num_tokens) for x in obj]
         if isinstance(obj, dict):
             return {
                 k: CUDAGraphWrapper._clone_activations(v, num_tokens)
@@ -356,9 +354,7 @@ class CUDAGraphWrapper:
         if isinstance(src, (tuple, list)) and isinstance(dst, type(src)):
             if len(src) != len(dst):
                 return False
-            return all(
-                CUDAGraphWrapper._copy_tree(s, d) for s, d in zip(src, dst)
-            )
+            return all(CUDAGraphWrapper._copy_tree(s, d) for s, d in zip(src, dst))
         if isinstance(src, dict) and isinstance(dst, dict):
             if src.keys() != dst.keys():
                 return False
@@ -368,9 +364,12 @@ class CUDAGraphWrapper:
     @staticmethod
     def _nan_to_num_tree(obj: Any) -> None:
         if isinstance(obj, torch.Tensor):
-            if obj.is_floating_point() and 0 < obj.numel() <= 2_000_000:
-                if obj.isnan().any():
-                    obj.nan_to_num_(0.0)
+            if (
+                obj.is_floating_point()
+                and 0 < obj.numel() <= 2_000_000
+                and obj.isnan().any()
+            ):
+                obj.nan_to_num_(0.0)
             return
         if isinstance(obj, (tuple, list)):
             for x in obj:
@@ -389,6 +388,48 @@ class CUDAGraphWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+
+        if os.environ.get("VLLM_PIECE_IN_DEBUG") == "1":
+            try:
+                _pn = getattr(self, "_piece_in_n", 0)
+                if _pn < 10:
+                    self._piece_in_n = _pn + 1
+                    _rid = (
+                        getattr(self, "submod_name", None)
+                        or getattr(self.runnable, "submod_name", None)
+                        or repr(self.runnable)[:60]
+                    )
+                    _t = self._collect_input_tensors(args, kwargs)
+                    with open(
+                        f"/tmp/piece_in_{torch.accelerator.current_device_index()}.log",
+                        "a",
+                    ) as _f:
+                        _f.write(
+                            f"\n[piece_in] call#{_pn} "
+                            f"rank={torch.accelerator.current_device_index()} "
+                            f"bd={batch_descriptor} rid={_rid}\n"
+                        )
+                        for _i, _x in enumerate(_t):
+                            try:
+                                if (
+                                    _x.is_floating_point()
+                                    and 0 < _x.numel() <= 2_000_000
+                                ):
+                                    _nan = bool(_x.isnan().any().item())
+                                    _v = _x.flatten()[:4].tolist()
+                                    _f.write(
+                                        f"  in[{_i}] s={tuple(_x.shape)} d={_x.dtype} "
+                                        f"p=0x{_x.data_ptr():x} nan={_nan} v={_v}\n"
+                                    )
+                                else:
+                                    _f.write(
+                                        f"  in[{_i}] s={tuple(_x.shape)} d={_x.dtype} "
+                                        f"p=0x{_x.data_ptr():x} (big)\n"
+                                    )
+                            except Exception as _e:
+                                _f.write(f"  in[{_i}] err={_e}\n")
+            except Exception:
+                pass
 
         if (
             cudagraph_runtime_mode == CUDAGraphMode.NONE
@@ -473,9 +514,7 @@ class CUDAGraphWrapper:
                     pool=self.graph_pool,
                     stream=current_stream(),
                 ):
-                    output = self.runnable(
-                        *entry.static_args, **entry.static_kwargs
-                    )
+                    output = self.runnable(*entry.static_args, **entry.static_kwargs)
                     # Join offloader's copy stream after forward to avoid
                     # unjoined stream error. The last layer's start_prefetch
                     # forks copy_stream, but wait_prefetch only happens in
@@ -529,11 +568,7 @@ class CUDAGraphWrapper:
             st = self._collect_input_tensors(
                 entry.static_args or (), entry.static_kwargs or {}
             )
-            same = sum(
-                1
-                for a, b in zip(rt, st)
-                if a.data_ptr() == b.data_ptr()
-            )
+            same = sum(1 for a, b in zip(rt, st) if a.data_ptr() == b.data_ptr())
             ids_t = next(
                 (
                     t
