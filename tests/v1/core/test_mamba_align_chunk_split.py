@@ -37,6 +37,47 @@ PROMPT_LEN = 2002
 MAMBA_GROUP_ID = 1
 
 
+@pytest.mark.parametrize("prompt_length", [3200, 3602])
+def test_flash_next_tp4_materializes_replay_state(tmp_path, monkeypatch, prompt_length):
+    """A TP4 request must stop on its state grid before its replay boundary."""
+    from transformers import OPTConfig
+
+    from vllm.platforms.cpu import CpuPlatform
+
+    from .utils import create_scheduler
+
+    monkeypatch.setattr("vllm.platforms.current_platform", CpuPlatform())
+    OPTConfig(
+        architectures=["OPTForCausalLM"], max_position_embeddings=8192
+    ).save_pretrained(tmp_path)
+    base = create_scheduler(model=str(tmp_path), skip_tokenizer_init=True)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = base.vllm_config
+    config.model_config.hf_config.model_type = "qwen4_exp"
+    config.parallel_config.tensor_parallel_size = 4
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.mamba_cache_mode = "align"
+    # The circular PLE scratch group's minimum is NOT the recurrent state grid.
+    config.cache_config.block_size = 8
+    manager = _make_hybrid_kv_cache_manager()
+    config.cache_config.num_gpu_blocks = manager.kv_cache_config.num_blocks
+    scheduler = Scheduler(
+        vllm_config=config,
+        kv_cache_config=manager.kv_cache_config,
+        structured_output_manager=base.structured_output_manager,
+        block_size=MAMBA_BLOCK_SIZE,
+        hash_block_size=ATTN_BLOCK_SIZE,
+    )
+    (request,) = create_requests(
+        1, num_tokens=prompt_length, block_size=ATTN_BLOCK_SIZE
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    end = output.num_scheduled_tokens[request.request_id]
+    assert end < request.num_prompt_tokens
+    assert end % MAMBA_BLOCK_SIZE == 0
+
+
 def _make_hybrid_kv_cache_manager(
     num_prefill_checkpoint_blocks: int = 0,
 ) -> KVCacheManager:
@@ -86,6 +127,10 @@ def _split(
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        mamba_state_block_size=MAMBA_BLOCK_SIZE,
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(get_replay_boundaries=lambda request: ())
+        ),
         use_eagle=use_eagle,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),

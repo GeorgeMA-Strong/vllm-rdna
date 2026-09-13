@@ -429,6 +429,8 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         """
         Cache the blocks for the request.
@@ -451,7 +453,11 @@ class SingleTypeKVCacheManager(ABC):
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        reachable_boundaries = list(
+            replay_boundaries
+            if replay_boundaries is not None
+            else (request.num_prompt_tokens - 1,)
+        )
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
@@ -786,8 +792,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
@@ -1170,6 +1183,8 @@ class CircularBufferManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         return
 
@@ -1802,9 +1817,16 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1897,6 +1919,8 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.

@@ -301,6 +301,19 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
+        """Retain both MTP resend and extension landing points (#54713)."""
+        if not self.eagle_group_ids:
+            return (
+                request.num_prompt_tokens
+                - 1
+                - (request.num_prompt_tokens - 1) % self.scheduler_block_size,
+            )
+        block = self.scheduler_block_size
+        resend = (request.num_prompt_tokens - 1) // block * block
+        extension = request.num_prompt_tokens // block * block
+        return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.
@@ -321,6 +334,7 @@ class KVCacheCoordinator(ABC):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundaries=self.get_replay_boundaries(request),
             )
 
     def free(self, request_id: str) -> None:
@@ -767,6 +781,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundaries=self.get_replay_boundaries(request),
             )
 
     def find_longest_cache_hit(

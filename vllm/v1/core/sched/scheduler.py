@@ -54,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, iter_layer_specs
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -322,15 +322,29 @@ class Scheduler(SchedulerInterface):
         # Blocks that async KV loads will overwrite this step, skipped from
         # zeroing since the zeroing could race the out-of-band write.
         self._skip_zero_block_ids: set[int] = set()
-        # gfx1030 TP>2: the mamba-block-aligned chunk split corrupts the
-        # hybrid forward (FA KV goes NaN, verified 2026-09-12); the unaligned
-        # single-chunk path is correct at the same TP. Keep the split only at
-        # TP<=2 where it is validated; prefix caching stays on either way.
+        # Preserve the TP>2 workaround for other hybrids. Flash-Next's V2
+        # GDN/state-copy path supports aligned chunks; disabling them defeats APC.
+        flash_next_v2 = (
+            self.use_v2_model_runner
+            and vllm_config.model_config.hf_config.model_type == "qwen4_exp"
+        )
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers
             and self.cache_config.mamba_cache_mode == "align"
-            and vllm_config.parallel_config.tensor_parallel_size <= 2
+            and (self.parallel_config.tensor_parallel_size <= 2 or flash_next_v2)
         )
+        # Adapted from vllm-project/vllm#54076: recurrent state uses its own
+        # grid, not the minimum block size of attention and PLE scratch groups.
+        mamba_state_block_sizes = {
+            spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+            if isinstance(spec, MambaSpec)
+        }
+        assert len(mamba_state_block_sizes) <= 1, (
+            "mamba align scheduling requires a single mamba state block size"
+        )
+        self.mamba_state_block_size = next(iter(mamba_state_block_sizes), None)
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
             # TODO: support spec decoding
@@ -414,7 +428,7 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        block_size = self.mamba_state_block_size or self.cache_config.block_size
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -452,6 +466,13 @@ class Scheduler(SchedulerInterface):
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
+            # Both an identical resend and an extended prompt must have a
+            # materialized state at the boundary retained by the coordinator.
+            *(
+                self.kv_cache_manager.coordinator.get_replay_boundaries(request)
+                if not use_internal_checkpoint
+                else ()
+            ),
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
             # Fine-grained hits: the prompt's partial-tail entry can only be

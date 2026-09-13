@@ -155,3 +155,60 @@ The original installation and boot unit remain under `/home/george/v620-vllm`
 and its saved release under `/home/george/v620-stable-releases`. This draft needs
 human review and further model-quality investigation before stable promotion.
 AI assistance was used for integration, testing and reporting.
+
+## Follow-up latency correction (September 13)
+
+The manual deployment initially recomputed entire conversations: identical
+8,428-token prompts had zero cached tokens and 7.13 s TTFT; the short follow-up
+had 10.05 s TTFT. Fresh-prompt benchmarks above did not cover this regression.
+
+The correction enables aligned state checkpoints for Flash-Next/V2 at TP4,
+uses the Mamba group's block size in the scheduler and worker resume path, and
+retains both MTP replay boundaries. It adapts existing work from
+[vLLM #54076](https://github.com/vllm-project/vllm/pull/54076),
+[#53945](https://github.com/vllm-project/vllm/pull/53945),
+[#54713](https://github.com/vllm-project/vllm/pull/54713), and
+[#53798](https://github.com/vllm-project/vllm/pull/53798), with the aligned-prompt
+replay stop described in [#50409](https://github.com/vllm-project/vllm/pull/50409).
+The other-model TP>2 workaround remains. This is an integration/backport rather
+than a competing upstream implementation. We did not import unconditional
+splitting at every state boundary or the optional finer-grained MTP feature.
+
+| Synthetic latency case | TTFT after | Cached / prompt tokens |
+| --- | ---: | ---: |
+| 8k identical resend | 1.718 s | 7,200 / 8,428 |
+| 8k follow-up after identical resend | 1.679 s | 8,000 / 8,448 |
+| Direct 8k follow-up, without resend | 1.649 s | 7,200 / 8,448 |
+| 16k follow-up after identical resend | 0.306 s | 16,800 / 16,848 |
+| 32k follow-up after identical resend | 0.380 s | 33,600 / 33,648 |
+| Direct 32k follow-up, without resend | 4.486 s | 32,800 / 33,648 |
+
+Each row is one bounded deterministic request, max output 16 tokens, measured
+from the LAN stream's first content token. The subsecond rows benefit from the
+preceding resend warming an additional boundary; they are not a general
+follow-up latency guarantee. Uncached 32k TTFT varied from 29.76 to 41.35 s in
+these synthetic trials; further prefill profiling remains necessary. These
+latency probes do not replace the context-benchmark figures or quality limits.
+
+192 CPU tests pass, three GPU-only cases skipped locally. Prose/code outputs
+match exactly between cold and cached runs, and two concurrent chats returned
+their separate requested words on the four V620s. Restore the original scheduler,
+retention code, or worker divisor to reproduce the corresponding test failures.
+The final service launch took 252.57 s to health; maximum worker loading took
+97.55 s. Model precision, native kernels and the FP16/MTP2 settings are unchanged.
+
+Reproduce on an otherwise idle endpoint with
+[check_prefix_reuse.py](../../tools/rdna2/check_prefix_reuse.py):
+
+```sh
+.venv/bin/python tools/rdna2/check_prefix_reuse.py \
+  --base-url http://127.0.0.1:8080 --skip-identical --lines 400 \
+  --output /tmp/prefix-check
+```
+
+Omit `--skip-identical` for the three-request sequence; use `--lines 800` or
+`1600` for approximately 16k/32k. The helper uses a fresh cache salt, saves raw
+metrics/results, and checks output, cache reuse and TTFT. Artifacts and the
+pre-fix Python rollback archives are saved in the testing workspace under
+`followup-latency-2026-09-13`. The enhanced manual service remains on port 8080;
+the original saved build and boot unit are preserved.
