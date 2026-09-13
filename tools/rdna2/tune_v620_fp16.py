@@ -24,6 +24,8 @@ def main():
     import json
     import os
 
+    os.environ["PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED"] = "0"
+    os.environ["TORCH_BLAS_PREFER_HIPBLASLT"] = "0"
     # Environment overrides the API and is cached on first use. Serving's explicit
     # zeros must not silently disable this offline tuning process.
     for name in (

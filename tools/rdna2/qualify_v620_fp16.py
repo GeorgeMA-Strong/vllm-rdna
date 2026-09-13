@@ -18,6 +18,8 @@ def main():
 
     import regex as re
 
+    os.environ["PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED"] = "0"
+    os.environ["TORCH_BLAS_PREFER_HIPBLASLT"] = "0"
     for name in (
         "PYTORCH_TUNABLEOP_ENABLED",
         "PYTORCH_TUNABLEOP_TUNING",
