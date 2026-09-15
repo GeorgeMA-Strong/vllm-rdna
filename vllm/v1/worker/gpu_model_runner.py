@@ -66,6 +66,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1043,6 +1044,7 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
+        self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
             self.mamba_prev_last_scheduled_idx = self._make_buffer(
@@ -1164,10 +1166,13 @@ class GPUModelRunner(
         if self._mamba_bufs is None:
             mamba_groups = mamba_utils.get_mamba_groups(self.kv_cache_config)
             mamba_types = {spec.mamba_type for spec in mamba_groups}
+            self._mamba_state_copy_funcs = self.model.get_mamba_state_copy_funcs(
+                mamba_types
+            )
             self._mamba_bufs = mamba_utils.MambaBuffers.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=self.kv_cache_config,
-                copy_funcs=self.model.get_mamba_state_copy_funcs(mamba_types),
+                copy_funcs=self._mamba_state_copy_funcs,
                 make_buffer=self._make_buffer,
                 device=self.device,
                 with_postprocess_align=(
@@ -1704,7 +1709,7 @@ class GPUModelRunner(
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
                 forward_context=self.compilation_config.static_forward_context,
-                mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                mamba_state_copy_funcs=self._mamba_state_copy_funcs,
             )
 
             assert self.num_accepted_tokens_event is not None
@@ -4645,7 +4650,7 @@ class GPUModelRunner(
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
+                    self._mamba_state_copy_funcs,
                     mamba_bufs.preprocess,
                     align_ctx=mamba_bufs.postprocess_align,
                 )
