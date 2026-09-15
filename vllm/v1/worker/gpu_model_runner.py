@@ -1162,10 +1162,12 @@ class GPUModelRunner(
         # decode + hybrid model.
         assert self.cache_config.mamba_cache_mode == "align"
         if self._mamba_bufs is None:
+            mamba_groups = mamba_utils.get_mamba_groups(self.kv_cache_config)
+            mamba_types = {spec.mamba_type for spec in mamba_groups}
             self._mamba_bufs = mamba_utils.MambaBuffers.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=self.kv_cache_config,
-                copy_funcs=self.model.get_mamba_state_copy_func(),
+                copy_funcs=self.model.get_mamba_state_copy_funcs(mamba_types),
                 make_buffer=self._make_buffer,
                 device=self.device,
                 with_postprocess_align=(
