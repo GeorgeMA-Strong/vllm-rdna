@@ -27,11 +27,14 @@ import os
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+
+logger = init_logger(__name__)
 
 # Eager registration of torch.ops.vllm.rdna_* (see rdna_dense_int8.py): a compile-cache
 # hit runs the cached graph before the lazy imports below would have executed.
@@ -186,6 +189,14 @@ class GatedResidual(nn.Module):
                 if self.use_combine
                 else None
             )
+            if os.environ.get("VLLM_HC_NAN_DEBUG") == "1" and not (
+                torch.cuda.is_current_stream_capturing()
+            ):
+                try:
+                    if bool(torch.isnan(block_input).any().item()):
+                        logger.warning("[hc-nan] BLOCK_INPUT nan=True")
+                except Exception:
+                    pass
             return hidden_states, block_input, injection
 
         if self.use_combine:
@@ -224,6 +235,19 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if os.environ.get("VLLM_HC_NAN_DEBUG") == "1" and not (
+            torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                _xn_nan = bool(torch.isnan(xn).any().item())
+                _hs_nan = bool(torch.isnan(hidden_states).any().item())
+                if _xn_nan or _hs_nan:
+                    logger.warning(
+                        "[hc-nan] xn_nan=%s hidden_states_nan=%s", _xn_nan, _hs_nan
+                    )
+            except Exception:
+                pass
+
         if _rdna_fused_ok(xn):
             # T46 (gfx1030): one opaque op; decode (M <= 8) runs two fused
             # kernels (down+inject GEMV with silu, up GEMV + sigmoid + gated
@@ -252,6 +276,14 @@ class GatedResidual(nn.Module):
                 if self.use_combine
                 else None
             )
+            if os.environ.get("VLLM_HC_NAN_DEBUG") == "1" and not (
+                torch.cuda.is_current_stream_capturing()
+            ):
+                try:
+                    if bool(torch.isnan(block_input).any().item()):
+                        logger.warning("[hc-nan] BLOCK_INPUT nan=True")
+                except Exception:
+                    pass
             return hidden_states, block_input, injection
 
         if self.use_combine:
