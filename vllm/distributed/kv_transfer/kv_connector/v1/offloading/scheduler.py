@@ -157,8 +157,9 @@ def resolve_mamba_align_size(
     such groups agree on the same value.
     """
     mamba_align_size: int | None = None
-    for idx, tokens_per_block in enumerate(spec.tokens_per_block):
-        kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+    for group in spec.config.groups:
+        tokens_per_block = group.tokens_per_block
+        kv_spec = kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
         if isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode in (
             "align",
             "all",
@@ -190,8 +191,9 @@ class SchedulerOffloadConfig(NamedTuple):
         # each segment can never serve a load hit. Relevant for hybrid
         # architectures like DeepSeek V4 (MLA + SWA groups).
         full_attn_tokens_per_chunk: set[int] = set()
-        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
-            kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+        for group in spec.config.groups:
+            tokens_per_block = group.tokens_per_block
+            kv_spec = kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
@@ -218,9 +220,9 @@ class SchedulerOffloadConfig(NamedTuple):
             return per_segment
 
         eagle_groups = {
-            idx
-            for idx, g in enumerate(kv_cache_config.kv_cache_groups)
-            if g.is_eagle_group
+            group.group_id
+            for group in spec.config.groups
+            if kv_cache_config.kv_cache_groups[group.group_id].is_eagle_group
         }
 
         use_eagle = (
@@ -228,7 +230,7 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.speculative_config.use_eagle()
         )
         if use_eagle and not eagle_groups:
-            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+            eagle_groups = {group.group_id for group in spec.config.groups}
 
         if eagle_groups:
             logger.info(
@@ -239,7 +241,9 @@ class SchedulerOffloadConfig(NamedTuple):
             )
 
         kv_group_configs_list: list[GroupOffloadConfig] = []
-        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+        for group in spec.config.groups:
+            idx = group.group_id
+            tokens_per_block = group.tokens_per_block
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
             kv_spec = kv_cache_group.kv_cache_spec
             sw = get_sliding_window_size_in_chunks(
