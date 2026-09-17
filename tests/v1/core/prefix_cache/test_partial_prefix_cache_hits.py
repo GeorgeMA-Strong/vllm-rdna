@@ -1786,3 +1786,29 @@ def test_dcp_partial_hit_with_eagle_rewinds_one_hash_unit():
     assert num_computed == 4
     assert [len(group) for group in computed_blocks.blocks] == [1, 1]
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+def test_circular_buffer_accepts_group_aligned_hits():
+    """QSA compression ring: a hit aligned to the ring capacity needs no
+    cached state from the circular group (the ring is empty at a group
+    boundary). Regression: the manager used to return 0 unconditionally,
+    which zeroed every prefix-cache hit on hybrid Qwen4Exp models."""
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+
+    spec = SimpleNamespace(block_size=16)
+
+    def hit(max_length):
+        return CircularBufferManager.find_longest_cache_hit(
+            block_hashes=[],
+            max_length=max_length,
+            kv_cache_group_ids=[0],
+            block_pool=None,
+            kv_cache_spec=spec,
+            drop_eagle_block=False,
+            alignment_tokens=16,
+        )
+
+    blocks, hit_len = hit(18860)
+    assert hit_len == 18848  # round down to the ring boundary
+    assert blocks == ([],)
+    assert hit(8)[1] == 0  # sub-group candidate still yields no hit
