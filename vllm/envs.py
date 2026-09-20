@@ -318,6 +318,9 @@ if TYPE_CHECKING:
     # Default off (Triton) until the HIP ports are verified end-to-end.
     VLLM_RDNA_HC_PREFILL_HIP: bool = False
     VLLM_RDNA_QSA_HIP: bool = False
+    # Experimental on gfx1030: retain QSA split-K workspace so the QSA
+    # attention custom op can stay inside a breakable decode graph.
+    VLLM_RDNA_QSA_GRAPH_CAPTURE: bool = False
     VLLM_RDNA_PLE_CONV_HIP: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -2120,6 +2123,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "0") == "1"
     ),
     "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "0") == "1",
+    "VLLM_RDNA_QSA_GRAPH_CAPTURE": lambda: (
+        os.getenv("VLLM_RDNA_QSA_GRAPH_CAPTURE", "0") == "1"
+    ),
     "VLLM_RDNA_PLE_CONV_HIP": lambda: os.getenv("VLLM_RDNA_PLE_CONV_HIP", "0") == "1",
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

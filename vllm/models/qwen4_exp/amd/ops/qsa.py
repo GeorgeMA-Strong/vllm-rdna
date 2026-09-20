@@ -887,6 +887,9 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    workspace_cache: dict[
+        tuple[int, int, int, int, int], tuple[torch.Tensor, torch.Tensor]
+    ] | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches."""
 
@@ -965,15 +968,34 @@ def qsa_sparse_paged_attention(
         partial_lse = out
     else:
         # FP32 partials preserve accuracy when merging independently normalized
-        # splits.
-        partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
+        # splits. During ROCm breakable graph capture these must retain their
+        # addresses across replay; QSA owns a small cache keyed by graph shape.
+        workspace_key = (
+            num_splits,
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            logical_indices.shape[1],
         )
-        partial_lse = torch.empty(
-            (num_splits, q.shape[0], q.shape[1]),
-            dtype=torch.float32,
-            device=q.device,
+        workspace = (
+            workspace_cache.get(workspace_key)
+            if workspace_cache is not None
+            else None
         )
+        expected_output = (num_splits, *q.shape)
+        expected_lse = (num_splits, q.shape[0], q.shape[1])
+        if (
+            workspace is None
+            or workspace[0].shape != expected_output
+            or workspace[0].device != q.device
+        ):
+            workspace = (
+                torch.empty(expected_output, dtype=torch.float32, device=q.device),
+                torch.empty(expected_lse, dtype=torch.float32, device=q.device),
+            )
+            if workspace_cache is not None:
+                workspace_cache[workspace_key] = workspace
+        partial_output, partial_lse = workspace
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](

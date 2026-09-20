@@ -9,6 +9,7 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -198,6 +199,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            workspace_cache=getattr(layer, "_qsa_splitk_workspaces", None),
         )
         return output
 
@@ -349,6 +351,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             ),
             persistent=False,
         )
+        # The split-K QSA kernel needs FP32 partial-output and LSE scratch.
+        # Allocating it in a breakable CUDA-graph capture makes the pointers
+        # capture-local on ROCm. Keep one workspace for each captured shape so
+        # an opt-in graph-captured QSA replay observes stable addresses.
+        self._qsa_splitk_workspaces: dict[
+            tuple[int, int, int, int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
@@ -463,7 +472,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return output
 
 
-@eager_break_during_capture
+def _qsa_capture_dispatch(fn):
+    """Keep legacy eager QSA replay unless the graph-safe workspace is opted in."""
+    if envs.VLLM_RDNA_QSA_GRAPH_CAPTURE:
+        return fn
+    return eager_break_during_capture(fn)
+
+
+@_qsa_capture_dispatch
 def _qsa_with_output_eager(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
