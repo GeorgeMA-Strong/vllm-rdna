@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import logging as _logging
 import math
+import os as _os
 
 import torch
 
@@ -590,30 +592,42 @@ def _compress_qsa_groups_kernel(
     )
 
 
-import os as _os
-import logging as _logging
-
-
 def _qsa_env_int(name: str, default):
     v = _os.environ.get(name)
     return default if v is None or v == "" else int(v)
 
 
-# gfx1030 tuning knobs. Defaults = 2026-09-05 sweep winners (sparse prefill BLOCK_N 64->32, warps 2->4;
-# MQA scoring BLOCK_N 32->128, warps 4->8): +3% @3.3k / +5% @30k prefill in-serve, decode unchanged.
+# gfx1030 tuning knobs. Defaults are the 2026-09-05 sweep winners:
+# sparse prefill BLOCK_N 64->32, warps 2->4; MQA scoring BLOCK_N 32->128,
+# warps 4->8. They measured +3% at 3.3k and +5% at 30k prefill in serving,
+# with decode unchanged.
 _QSA_MQA_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_MQA_BLOCK_N", 128)
 _QSA_MQA_WARPS = _qsa_env_int("VLLM_RDNA_QSA_MQA_WARPS", 8)
-_QSA_MQA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_MQA_STAGES", None)  # None -> Triton default (2 on AMD)
-_QSA_PREFILL_BLOCK_N = _qsa_env_int("VLLM_RDNA_QSA_BLOCK_N", 32)  # prefill branch only (base_programs > 512)
+_QSA_MQA_STAGES = _qsa_env_int(
+    "VLLM_RDNA_QSA_MQA_STAGES", None
+)  # None -> Triton default (2 on AMD)
+_QSA_PREFILL_BLOCK_N = _qsa_env_int(
+    "VLLM_RDNA_QSA_BLOCK_N", 32
+)  # prefill branch only (base_programs > 512)
 _QSA_PREFILL_SPLITS = _qsa_env_int("VLLM_RDNA_QSA_SPLITS", 1)
 _QSA_PREFILL_WARPS = _qsa_env_int("VLLM_RDNA_QSA_WARPS", 4)
-_QSA_STAGES = _qsa_env_int("VLLM_RDNA_QSA_STAGES", None)  # None -> 1 on ROCm, 2 elsewhere
-_QSA_OVERRIDES = {k: v for k, v in _os.environ.items() if k.startswith("VLLM_RDNA_QSA_")}
+_QSA_STAGES = _qsa_env_int(
+    "VLLM_RDNA_QSA_STAGES", None
+)  # None -> 1 on ROCm, 2 elsewhere
+_QSA_OVERRIDES = {
+    k: v for k, v in _os.environ.items() if k.startswith("VLLM_RDNA_QSA_")
+}
 if _QSA_OVERRIDES:
     _logging.getLogger(__name__).warning("QSA overrides active: %s", _QSA_OVERRIDES)
 _logging.getLogger(__name__).info(
-    "QSA launch params: mqa_bn=%s mqa_warps=%s mqa_stages=%s prefill_bn=%s prefill_splits=%s prefill_warps=%s",
-    _QSA_MQA_BLOCK_N, _QSA_MQA_WARPS, _QSA_MQA_STAGES, _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS,
+    "QSA launch params: mqa_bn=%s mqa_warps=%s mqa_stages=%s "
+    "prefill_bn=%s prefill_splits=%s prefill_warps=%s",
+    _QSA_MQA_BLOCK_N,
+    _QSA_MQA_WARPS,
+    _QSA_MQA_STAGES,
+    _QSA_PREFILL_BLOCK_N,
+    _QSA_PREFILL_SPLITS,
+    _QSA_PREFILL_WARPS,
 )
 
 
@@ -667,7 +681,7 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = _QSA_MQA_BLOCK_N
-    _qsa_mqa_extra = {} if _QSA_MQA_STAGES is None else {'num_stages': _QSA_MQA_STAGES}
+    _qsa_mqa_extra = {} if _QSA_MQA_STAGES is None else {"num_stages": _QSA_MQA_STAGES}
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         k_cache,
@@ -772,6 +786,8 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    *,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -786,6 +802,13 @@ def qsa_select_paged_tokens(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
+    if max_seq_len is not None:
+        if max_seq_len < 0:
+            raise ValueError("QSA context bound must be non-negative")
+        # Match the live-context bound used by the NVIDIA prefill indexer.
+        # Keep enough columns for top-k even when only a few blocks are visible.
+        live_columns = triton.cdiv(triton.cdiv(max_seq_len, compress_ratio), 64) * 64
+        columns = min(columns, max(block_topk, live_columns))
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
@@ -805,6 +828,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
@@ -919,10 +943,16 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
-        block_n, target_splits, partial_warps = _QSA_PREFILL_BLOCK_N, _QSA_PREFILL_SPLITS, _QSA_PREFILL_WARPS
+        block_n, target_splits, partial_warps = (
+            _QSA_PREFILL_BLOCK_N,
+            _QSA_PREFILL_SPLITS,
+            _QSA_PREFILL_WARPS,
+        )
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
-    partial_stages = (1 if current_platform.is_rocm() else 2) if _QSA_STAGES is None else _QSA_STAGES
+    partial_stages = (
+        (1 if current_platform.is_rocm() else 2) if _QSA_STAGES is None else _QSA_STAGES
+    )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -1015,8 +1045,11 @@ def qsa_store_cache_rows(
         # Strip the [rows, 1, WIDTH] head dim the Triton path allows.
         rows_flat = rows.squeeze(1) if rows.ndim == 3 else rows
         qsa_rdna2.qsa_store_cache_rows(
-            rows_flat, slot_mapping, cache,
-            page_size=cache.shape[1], width=cache.shape[3],
+            rows_flat,
+            slot_mapping,
+            cache,
+            page_size=cache.shape[1],
+            width=cache.shape[3],
         )
         return
 
@@ -1076,8 +1109,9 @@ def qsa_compress_groups_with_ratio(
         # False we pass an empty tensor.
         load_rope = rope_cache is not None
         rope_arg = (
-            rope_cache if load_rope else
-            torch.empty(0, dtype=torch.int64, device=raw_keys.device)
+            rope_cache
+            if load_rope
+            else torch.empty(0, dtype=torch.int64, device=raw_keys.device)
         )
         # pooled is [rows, 1, head_dim]; the HIP path writes [rows, head_dim]
         # and we unsqueeze to match the Triton contract.
@@ -1088,12 +1122,17 @@ def qsa_compress_groups_with_ratio(
             (rows, 3), dtype=torch.int64, device=raw_keys.device
         )
         qsa_rdna2.qsa_compress_groups(
-            raw_keys_flat, raw_positions,
-            compressor_state_cache, rope_arg,
+            raw_keys_flat,
+            raw_positions,
+            compressor_state_cache,
+            rope_arg,
             compressor_state_block_table,
-            token_to_req, query_start_loc,
-            logical_positions, compressed_slots,
-            pooled_flat, first_positions_out,
+            token_to_req,
+            query_start_loc,
+            logical_positions,
+            compressed_slots,
+            pooled_flat,
+            first_positions_out,
             compress_ratio=compress_ratio,
             compressor_state_size=compressor_state_cache.shape[1],
             head_dim=head_dim,
