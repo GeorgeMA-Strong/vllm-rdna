@@ -115,6 +115,6 @@ export PYTHONPATH=/home/george/v620-vllm-testing/context-bench-92286b2/src
 
 ## Review and scope
 
-Open target PRs checked before publication: PR #12 concerns CPU PLE/MTP startup and does not contain this QSA bound. No open matching QSA prefill PR found. Base is the fork's rdna_extras, not mainline vLLM.
+Open target PRs checked before publication: PR #12 concerns CPU PLE/MTP startup and does not contain this QSA bound. Upstream vLLM PR #56500 reuses a bounded NVIDIA QSA logits workspace but preserves its existing scoring width; this PR independently reduces the AMD scoring width to the live prefill context. Base is the fork's rdna_extras, not mainline vLLM.
 
-AI assistance was used. Draft for human review. Historical server tests are recorded above; the clean cherry-pick has not been requalified end-to-end. Publishing this PR makes no changes to the live service.
+AI assistance was used. Historical server tests are recorded above; the clean cherry-pick has not been requalified end-to-end. Publishing this PR makes no changes to the live service.
