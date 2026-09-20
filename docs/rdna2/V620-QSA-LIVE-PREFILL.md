@@ -81,12 +81,12 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
  --model /home/george/v620-vllm/models/intel-autoround --served-model-name active qwen3.8-flash-next
  --host 0.0.0.0 --port 8080 --tensor-parallel-size 4 --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
  --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
- --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4294967296
+ --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4026531840
  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,12]}'
  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
  --default-chat-template-kwargs '{"enable_thinking":false}'
- --limit-mm-per-prompt '{"image":255,"video":32}' --mm-processor-kwargs '{"max_pixels":1638400}'
+ --limit-mm-per-prompt '{"image":255,"video":32}' --mm-processor-kwargs '{"max_pixels":1048576}'
  --enable-prefix-caching --mamba-cache-mode align --kernel-config '{"moe_backend":"triton"}')
 if [[ ${1:-} == --dry-run ]]; then printf '%q ' "${command[@]}"; printf '\n'; exit 0; fi
 if pgrep -u "$(id -u)" -f 'vllm.entrypoints|VLLM::EngineCore|VLLM::Worker' >/dev/null; then
@@ -97,6 +97,17 @@ fi
 cd "$root/source"
 exec "${command[@]}" "$@"
 ```
+
+The 3.75 GiB KV allocation retains 266,945 cache tokens (1.02x the
+262,144-token model context) while reserving 256 MiB per GPU for vision
+workspaces. The 1,048,576-pixel processor cap prevents the Torch SDPA vision
+encoder from exhausting the remaining VRAM when multiple large images appear
+after a long cached prefix. On four V620s, a regression request with 24,073
+prompt tokens followed by two 1024x1024 images completed in 12 seconds with
+HTTP 200; peak usage was 29.1 GiB per card and all four workers remained
+healthy. Do not use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` with
+CPU PLE offload: its ROCm CUDA IPC registration can fail with
+`pidfd_getfd: Operation not permitted`.
 
 ## Benchmark reproduction
 
