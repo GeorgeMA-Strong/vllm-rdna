@@ -2,7 +2,7 @@
 
 Bound AMD QSA prefill scoring to the live prompt context instead of the allocated context capacity. Round compressed columns to 64, retain enough for top-k, and carry the live bound through side metadata. Decode and missing metadata retain the existing capacity-wide path.
 
-Clean branch from opengfx1030/rdna_extras at b33f9b66e, containing QSA commits a2e47ef70/ad8cc519d plus documentation. Excludes rejected graph-capture experiments, Wave-SplitK, local argmax, and INT8 shadows.
+Clean branch from opengfx1030/rdna_extras at b33f9b66e. The QSA patches are derived from a2e47ef70/ad8cc519d and were recommitted as 9a91ff64b/de6f1c9da. The branch also folds in PR #12's remaining CPU PLE and MTP startup prerequisites. It excludes rejected graph-capture experiments, Wave-SplitK, local argmax, and INT8 shadows.
 
 ## Recorded results and limits
 
@@ -18,7 +18,7 @@ Historical combined deployment 82926d228: TP4, PP1, EP4, MTP2, FP16 dense, Intel
 | Regular | 128K | 133,816 | 1,859 | 53.86 |
 | Coding | 128K | 143,855 | 1,832 | 72.49 |
 
-Coding 32K was excluded for repetition, also observed in baseline. Valid 16K/32K prefill improved 31–33% against the immediately collected 1,529–1,543 tok/s baseline. No consistent end-to-end decode improvement established. Later fused-draft testing retained 2,015–2,040 prefill but showed no matched-acceptance decode gain.
+Coding 32K was excluded for repetition, also observed in baseline. The combined stack improved valid 16K/32K prefill by 31–33% against the immediately collected 1,529–1,543 tok/s baseline. Because that deployment included changes outside this PR, the result does not isolate the QSA bound's contribution. No consistent end-to-end decode improvement was established. Later fused-draft testing retained 2,015–2,040 prefill but showed no matched-acceptance decode gain.
 
 A later rejected QSA graph-capture experiment measured 1,369–1,389 prefill tok/s. Its launcher omitted environment values normally supplied by the default systemd unit, so it was not a controlled comparison of the graph flag alone. The cause of the slowdown remains unresolved. Restored default throughput has not been rebenchmarked. Do not interpret the historical 2k numbers as a fresh verification of the current process.
 
