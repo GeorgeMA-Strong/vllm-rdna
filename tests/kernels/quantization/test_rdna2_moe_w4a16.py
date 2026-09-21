@@ -32,6 +32,10 @@ from vllm.model_executor.layers.fused_moe.activation import (  # noqa: E402
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
     moe_align_block_size,
 )
+from vllm.model_executor.layers.quantization.rdna2_moe_resident import (  # noqa: E402
+    apply_resident,
+    prepare_resident_layer,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (  # noqa: E402
     pack_quantized_values_into_int32,
 )
@@ -362,6 +366,80 @@ def test_full_moe_e2e(E, K, N_inter, top_k, group_size, M, dtype):
         f"rel L2 = {rel_l2:.4f} (threshold {threshold}), "
         f"max abs diff: {(fused - ref).abs().max().item()}"
     )
+
+
+@gfx1030_only
+@pytest.mark.parametrize("M", [3, 17])
+def test_resident_full_moe_matches_dense_ep_and_cuda_graph_replay(M):
+    """Check real resident packing against independent math and changing replays."""
+    torch.manual_seed(19)
+    E, global_E, K, N_inter, top_k, group_size = 4, 8, 128, 256, 2, 128
+    resident = torch.nn.Module()
+    dense = []
+    for name, n, k in (("w13", 2 * N_inter, K), ("w2", K, N_inter)):
+        codes = torch.randint(0, 16, (E, n, k), dtype=torch.uint8, device=device)
+        weight = (codes[..., ::2] | (codes[..., 1::2] << 4)).contiguous()
+        scales = (
+            torch.rand(E, n, k // group_size, device=device, dtype=torch.float16) * 0.01
+        )
+        dense.append(
+            ((codes.float() - 8) * scales.repeat_interleave(group_size, -1)).half()
+        )
+        resident.register_parameter(
+            name + "_qweight", torch.nn.Parameter(weight, requires_grad=False)
+        )
+        resident.register_parameter(
+            name + "_scales", torch.nn.Parameter(scales, requires_grad=False)
+        )
+    prepare_resident_layer(resident, group_size)
+    resident.activation = MoEActivation.SILU
+    resident.apply_router_weight_on_input = False
+    resident.global_num_experts = global_E
+    resident.expert_map = torch.tensor(
+        [0, 1, 2, 3, -1, -1, -1, -1], dtype=torch.int32, device=device
+    )
+    x = torch.randn(M, K, device=device, dtype=torch.float16)
+    topk_ids = (
+        torch.tensor(
+            [[0, 4], [1, 5], [2, 6], [3, 7], [0, 1]], dtype=torch.int32, device=device
+        )
+        .repeat((M + 4) // 5, 1)[:M]
+        .contiguous()
+    )
+    topk_weights = torch.softmax(torch.randn(M, top_k, device=device), dim=-1)
+
+    def independent_reference():
+        ref = torch.zeros(M, K, device=device, dtype=torch.float32)
+        for m in range(M):
+            for slot in range(top_k):
+                expert = topk_ids[m, slot].item()
+                if expert >= E:
+                    continue
+                first = torch.nn.functional.linear(
+                    x[m : m + 1].float(), dense[0][expert].float()
+                ).half()
+                gate, up = first.float().chunk(2, -1)
+                act = (torch.nn.functional.silu(gate) * up).half()
+                second = torch.nn.functional.linear(
+                    act.float(), dense[1][expert].float()
+                )
+                ref[m] += second.squeeze(0) * topk_weights[m, slot]
+        return ref
+
+    actual = apply_resident(resident, x, topk_weights, topk_ids)
+    torch.testing.assert_close(
+        actual.float(), independent_reference(), atol=0.0005, rtol=0.02
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = apply_resident(resident, x, topk_weights, topk_ids)
+    for factor in (0.5, -1.0):
+        x.mul_(factor)
+        graph.replay()
+        current_platform.synchronize()
+        torch.testing.assert_close(
+            captured.float(), independent_reference(), atol=0.0005, rtol=0.02
+        )
 
 
 @gfx1030_only

@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_MOE_SKINNY: bool = True
+    VLLM_RDNA_MOE_RESIDENT: bool = False
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_USE_RDNA2_FA: bool = True
     VLLM_FORCE_CUSTOM_ALL_REDUCE: bool = False
@@ -1376,6 +1377,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_MOE_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_MOE_PADDING", "1"))),
     # Does not intercept the shuffled RDNA2 fused HIP MoE path. Set 0 to A/B
     # against tile Triton. See fused_moe/rocm_moe_skinny.py.
+    # Keep RDNA2 W4A16 MoE weights in the native shuffled layout after load.
+    "VLLM_RDNA_MOE_RESIDENT": lambda: bool(
+        int(os.getenv("VLLM_RDNA_MOE_RESIDENT", "0"))
+    ),
     "VLLM_ROCM_MOE_SKINNY": lambda: bool(int(os.getenv("VLLM_ROCM_MOE_SKINNY", "1"))),
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
@@ -2107,7 +2112,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RDNA_DENSE_INT8": lambda: os.getenv("VLLM_RDNA_DENSE_INT8", "0") == "1",
     "VLLM_RDNA_FUSED_HC": lambda: os.getenv("VLLM_RDNA_FUSED_HC", "1") == "1",
     "VLLM_RDNA_FUSED_SE": lambda: os.getenv("VLLM_RDNA_FUSED_SE", "1") == "1",
-    "VLLM_RDNA_HC_PREFILL_HIP": lambda: os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "0") == "1",
+    "VLLM_RDNA_HC_PREFILL_HIP": lambda: os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "0")
+    == "1",
     "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "0") == "1",
     "VLLM_RDNA_PLE_CONV_HIP": lambda: os.getenv("VLLM_RDNA_PLE_CONV_HIP", "0") == "1",
     # Log model inspection after loading.
