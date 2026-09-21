@@ -8,9 +8,36 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(),
-    reason="requires CUDA",
+    not (current_platform.is_cuda() or current_platform.is_rocm()),
+    reason="requires CUDA or ROCm",
 )
+
+
+def test_slot_mapping_does_not_read_next_request_for_short_state_tables():
+    """Long prefill must not index another request's recurrent-state row."""
+    device = torch.device("cuda")
+    tables = BlockTables(
+        block_sizes=[1024] * 6,
+        max_num_reqs=16,
+        max_num_batched_tokens=4,
+        max_num_blocks_per_group=[32, 1, 1, 1, 1, 1],
+        device=device,
+        kernel_block_sizes=[1024] * 6,
+    )
+    # Keep the erroneous cross-row read in allocated memory, so the old
+    # kernel fails deterministically without poisoning the GPU context.
+    for table in tables.block_tables:
+        table.gpu.fill_(7)
+    result = tables.compute_slot_mappings(
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0, 3], dtype=torch.int32, device=device),
+        torch.tensor([8192, 8193, 8194], dtype=torch.int64, device=device),
+        num_tokens_padded=4,
+    )
+    torch.testing.assert_close(
+        result[0], torch.tensor([7168, 7169, 7170, -1], device=device)
+    )
+    torch.testing.assert_close(result[1:], torch.full_like(result[1:], -1))
 
 
 def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
@@ -193,3 +220,40 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+def test_block_tables_skip_custom_slot_mapping_groups():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[8, 262144],
+        max_num_reqs=1,
+        max_num_batched_tokens=4,
+        max_num_blocks_per_group=[1, 1],
+        device=device,
+        kernel_block_sizes=[8, 262144],
+        slot_mapping_enabled=[False, True],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([7], [12]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.tensor([0], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    # Position zero distinguishes disabled mappings from the bounds guard.
+    positions = torch.tensor([0, 165757], dtype=torch.int64, device=device)
+    slot_mappings = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=2,
+    )
+    torch.accelerator.synchronize()
+
+    assert slot_mappings[0].tolist() == [-1, -1]
+    assert slot_mappings[1].tolist() == [
+        12 * 262144,
+        12 * 262144 + 165757,
+    ]

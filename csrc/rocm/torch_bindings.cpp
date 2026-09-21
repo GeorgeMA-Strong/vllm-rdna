@@ -63,6 +63,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "-> ()");
   rocm_ops.impl("moe_skinny_int4_decode", torch::kCUDA, &moe_skinny_int4_decode);
 
+  // Native resident-layout W4A16 MoE skinny GEMV.
+  rocm_ops.def(
+      "moe_resident_int4_decode(Tensor input, Tensor w13, Tensor w13_scale, "
+      "Tensor w2, Tensor w2_scale, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor! act_buf, Tensor! output, int group_size, Tensor? expert_map) "
+      "-> ()");
+  rocm_ops.impl("moe_resident_int4_decode", torch::kCUDA,
+                &moe_resident_int4_decode);
+
   // gfx1030 fp16/int8 skinny GEMM for decode-sized M (T43/T45).
   rocm_ops.def("gemv_f16_rdna2(Tensor x, Tensor w, Tensor? bias) -> Tensor");
   rocm_ops.impl("gemv_f16_rdna2", torch::kCUDA, &gemv_f16_rdna2);

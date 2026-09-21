@@ -27,6 +27,17 @@ void moe_skinny_int4_decode(const at::Tensor& input, const at::Tensor& w13,
                             at::Tensor& output, const int64_t group_size,
                             const std::optional<at::Tensor>& expert_map);
 
+// Native resident-layout W4A16 MoE skinny GEMV. Weights are shuffled int32
+// [E, K/8, N], scales are fp16 [E, K/group_size, N], and routing ids may be
+// int32 or int64. Symmetric uint4b8 is the only supported quantization.
+void moe_resident_int4_decode(
+    const at::Tensor& input, const at::Tensor& w13,
+    const at::Tensor& w13_scale, const at::Tensor& w2,
+    const at::Tensor& w2_scale, const at::Tensor& topk_weights,
+    const at::Tensor& topk_ids, at::Tensor& act_buf, at::Tensor& output,
+    const int64_t group_size,
+    const std::optional<at::Tensor>& expert_map);
+
 at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
                           const std::optional<at::Tensor>& bias);
 at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w,
@@ -667,4 +678,3 @@ void ple_short_conv_prefill_rdna2(
     int64_t dilation,
     int64_t state_len,
     bool silu);
-
