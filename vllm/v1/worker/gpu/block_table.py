@@ -7,8 +7,6 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
@@ -16,6 +14,8 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+
+logger = init_logger(__name__)
 
 
 class BlockTables:
@@ -30,6 +30,7 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        slot_mapping_enabled: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -43,6 +44,10 @@ class BlockTables:
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
+        if slot_mapping_enabled is None:
+            slot_mapping_enabled = [True] * self.num_kv_cache_groups
+        assert len(slot_mapping_enabled) == self.num_kv_cache_groups
+        self._slot_mapping_enabled = slot_mapping_enabled
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -107,6 +112,9 @@ class BlockTables:
             self.kernel_block_sizes, dtype=torch.int32, device=self.device
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
+        self.slot_mapping_enabled = torch.tensor(
+            self._slot_mapping_enabled, dtype=torch.bool, device=self.device
+        )
 
     def append_block_ids(
         self,
@@ -194,12 +202,8 @@ class BlockTables:
                         dup.tolist()[:10],
                     )
                     for bid in dup.tolist()[:5]:
-                        owners = (
-                            (rows == bid).any(dim=1).nonzero().flatten().tolist()
-                        )
-                        logger.warning(
-                            "[bt-debug]   block %d in rows %s", bid, owners
-                        )
+                        owners = (rows == bid).any(dim=1).nonzero().flatten().tolist()
+                        logger.warning("[bt-debug]   block %d in rows %s", bid, owners)
         return result
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
@@ -236,6 +240,7 @@ class BlockTables:
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
+            self.slot_mapping_enabled,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
@@ -307,6 +312,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
+    slot_mapping_enabled,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -334,6 +340,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)
+    mapping_enabled = tl.load(slot_mapping_enabled + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -344,8 +351,18 @@ def _compute_slot_mappings_kernel(
 
         block_indices = positions // (block_size * CP_SIZE)
         block_offsets = positions % (block_size * CP_SIZE)
+        # Recurrent/circular cache rows can be shorter than the sequence.
+        # Their state metadata handles indexing; never read the next row.
+        valid = (
+            mapping_enabled
+            & (offset < end_idx)
+            & (block_indices >= 0)
+            & (block_indices < block_table_stride)
+        )
         block_numbers = tl.load(
-            block_table_ptr + req_state_idx * block_table_stride + block_indices
+            block_table_ptr + req_state_idx * block_table_stride + block_indices,
+            mask=valid,
+            other=0,
         )
 
         if CP_SIZE == 1:
@@ -360,4 +377,5 @@ def _compute_slot_mappings_kernel(
             slot_ids = block_numbers * block_size + local_offsets
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
+        slot_ids = tl.where(valid, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
