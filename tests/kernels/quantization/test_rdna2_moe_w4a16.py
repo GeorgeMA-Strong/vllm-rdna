@@ -106,9 +106,8 @@ def _make_qzeros(E, groups, N):
         pytest.param(
             torch.bfloat16,
             marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
+                reason="gfx1030 lacks bf16 v_dot2; fp16 fallback "
                 "fallback not yet wired into dispatch",
-                
             ),
         ),
     ],
@@ -183,9 +182,8 @@ def test_fused_moe_w1_matches_dense(
         pytest.param(
             torch.bfloat16,
             marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
+                reason="gfx1030 lacks bf16 v_dot2; fp16 fallback "
                 "fallback not yet wired into dispatch",
-                
             ),
         ),
     ],
@@ -262,9 +260,8 @@ def test_fused_moe_output_topk_reduces(E, K, N_inter, top_k, group_size, M, dtyp
         pytest.param(
             torch.bfloat16,
             marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
+                reason="gfx1030 lacks bf16 v_dot2; fp16 fallback "
                 "fallback not yet wired into dispatch",
-                
             ),
         ),
     ],
@@ -369,10 +366,9 @@ def test_full_moe_e2e(E, K, N_inter, top_k, group_size, M, dtype):
 
 @gfx1030_only
 @pytest.mark.xfail(
-    reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot fallback "
+    reason="gfx1030 lacks bf16 v_dot2; fp16 fallback fallback "
     "not yet wired into dispatch. Test hardcodes bfloat16; sentinel-expert test "
     "should be re-added when bf16 kernel lands.",
-    
 )
 def test_expert_id_minus_one():
     """Kernel handles expert_id == -1 (expert parallelism) without crash."""
@@ -410,3 +406,33 @@ def test_expert_id_minus_one():
 
     # Output should remain zero (expert skipped)
     assert torch.equal(out, torch.zeros_like(out))
+
+
+@gfx1030_only
+@pytest.mark.parametrize("scale", [0.007, 0.0078125, 0.01])
+def test_quantized_zero_stays_zero(scale):
+    """Dequantization must preserve a zero INT4 value at every scale."""
+    m, k, n = 9, 128, 8
+    x = torch.ones(m, k, device=device, dtype=torch.float16)
+    packed = torch.full((1, k // 8, n), -2004318072, device=device, dtype=torch.int32)
+    scales = torch.full((1, 1, n), scale, device=device, dtype=torch.float16)
+    zeros = _make_qzeros(1, 1, n)
+    ids = torch.zeros(m, 1, device=device, dtype=torch.int32)
+    sorted_ids, expert_ids, num_tokens = moe_align_block_size(ids, 4, 1)
+    output = torch.zeros(m, n, device=device, dtype=torch.float16)
+    ops.moe_gptq_gemm_rdna2(
+        x,
+        output,
+        packed,
+        scales,
+        zeros,
+        torch.empty(0, device=device),
+        sorted_ids,
+        expert_ids,
+        num_tokens,
+        1,
+        4,
+        False,
+        0,
+    )
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
