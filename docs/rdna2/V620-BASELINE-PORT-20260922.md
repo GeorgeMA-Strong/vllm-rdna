@@ -129,3 +129,24 @@ the first regular repetition reused a deterministic prefix and is excluded.
 This is roughly 0.5–0.8% faster prefill than tile8 alone in these 16k trials.
 Decode remains variable and no decode improvement is attributed to PLE.
 JSON: `/home/george/v620-experiments/resident-tile8-ple-16k-dbd999403-fresh-repeats.json`.
+
+## Served prefix checkpoint replay fixes
+
+Commit `772dac40d` ports the served cache/replay changes for aligned Flash-Next
+TP4 chunks and MTP resend/extension boundaries. Ten focused core tests passed.
+The full-model 16k suite completed. The first repetition of both fixtures
+reused cached prefixes and is excluded. The two later fresh trials measured:
+
+| 16k case | Fresh trial | Prefill tokens/s | Generation tokens/s | TTFT s | Output valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular prose | 02 | 1,950.2 | 54.8 | 8.59 | Yes |
+| Regular prose | 03 | 1,949.1 | 56.7 | 8.59 | Yes |
+| Coding | 02 | 1,969.0 | 73.6 | 9.17 | Yes |
+| Coding | 03 | 1,967.4 | 71.9 | 9.18 | Yes |
+
+Two Triton inference JIT events appeared early in the measured pass, during
+the cached first repetition; these later fresh trials were stable. Compared
+with the preceding PLE build, the checkpoint changes cost about 2.5–3.2%
+prefill on these 16k fixtures. This step is for correct prompt reuse; the
+served tuning table is evaluated separately below. JSON:
+`/home/george/v620-experiments/checkpoints-16k-772dac40d-fresh-repeats.json`.
