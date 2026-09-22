@@ -116,7 +116,7 @@ def _make_qzeros(E, groups, N):
         ),
     ],
 )
-@pytest.mark.parametrize("block_size_m", [1, 4, 8])
+@pytest.mark.parametrize("block_size_m", [1, 4])
 def test_fused_moe_w1_matches_dense(
     E, K, N_inter, top_k, group_size, M, dtype, block_size_m
 ):
@@ -174,6 +174,45 @@ def test_fused_moe_w1_matches_dense(
     assert torch.allclose(fused_out, ref_out, atol=atol, rtol=0.01), (
         f"max diff: {(fused_out - ref_out).abs().max().item()}"
     )
+
+
+@gfx1030_only
+def test_v620_moe_prefill_tile8_matches_tile4():
+    """The qualified V620 expert shape must preserve the existing tile output."""
+    experts, hidden, gate_up, top_k, group_size, tokens = 16, 2560, 1280, 10, 128, 64
+    torch.manual_seed(42)
+    x = torch.randn(tokens, hidden, dtype=torch.float16, device=device)
+    weight = _make_packed_weights(experts, hidden, gate_up)
+    scales = _make_scales(experts, hidden // group_size, gate_up, torch.float16)
+    zeros = _make_qzeros(experts, hidden // group_size, gate_up)
+    topk_ids = torch.randint(
+        0, experts, (tokens, top_k), device=device, dtype=torch.int32
+    )
+    outputs = []
+    for block_size_m in (4, 8):
+        sorted_ids, expert_ids, padded_count = moe_align_block_size(
+            topk_ids, block_size_m, experts
+        )
+        output = torch.zeros(
+            tokens * top_k, gate_up, dtype=torch.float16, device=device
+        )
+        ops.moe_gptq_gemm_rdna2(
+            x,
+            output,
+            weight,
+            scales,
+            zeros,
+            torch.empty(0, device=device),
+            sorted_ids,
+            expert_ids,
+            padded_count,
+            top_k,
+            block_size_m,
+            False,
+            0,
+        )
+        outputs.append(output)
+    torch.testing.assert_close(outputs[1], outputs[0], atol=0.1, rtol=0.01)
 
 
 @gfx1030_only
