@@ -109,3 +109,23 @@ regular fixture hit prefix cache and is excluded despite harness validity.
 This is about 2.5–3% higher prefill than the preceding resident candidate in
 these 16k runs. The decode trials vary and do not establish a decode gain.
 JSON: `/home/george/v620-experiments/resident-tile8-16k-178f107ad-fresh-repeats.json`.
+
+## Fused PLE grouped normalization
+
+Commit `dbd999403` reuses the existing AMD grouped RMSNorm kernel for PLE
+on supported FP16/BF16 contiguous GPU tensors. Eight focused CPU/GPU,
+strided-input, and graph-replay tests passed on V620. One 16k pass warmed the
+build; the measured pass logged no inference JIT or GPU memory faults. Again,
+the first regular repetition reused a deterministic prefix and is excluded.
+
+| 16k case | Fresh trial | Prefill tokens/s | Generation tokens/s | TTFT s | Output valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular prose | 02 | 2,013.5 | 56.4 | 8.32 | Yes |
+| Regular prose | 03 | 2,016.0 | 57.2 | 8.31 | Yes |
+| Coding | 01 | 2,021.9 | 72.2 | 8.93 | Yes |
+| Coding | 02 | 2,013.1 | 69.7 | 8.97 | Yes |
+| Coding | 03 | 2,017.8 | 72.8 | 8.95 | Yes |
+
+This is roughly 0.5–0.8% faster prefill than tile8 alone in these 16k trials.
+Decode remains variable and no decode improvement is attributed to PLE.
+JSON: `/home/george/v620-experiments/resident-tile8-ple-16k-dbd999403-fresh-repeats.json`.
