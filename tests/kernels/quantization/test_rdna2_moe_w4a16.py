@@ -116,7 +116,7 @@ def _make_qzeros(E, groups, N):
         ),
     ],
 )
-@pytest.mark.parametrize("block_size_m", [1, 4])
+@pytest.mark.parametrize("block_size_m", [1, 4, 8])
 def test_fused_moe_w1_matches_dense(
     E, K, N_inter, top_k, group_size, M, dtype, block_size_m
 ):
