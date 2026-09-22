@@ -150,3 +150,23 @@ with the preceding PLE build, the checkpoint changes cost about 2.5–3.2%
 prefill on these 16k fixtures. This step is for correct prompt reuse; the
 served tuning table is evaluated separately below. JSON:
 `/home/george/v620-experiments/checkpoints-16k-772dac40d-fresh-repeats.json`.
+
+## Git-tracked served MoE tuning and launch settings
+
+Commit `1e68a8b90` versions the served V620 MoE configuration and matches the
+unit's `VLLM_ROCM_MOE_PREFILL=0` and `VLLM_GDN_HIP_PREFILL=0` settings. The
+JSON content was compared with the live unit's tuning table by canonicalized
+SHA-256 and matched exactly. The same 16k procedure gave these uncached trials:
+
+| 16k case | Fresh trial | Prefill tokens/s | Generation tokens/s | TTFT s | Output valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular prose | 02 | 1,951.7 | 56.2 | 8.58 | Yes |
+| Regular prose | 03 | 1,950.8 | 56.0 | 8.59 | Yes |
+| Coding | 02 | 1,971.5 | 70.6 | 9.16 | Yes |
+| Coding | 03 | 1,970.5 | 73.1 | 9.17 | Yes |
+
+The tuning table and launcher parity did not materially change 16k prefill
+from the checkpoint-only build in this controlled run. The measured pass logged
+two early Triton JIT events during cached repetition 01; later fresh trials
+were stable. JSON:
+`/home/george/v620-experiments/served-tuning-16k-1e68a8b90-fresh-repeats.json`.
