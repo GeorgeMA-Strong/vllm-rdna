@@ -592,6 +592,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.gdn_decode_kernel = "triton"
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+        # First RDNA2 decode may read paged state allocated without committed
+        # physical pages. Initialize it once before gathering or updating it.
+        self._rdna2_cache_sanitized = False
+        self._rdna2_ssm_sanitized = False
         self._gdn_arena_max_bs = gdn_decode_arena_max_bs(vllm_config, self.num_spec)
         self._conv_state_arena: torch.Tensor | None = None
         self._ssm_state_arena: torch.Tensor | None = None
@@ -662,6 +666,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata.cache_slot_indices_is_static,
         )
         conv_arena, ssm_arena = self._ensure_gdn_state_arenas(conv_state, ssm_state)
+        if current_platform.is_rocm() and not self._rdna2_cache_sanitized:
+            with torch.no_grad():
+                conv_state.zero_()
+                ssm_state.zero_()
+            self._rdna2_cache_sanitized = True
         gather_gdn_state_arenas(
             conv_state, ssm_state, conv_arena, ssm_arena, cache_slots, num
         )
@@ -2076,6 +2085,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 and hasattr(torch.ops, "_rocm_C")
                 and hasattr(torch.ops._rocm_C, "gdn_decode_rdna2")
             ):
+                if not self._rdna2_ssm_sanitized:
+                    ssm_state.zero_()
+                    self._rdna2_ssm_sanitized = True
                 if os.environ.get("VLLM_GDN_DBG") == "1":
                     # Diagnostic-only: omit ssm_state NaN pre-check from this
                     # print -- ssm_state is GB-scale and any().item() forces
