@@ -66,9 +66,10 @@ skinny decode path. It listens on port 8080. It conflicts with the old fast
 unit to prevent two full models using the same GPUs.
 
 ```bash
+systemctl --user disable --now v620-tp4-fast.service
 systemctl --user link "$root/tools/rdna2/systemd/v620-tp4-git.service"
 systemctl --user daemon-reload
-systemctl --user start v620-tp4-git.service
+systemctl --user enable --now v620-tp4-git.service
 curl --fail http://127.0.0.1:8080/health
 ```
 
