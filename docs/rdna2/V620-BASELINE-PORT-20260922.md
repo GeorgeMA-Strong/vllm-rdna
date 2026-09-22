@@ -86,3 +86,26 @@ Against the exact-base fresh trials, the bundle improves 16k prefill by about
 33–38%. This comparison does not isolate one of the bundled edits as the sole
 cause. JSON:
 `/home/george/v620-experiments/resident-16k-fea652bcd-fresh-repeats.json`.
+
+## Qualified eight-row MoE prefill tile
+
+Commit `85f22d518` selects tile8 only for FP16, at least 4,096 tokens, and
+the served model's 2,560/640 hidden/intermediate size, 128/512 local/global
+experts, 10 routed experts, and expected scale groups. Commit `178f107ad`
+adds a GPU test comparing tile8 with the existing tile4 on this weight
+geometry; it passed on V620. A startup log confirmed tile8 selection.
+The first 16k pass compiled additional Triton shapes and was used as warmup.
+The measured pass logged no inference JIT. As above, repeated tag 01 on the
+regular fixture hit prefix cache and is excluded despite harness validity.
+
+| 16k case | Fresh trial | Prefill tokens/s | Generation tokens/s | TTFT s | Output valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular prose | 02 | 2,002.5 | 61.3 | 8.36 | Yes |
+| Regular prose | 03 | 1,999.9 | 59.8 | 8.38 | Yes |
+| Coding | 01 | 2,009.4 | 66.4 | 8.99 | Yes |
+| Coding | 02 | 2,000.3 | 71.1 | 9.03 | Yes |
+| Coding | 03 | 2,004.7 | 68.2 | 9.01 | Yes |
+
+This is about 2.5–3% higher prefill than the preceding resident candidate in
+these 16k runs. The decode trials vary and do not establish a decode gain.
+JSON: `/home/george/v620-experiments/resident-tile8-16k-178f107ad-fresh-repeats.json`.
