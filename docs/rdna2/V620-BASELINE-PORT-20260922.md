@@ -192,3 +192,32 @@ do not establish a consistent decode benefit. The measured pass logged two
 early Triton JIT events during cached repetition 01; later fresh trials were
 stable. JSON:
 `/home/george/v620-experiments/served-skinny-16k-0821be8d7-fresh-repeats.json`.
+
+## Long-context check after served-source audit
+
+Commit `5e4b5d580` restores the old service's one-shot RDNA2 GDN state
+initialization guard. The native modules were rebuilt from that Git checkout,
+and `llm-context-bench` then ran the regular and coding performance cases at
+32k, 64k, and 128k with a unique request-tag scope. Each case requested 1,024
+output tokens. The service reported a zero percent prefix-cache hit rate.
+
+| Case | Prompt tokens | Prefill tokens/s | Generation tokens/s | TTFT s | Valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular 32k | 33,475 | 1,977.1 | 58.6 | 16.93 | Yes |
+| Coding 32k | 36,155 | 1,982.2 | 70.1 | 18.24 | Yes |
+| Regular 64k | 66,933 | 1,918.7 | 56.9 | 34.89 | Yes |
+| Coding 64k | 71,991 | 1,928.4 | 65.8 | 37.33 | Yes |
+| Regular 128k | 133,836 | 1,778.8 | 55.7 | 75.24 | Yes |
+| Coding 128k | 143,875 | 928.6 | 73.4 | 154.93 | Yes, after retry |
+
+The coding 128k group took 410 seconds because its first request exceeded the
+240-second client timeout. The successful retry still measured only 928.6
+prefill tokens/s. A separate coding 128k run with retries disabled also timed
+out after 240 seconds, leaving the request active in the engine. The service
+was restarted to cancel it. This is a reproducible long-context regression,
+not a result that should be averaged with the other five cases.
+
+Raw server artifacts:
+
+- `/home/george/v620-experiments/git-fast-5e4b5d580-32-128k-20260922.json`
+- `/home/george/v620-experiments/git-fast-5e4b5d580-coding128k-repeat-20260922.json`
