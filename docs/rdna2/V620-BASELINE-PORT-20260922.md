@@ -1,6 +1,14 @@
 # V620 baseline before porting the fast service
 
+> **Timing correction:** The first 16k trial below is invalid as a clean
+> performance baseline. The regular-prose request overlapped Triton kernel
+> compilation in the server logs, so its 1,029 tok/s prefill rate includes
+> first-use compilation delay. Output validity does not validate timing.
+> The corrected warmed measurements appear below.
+
 The baseline source is upstream `rdna_extras` at `f3dd65fa70636566c11b249209d281c0b63c819e`.
+That merge already contains PR #15's live-context QSA prefill bound, so this
+port must not count QSA as a new change relative to this base.
 Commit `9daf24d68949be29b9506ce640fd46367ca0b9cc` adds only the
 benchmark launcher. No runtime source edits were present during this run.
 The server cloned and pulled the branch from GitHub and built its own gfx1030
@@ -23,6 +31,33 @@ timeout, and disabled thinking. The harness performed its normal warmup.
 | Regular prose | 16,750 | 1,029.1 | 57.1 | 16.28 | Yes |
 | Coding | 18,063 | 1,485.4 | 66.8 | 12.16 | Yes |
 
-These are single-run observations, not confidence intervals. The full JSON
+These are cold-start diagnostic observations, not performance conclusions. The
+large prefill discrepancy between cases must not be used to rank changes. The full JSON
 result remains on the V620 server at
 `/home/george/v620-experiments/base-16k-f3dd65fa7.json`.
+
+## Corrected 16k baseline
+
+The server rebuilt the exact `9daf24d68` Git revision in a separate Git
+worktree. One 16k pass warmed the prompt shapes and compiled Triton kernels.
+The next pass accidentally reused a deterministic request tag and hit prefix
+cache for regular prose (1.00-second TTFT). The harness did not report cached
+tokens for this vLLM stream and therefore marked that trial valid. It must be
+discarded. A further `llm-context-bench --repetitions 3` pass used fresh tags
+`performance-02` and `performance-03`. The server logged no Triton inference
+JIT during this final pass.
+
+| 16k case | Prompt tokens | Fresh trial | Prefill tokens/s | Generation tokens/s | TTFT s | Output valid |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Regular prose | 16,750 | 02 | 1,411.5 | 55.5 | 11.87 | Yes |
+| Regular prose | 16,750 | 03 | 1,424.0 | 54.8 | 11.76 | Yes |
+| Coding | 18,063 | 01 | 1,478.1 | 64.7 | 12.22 | Yes |
+| Coding | 18,063 | 02 | 1,474.7 | 65.3 | 12.25 | No: repeated-token output |
+| Coding | 18,063 | 03 | 1,464.5 | 64.4 | 12.33 | Yes |
+
+The clean prefill comparison is therefore about **1,411–1,424 tokens/s for
+regular prose** and **1,464–1,478 tokens/s for coding**. Coding prompt length
+is 7.8% greater. This is a small fixture-dependent gap, not the 44% gap in the
+first cold-start trial. The coding trial with invalid output is excluded from
+the valid measurement range. The full final JSON is on the server at
+`/home/george/v620-experiments/base-16k-f3dd65fa7-fresh-repeats.json`.
