@@ -61,3 +61,28 @@ is 7.8% greater. This is a small fixture-dependent gap, not the 44% gap in the
 first cold-start trial. The coding trial with invalid output is excluded from
 the valid measurement range. The full final JSON is on the server at
 `/home/george/v620-experiments/base-16k-f3dd65fa7-fresh-repeats.json`.
+
+## Resident MoE port on the same 16k suite
+
+At source revision `fea652bcd` (later `9332972c5` changed this document only),
+the launcher enabled `V620_ENABLE_RESIDENT=1`. The code bundle adds resident
+W4A16 weights, FP16 shared-expert fusion, zero-preserving INT4 dequantization,
+and a recurrent slot-bounds guard. It does **not** enable the eight-row MoE
+prefill tile or grouped PLE normalization yet. A warm pass completed without
+the earlier GPU fault. Three further repetitions logged no inference JIT or
+GPU memory faults. Repetition 01 reused the earlier deterministic regular
+prefix and gave an impossible 40,156 tokens/s; it is excluded even though the
+harness marked it valid because this server did not report cached-token usage.
+
+| 16k case | Fresh trial | Prefill tokens/s | Generation tokens/s | TTFT s | Output valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular prose | 02 | 1,947.8 | 60.8 | 8.60 | Yes |
+| Regular prose | 03 | 1,943.6 | 55.8 | 8.62 | Yes |
+| Coding | 01 | 1,955.1 | 70.2 | 9.24 | Yes |
+| Coding | 02 | 1,951.8 | 71.9 | 9.25 | Yes |
+| Coding | 03 | 1,950.8 | 68.5 | 9.26 | Yes |
+
+Against the exact-base fresh trials, the bundle improves 16k prefill by about
+33–38%. This comparison does not isolate one of the bundled edits as the sole
+cause. JSON:
+`/home/george/v620-experiments/resident-16k-fea652bcd-fresh-repeats.json`.
