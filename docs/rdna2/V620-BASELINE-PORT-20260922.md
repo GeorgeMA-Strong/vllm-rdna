@@ -170,3 +170,25 @@ from the checkpoint-only build in this controlled run. The measured pass logged
 two early Triton JIT events during cached repetition 01; later fresh trials
 were stable. JSON:
 `/home/george/v620-experiments/served-tuning-16k-1e68a8b90-fresh-repeats.json`.
+
+## Served resident skinny decode
+
+Commit `0821be8d7` ports the served native skinny decode kernel behind
+`V620_ENABLE_SKINNY=1`. The six native reference and graph-replay tests passed
+on V620. The full model logged that the skinny path was enabled, and the
+fresh 16k pass had no GPU memory faults. Repetition 01 on each fixture reused
+prefix cache and is excluded. The later fresh trials measured:
+
+| 16k case | Fresh trial | Prefill tokens/s | Generation tokens/s | TTFT s | Output valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular prose | 02 | 1,947.5 | 54.2 | 8.60 | Yes |
+| Regular prose | 03 | 1,946.8 | 56.1 | 8.60 | Yes |
+| Coding | 02 | 1,965.5 | 73.8 | 9.19 | Yes |
+| Coding | 03 | 1,967.2 | 72.9 | 9.18 | Yes |
+
+The prefill change from the tuned build is within a few tokens/s. Decode moved
+down slightly on prose and up slightly on coding, so these full-model trials
+do not establish a consistent decode benefit. The measured pass logged two
+early Triton JIT events during cached repetition 01; later fresh trials were
+stable. JSON:
+`/home/george/v620-experiments/served-skinny-16k-0821be8d7-fresh-repeats.json`.

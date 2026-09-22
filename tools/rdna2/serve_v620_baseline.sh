@@ -6,7 +6,8 @@ set -euo pipefail
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 runtime=${V620_RUNTIME:-/home/george/v620-experiments/upstream-20260915/v620-vllm-testing}
 model=${V620_MODEL:-/home/george/v620-vllm/models/intel-autoround}
-port=${V620_TEST_PORT:-8082}
+port=${V620_PORT:-${V620_TEST_PORT:-8082}}
+host=${V620_HOST:-127.0.0.1}
 export PYTHONPATH=$source_dir
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_PLE_CPU_OFFLOAD=1 VLLM_USE_V2_MODEL_RUNNER=1
@@ -36,7 +37,7 @@ source "$source_dir/tools/rdna2/tunableop_env.sh"
 configure_v620_tunableop "$runtime/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5" "$runtime/tunableop"
 command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
     --model "$model" --served-model-name active qwen3.8-flash-next
-    --host 127.0.0.1 --port "$port" --tensor-parallel-size 4
+    --host "$host" --port "$port" --tensor-parallel-size 4
     --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
     --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
     --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4026531840
