@@ -42,6 +42,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -1084,6 +1085,10 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     # Create minimal mock with just the needed attributes
     mock = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
+        mamba_state_block_size=block_size,
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(get_replay_boundaries=lambda request: ())
+        ),
         max_num_scheduled_tokens=3 * block_size,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
@@ -3059,6 +3064,72 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
             )
 
 
+def test_hybrid_coordinator_skips_non_cacheable_circular_group():
+    """Non-cacheable QSA ring groups must not enter prefix-hit lookup."""
+    block_size = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["ring"],
+                CircularBufferSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=64,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    attention_group_ids = {
+        group_id
+        for group in manager.coordinator.attention_groups
+        for group_id in group.group_ids
+    }
+    assert attention_group_ids == {0, 2}
+
+    token_ids = list(range(16))
+    first = make_request("ring-cache-0", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(first)
+    assert num_computed_tokens == 0
+    assert manager.allocate_slots(
+        first, len(token_ids), num_computed_tokens, computed_blocks
+    )
+    manager.free(first)
+
+    replay = make_request("ring-cache-1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(replay)
+    assert num_computed_tokens == 12
+    assert len(computed_blocks.blocks[0]) == 3
+    assert not computed_blocks.blocks[1]
+    assert len(computed_blocks.blocks[2]) == 3
+
+
 def test_hybrid_cache_blocks_clamped_to_lcm():
     """HybridKVCacheCoordinator.cache_blocks() clamps to scheduler_block_size.
     Chunks past the last lcm-aligned boundary can never participate in a
@@ -4240,6 +4311,74 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
+
+
+def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
+    """Sparse retention keeps both MTP resend and extension boundaries."""
+    block_size = 32
+    num_spec = 3
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba_mtp"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=num_spec,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(4) for _ in range(block_size)]
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    for chunk_end in (32, 64, 96, 128):
+        blocks = manager.allocate_slots(
+            req0,
+            chunk_end - req0.num_computed_tokens,
+            num_computed_tokens,
+            computed_blocks,
+            num_lookahead_tokens=num_spec,
+        )
+        assert blocks is not None
+        req0.num_computed_tokens = chunk_end
+
+    # The EAGLE resend can resume at 64, while an extension can resume at 96.
+    pool = manager.block_pool
+    assert pool.get_cached_block(req0.block_hashes[1], kv_cache_group_ids=[1])
+    assert pool.get_cached_block(req0.block_hashes[2], kv_cache_group_ids=[1])
+    manager.free(req0)
+
+    resend = make_request("1", token_ids, block_size, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(resend)
+    assert num_computed_tokens == 2 * block_size
+
+    longer = make_request("2", token_ids + [9] * block_size, block_size, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(longer)
+    assert num_computed_tokens == 3 * block_size
 
 
 def test_swa_reachable_block_mask_pins_shared_prefix():
