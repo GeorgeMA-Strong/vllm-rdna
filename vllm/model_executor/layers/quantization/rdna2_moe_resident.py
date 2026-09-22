@@ -7,10 +7,14 @@ from types import SimpleNamespace
 
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_rdna2 import (  # noqa: E501
     CompressedTensorsWNA16RDNA2MoEMethod,
 )
 from vllm.model_executor.utils import replace_parameter
+
+logger = init_logger(__name__)
 
 
 def pack_sequential_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -51,6 +55,14 @@ def prepare_resident_layer(layer, group_size: int) -> None:
     native_method = object.__new__(CompressedTensorsWNA16RDNA2MoEMethod)
     native_method.group_size = group_size
     native_method.process_weights_after_loading(native_layer)
+    native_layer.skinny_decode = envs.VLLM_RDNA_MOE_RESIDENT_SKINNY and hasattr(
+        torch.ops._rocm_C, "moe_resident_int4_decode"
+    )
+    if native_layer.skinny_decode:
+        logger.info_once("RDNA2 resident skinny decode enabled for M=1..4")
+    elif envs.VLLM_RDNA_MOE_RESIDENT_SKINNY:
+        logger.warning_once("Resident skinny op unavailable; using tiled MoE")
+    native_layer.group_size = group_size
     layer._rdna2_resident = native_layer
 
 
@@ -75,6 +87,41 @@ def apply_resident(layer, x, topk_weights, topk_ids):
     activation = layer.activation
     if not isinstance(activation, MoEActivation):
         activation = MoEActivation.from_str(activation)
+    native = layer._rdna2_resident
+    # The sibling kernel reads the same resident weights; larger verification
+    # batches and other activations retain the qualified tiled path.
+    if (
+        getattr(native, "skinny_decode", False)
+        and 1 <= x.shape[0] <= 4
+        and activation == MoEActivation.SILU
+        and not layer.apply_router_weight_on_input
+        and x.shape[1] % 32 == 0
+        and native.w13_weight_packed.shape[2] % 64 == 0
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and x.shape[0] * topk_ids.shape[1] <= native.rdna2_act_buf.shape[0]
+    ):
+        m, topk = topk_ids.shape
+        intermediate = native.w13_weight_packed.shape[2] // 2
+        act = native.rdna2_act_buf[: m * topk].view(m, topk, intermediate)
+        # Each call owns its output, including multiple layers/captured calls.
+        out = torch.empty_like(x)
+        torch.ops._rocm_C.moe_resident_int4_decode(
+            x,
+            native.w13_weight_packed,
+            native.w13_weight_scale,
+            native.w2_weight_packed,
+            native.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            act,
+            out,
+            native.group_size,
+            layer.expert_map,
+        )
+        return out
     return _rdna2_fused_moe(
         x,
         topk_weights,

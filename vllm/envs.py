@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_MOE_SKINNY: bool = True
     VLLM_RDNA_MOE_RESIDENT: bool = False
+    VLLM_RDNA_MOE_RESIDENT_SKINNY: bool = False
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_USE_RDNA2_FA: bool = True
     VLLM_FORCE_CUSTOM_ALL_REDUCE: bool = False
@@ -1381,6 +1382,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RDNA_MOE_RESIDENT": lambda: bool(
         int(os.getenv("VLLM_RDNA_MOE_RESIDENT", "0"))
     ),
+    "VLLM_RDNA_MOE_RESIDENT_SKINNY": lambda: bool(
+        int(os.getenv("VLLM_RDNA_MOE_RESIDENT_SKINNY", "0"))
+    ),
     "VLLM_ROCM_MOE_SKINNY": lambda: bool(int(os.getenv("VLLM_ROCM_MOE_SKINNY", "1"))),
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
@@ -1410,7 +1414,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CUSTOM / RCCL. Not implied by VLLM_FORCE_CUSTOM_ALL_REDUCE. Related:
     # VLLM_RDNA_AR_MAX_KB, VLLM_RDNA_AR_BLOCKS, VLLM_RDNA_AR_PACE,
     # VLLM_RDNA_AR_SPIN_CAP. A wedge writes $VLLM_CACHE_ROOT/rdna_ar_wedged.
-    "VLLM_RDNA_AR": lambda: (os.getenv("VLLM_RDNA_AR", "0").strip().lower() or "0"),
+    "VLLM_RDNA_AR": lambda: os.getenv("VLLM_RDNA_AR", "0").strip().lower() or "0",
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
     # Recommended for large models to get allreduce
@@ -2112,8 +2116,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RDNA_DENSE_INT8": lambda: os.getenv("VLLM_RDNA_DENSE_INT8", "0") == "1",
     "VLLM_RDNA_FUSED_HC": lambda: os.getenv("VLLM_RDNA_FUSED_HC", "1") == "1",
     "VLLM_RDNA_FUSED_SE": lambda: os.getenv("VLLM_RDNA_FUSED_SE", "1") == "1",
-    "VLLM_RDNA_HC_PREFILL_HIP": lambda: os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "0")
-    == "1",
+    "VLLM_RDNA_HC_PREFILL_HIP": lambda: (
+        os.getenv("VLLM_RDNA_HC_PREFILL_HIP", "0") == "1"
+    ),
     "VLLM_RDNA_QSA_HIP": lambda: os.getenv("VLLM_RDNA_QSA_HIP", "0") == "1",
     "VLLM_RDNA_PLE_CONV_HIP": lambda: os.getenv("VLLM_RDNA_PLE_CONV_HIP", "0") == "1",
     # Log model inspection after loading.

@@ -27,6 +27,17 @@ void moe_skinny_int4_decode(const at::Tensor& input, const at::Tensor& w13,
                             at::Tensor& output, const int64_t group_size,
                             const std::optional<at::Tensor>& expert_map);
 
+// Native resident-layout W4A16 MoE skinny GEMV. Weights are shuffled int32
+// [E, K/8, N], scales are fp16 [E, K/group_size, N], and routing ids may be
+// int32 or int64. Symmetric uint4b8 is the only supported quantization.
+void moe_resident_int4_decode(const at::Tensor& input, const at::Tensor& w13,
+                              const at::Tensor& w13_scale, const at::Tensor& w2,
+                              const at::Tensor& w2_scale,
+                              const at::Tensor& topk_weights,
+                              const at::Tensor& topk_ids, at::Tensor& act_buf,
+                              at::Tensor& output, const int64_t group_size,
+                              const std::optional<at::Tensor>& expert_map);
+
 at::Tensor gemv_f16_rdna2(const at::Tensor& x, const at::Tensor& w,
                           const std::optional<at::Tensor>& bias);
 at::Tensor gemv_i8_rdna2(const at::Tensor& x, const at::Tensor& w,
@@ -94,8 +105,9 @@ void paged_attention(
 
 // T44: gfx1030 push-based one-shot all-reduce (opt-in via VLLM_RDNA_AR).
 // Protocol from leapdragon/vllm-rdna2-qwen T44/T44b (Aron Hsiao).
-at::Tensor rdna_ar_init(int64_t rank, int64_t world, const at::Tensor& device_ids,
-                        int64_t max_bytes, const std::string& shm_name);
+at::Tensor rdna_ar_init(int64_t rank, int64_t world,
+                        const at::Tensor& device_ids, int64_t max_bytes,
+                        const std::string& shm_name);
 void rdna_ar_connect(int64_t handle, const at::Tensor& handles);
 bool rdna_ar_can(int64_t handle, const at::Tensor& t);
 at::Tensor rdna_ar_all_reduce(int64_t handle, const at::Tensor& in);
@@ -119,23 +131,17 @@ void rdna2_freeze_capture_persist();
 // RDNA2 GEMM paths; the host launchers above are at global scope
 // because they are called from torch registration which expects
 // unqualified symbol names.
-torch::Tensor fa_rdna2_decode_paged(torch::Tensor Q,
-                                   torch::Tensor key_cache,
-                                   torch::Tensor value_cache,
-                                   torch::Tensor block_table,
-                                   torch::Tensor seq_lens,
-                                   int64_t block_size, int64_t kv_splits,
-                                   int64_t sliding_window);
+torch::Tensor fa_rdna2_decode_paged(torch::Tensor Q, torch::Tensor key_cache,
+                                    torch::Tensor value_cache,
+                                    torch::Tensor block_table,
+                                    torch::Tensor seq_lens, int64_t block_size,
+                                    int64_t kv_splits, int64_t sliding_window);
 
-torch::Tensor fa_rdna2_prefill_paged_varlen(torch::Tensor Q,
-                                           torch::Tensor key_cache,
-                                           torch::Tensor value_cache,
-                                           torch::Tensor block_table,
-                                           torch::Tensor cu_query_lens,
-                                           torch::Tensor seq_lens,
-                                           int64_t block_size,
-                                           int64_t causal,
-                                           int64_t sliding_window);
+torch::Tensor fa_rdna2_prefill_paged_varlen(
+    torch::Tensor Q, torch::Tensor key_cache, torch::Tensor value_cache,
+    torch::Tensor block_table, torch::Tensor cu_query_lens,
+    torch::Tensor seq_lens, int64_t block_size, int64_t causal,
+    int64_t sliding_window);
 
 torch::Tensor fa_rdna2_prefill_paged_varlen_short(
     torch::Tensor Q, torch::Tensor key_cache, torch::Tensor value_cache,
@@ -164,7 +170,6 @@ void moe_gptq_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                          int64_t block_size_m, bool mul_topk_weight,
                          int64_t output_topk);
 
-
 // W8A16-FP8 dense linear kernel for AMD RDNA2 (gfx1030).
 // Per-tile FP8 (E4M3) -> fp16 dequant via 256-entry LUT, then v_dot2_f32_f16.
 void gemm_w8a16_fp8_dense(torch::Tensor a, torch::Tensor b_q_weight,
@@ -177,9 +182,9 @@ void gemm_w8a16_fp8_dense(torch::Tensor a, torch::Tensor b_q_weight,
 // memory), then v_dot2_f32_f16. Per-row activation scale, per-group weight
 // scale. Atomic-add epilogue into a pre-zeroed fp16 output.
 void gemm_w8a8_fp8_dense(torch::Tensor a_q, torch::Tensor a_scale,
-                          torch::Tensor b_q_weight, torch::Tensor b_scales,
-                          torch::Tensor c, int64_t group_size,
-                          int64_t a_scale_K_groups);
+                         torch::Tensor b_q_weight, torch::Tensor b_scales,
+                         torch::Tensor c, int64_t group_size,
+                         int64_t a_scale_K_groups);
 
 // W4A4 MXFP4 dense linear kernel for AMD RDNA2 (gfx1030).
 // E2M1 nibble -> fp16 via 16-entry constant LUT, UE8M0 scale per 32-elem
@@ -204,10 +209,9 @@ void moe_exl3_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                          torch::Tensor trellis, torch::Tensor topk_weights,
                          torch::Tensor sorted_token_ids,
                          torch::Tensor expert_ids,
-                         torch::Tensor num_tokens_post_padded,
-                         int64_t top_k, int64_t block_size_m,
-                         bool mul_topk_weight, int64_t output_topk,
-                         int64_t bits, int64_t cb);
+                         torch::Tensor num_tokens_post_padded, int64_t top_k,
+                         int64_t block_size_m, bool mul_topk_weight,
+                         int64_t output_topk, int64_t bits, int64_t cb);
 
 // EXL3 Hadamard-128 transform for AMD RDNA2/RDNA3 (gfx1030/gfx1100).
 // y = H_128(x) * (scale/sqrt(128)), optionally pre-scaled (suh, A-side) or
@@ -215,8 +219,7 @@ void moe_exl3_gemm_rdna2(torch::Tensor a, torch::Tensor c,
 // OUTSIDE the EXL3 K-dot (wiki kernels/exl3.md).
 void exl3_hadamard_128(torch::Tensor input, torch::Tensor output,
                        torch::optional<torch::Tensor> pre_scale,
-                       torch::optional<torch::Tensor> post_scale,
-                       double scale);
+                       torch::optional<torch::Tensor> post_scale, double scale);
 
 // EXL3 6bpw dequant for AMD RDNA2/RDNA3 (gfx1030/gfx1100). Caller applies
 // suh/svh Hadamard folding on GPU (PyTorch).
@@ -237,10 +240,12 @@ void exl3_decode_trellis_rdna2(torch::Tensor trellis, torch::Tensor out,
 // sum kernel. Output is logits [B*next_n, max_model_len] fp32 with -inf
 // in padded slots. Top-K selection is done by the standard upstream
 // `top_k_per_row_decode` kernel (runs on gfx1030).
-torch::Tensor paged_mqa_logits_decode_rdna2(
-    torch::Tensor q_fp8, torch::Tensor kv_cache, torch::Tensor weights,
-    torch::Tensor context_lens, torch::Tensor block_tables,
-    int64_t max_model_len);
+torch::Tensor paged_mqa_logits_decode_rdna2(torch::Tensor q_fp8,
+                                            torch::Tensor kv_cache,
+                                            torch::Tensor weights,
+                                            torch::Tensor context_lens,
+                                            torch::Tensor block_tables,
+                                            int64_t max_model_len);
 
 // Sparse MLA decode for DeepSeek V4 on AMD RDNA2 (gfx1030).
 // Replaces the Triton `_sparse_attn_decode_ragged_kernel` path on
@@ -250,20 +255,18 @@ torch::Tensor paged_mqa_logits_decode_rdna2(
 // FP8 (E4M3 OCP) K_nope with E8M0 block scales, bf16 K_rope. Gated
 // by VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
 void sparse_mla_decode_rdna2(
-    torch::Tensor q,                  // [B, H, D] fp16 or bf16
-    torch::Tensor main_cache,         // [num_blocks, block_size, 576] uint8
-    torch::Tensor main_indices,       // [nnz] int32
-    torch::Tensor main_indptr,        // [B+1] int32
-    torch::Tensor extra_cache,        // [num_blocks, block_size, 576] uint8 (may be empty)
-    torch::Tensor extra_indices,      // [nnz_extra] int32 (may be empty)
-    torch::Tensor extra_indptr,       // [B+1] int32 (zeroed when no extra)
-    int64_t main_block_size,
-    int64_t main_num_rows,
-    int64_t extra_block_size,
-    int64_t extra_num_rows,
-    double scale,
-    torch::Tensor attn_sink,          // [H] fp32 or empty
-    torch::Tensor out);               // [B, H, D] bf16
+    torch::Tensor q,             // [B, H, D] fp16 or bf16
+    torch::Tensor main_cache,    // [num_blocks, block_size, 576] uint8
+    torch::Tensor main_indices,  // [nnz] int32
+    torch::Tensor main_indptr,   // [B+1] int32
+    torch::Tensor
+        extra_cache,  // [num_blocks, block_size, 576] uint8 (may be empty)
+    torch::Tensor extra_indices,  // [nnz_extra] int32 (may be empty)
+    torch::Tensor extra_indptr,   // [B+1] int32 (zeroed when no extra)
+    int64_t main_block_size, int64_t main_num_rows, int64_t extra_block_size,
+    int64_t extra_num_rows, double scale,
+    torch::Tensor attn_sink,  // [H] fp32 or empty
+    torch::Tensor out);       // [B, H, D] bf16
 
 // Sparse MLA prefill for DeepSeek V4 on AMD RDNA2 (gfx1030).
 // Replaces the Triton `_sparse_attn_prefill_ragged_kernel` path on
@@ -273,14 +276,13 @@ void sparse_mla_decode_rdna2(
 // (query, head-group), 32 threads (wave32). Gated by
 // VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
 void sparse_mla_prefill_rdna2(
-    torch::Tensor q,                  // [T, H, D] fp16 or bf16
-    torch::Tensor kv,                 // [skv, D] fp16/bf16 (contiguous rows)
-    torch::Tensor indices,            // [nnz] int32
-    torch::Tensor indptr,             // [T + 1] int32
-    int64_t num_kv,
-    double scale,
-    torch::Tensor attn_sink,          // [H] fp32 or empty
-    torch::Tensor out);               // [T, H, D] same dtype as q
+    torch::Tensor q,        // [T, H, D] fp16 or bf16
+    torch::Tensor kv,       // [skv, D] fp16/bf16 (contiguous rows)
+    torch::Tensor indices,  // [nnz] int32
+    torch::Tensor indptr,   // [T + 1] int32
+    int64_t num_kv, double scale,
+    torch::Tensor attn_sink,  // [H] fp32 or empty
+    torch::Tensor out);       // [T, H, D] same dtype as q
 
 // INT8 per-(token, head) KV-cache writer for AMD RDNA2 (gfx1030).
 // Symmetric signed int8 quantize + write to the interleaved cache
@@ -291,10 +293,10 @@ void sparse_mla_prefill_rdna2(
 // cooperative load. Per the kv-int8.md wiki contract — fused i8 quant
 // + scale computation in a single CTA per (token, head).
 void reshape_and_cache_int8_rdna2(
-    torch::Tensor key,         // [num_tokens, H_kv, D] fp16
-    torch::Tensor value,       // [num_tokens, H_kv, D] fp16
-    torch::Tensor kv_cache,    // [2, num_blocks, H_kv, D + 4, block_size] int8
-    torch::Tensor slot_mapping // [num_tokens] int32 (-1 = skip)
+    torch::Tensor key,          // [num_tokens, H_kv, D] fp16
+    torch::Tensor value,        // [num_tokens, H_kv, D] fp16
+    torch::Tensor kv_cache,     // [2, num_blocks, H_kv, D + 4, block_size] int8
+    torch::Tensor slot_mapping  // [num_tokens] int32 (-1 = skip)
 );
 
 // fp16 flash KV-cache writer for FA-RDNA2. Stride-aware so hybrid GDN
@@ -304,12 +306,10 @@ void reshape_and_cache_int8_rdna2(
 //   key_cache:     [nb, H_kv, D/x, block_size, x] fp16
 //   value_cache:   [nb, H_kv, D, block_size] fp16
 //   slot_mapping:  [num_tokens] int32 or int64 (-1 = skip)
-void reshape_and_cache_flash_rdna2(
-    torch::Tensor key,
-    torch::Tensor value,
-    torch::Tensor key_cache,
-    torch::Tensor value_cache,
-    torch::Tensor slot_mapping);
+void reshape_and_cache_flash_rdna2(torch::Tensor key, torch::Tensor value,
+                                   torch::Tensor key_cache,
+                                   torch::Tensor value_cache,
+                                   torch::Tensor slot_mapping);
 
 // hipMalloc + from_blob, never hipFree. GDN prefill scratch / eager 16k
 // workspaces use this so mixed prefill cannot recycle FULL-graph pages.
@@ -331,8 +331,7 @@ void gdn_decode_rdna2(
     torch::Tensor out,                // [B, 1, HV, V] fp16
     torch::Tensor initial_state,      // [blocks, HV, V, K] fp32, in-place
     torch::Tensor ssm_state_indices,  // [B] int32
-    double scale,
-    bool use_qk_l2norm);
+    double scale, bool use_qk_l2norm);
 
 // GDN prefill kernels for AMD RDNA2 (gfx1030). Hand ports of the Triton/FLA
 // chain `chunk_gated_delta_rule_fwd` (chunk.py:23-86) decomposed into 5 HIP
@@ -342,73 +341,74 @@ void gdn_decode_rdna2(
 // fused_post_conv_prep + chunk_local_cumsum fused. g is already cumsum'd
 // when it leaves this kernel (fold of `chunk_local_cumsum` in chunk.py:37).
 void gdn_prefill_prep_rdna2(
-    torch::Tensor mixed_qkv,    // [L, qkv_dim] fp16 contiguous in last dim
-    torch::Tensor a,            // [L, HV] fp16
-    torch::Tensor b,            // [L, HV] fp16
-    torch::Tensor A_log,        // [HV] fp32 or fp16 contiguous
-    torch::Tensor dt_bias,      // [HV] fp32 or fp16 contiguous
-    torch::Tensor q,            // [L, H, K] fp16 (output)
-    torch::Tensor k_out,        // [L, H, K] fp16 (output)
-    torch::Tensor v,            // [L, HV, V] fp16 (output)
-    torch::Tensor g_cumsum,     // [L, HV] fp32 (output)
-    torch::Tensor beta,         // [L, HV] fp32 (output)
-    torch::Tensor cu_seqlens,   // [N+1] int32
-    torch::Tensor chunk_indices);// [NT, 2] int32
+    torch::Tensor mixed_qkv,       // [L, qkv_dim] fp16 contiguous in last dim
+    torch::Tensor a,               // [L, HV] fp16
+    torch::Tensor b,               // [L, HV] fp16
+    torch::Tensor A_log,           // [HV] fp32 or fp16 contiguous
+    torch::Tensor dt_bias,         // [HV] fp32 or fp16 contiguous
+    torch::Tensor q,               // [L, H, K] fp16 (output)
+    torch::Tensor k_out,           // [L, H, K] fp16 (output)
+    torch::Tensor v,               // [L, HV, V] fp16 (output)
+    torch::Tensor g_cumsum,        // [L, HV] fp32 (output)
+    torch::Tensor beta,            // [L, HV] fp32 (output)
+    torch::Tensor cu_seqlens,      // [N+1] int32
+    torch::Tensor chunk_indices);  // [NT, 2] int32
 
 // chunk_scaled_dot_kkt. A[i,j] = beta_i * exp(g_i - g_j) * (k_i . k_j)
 // for i > j (strict), else 0. The [64,128] @ [128,64] dot is fp32 FMA
 // (no V_DOT2: _CAST_DOT_TO_K_DTYPE is False on gfx1030, beta*k stays fp32).
 void gdn_prefill_kkt_rdna2(
-    torch::Tensor k,            // [B, T, Hg, K] fp16 contiguous in last dim
-    torch::Tensor beta,         // [B, T, H] fp32
-    torch::Tensor g,            // [B, T, H] fp32 (cumsum'd g, from prep)
-    torch::Tensor A,            // [B, T, H, BT] fp32 (output)
-    torch::Tensor cu_seqlens,   // [N+1] int32
-    torch::Tensor chunk_indices);// [NT, 2] int32
+    torch::Tensor k,               // [B, T, Hg, K] fp16 contiguous in last dim
+    torch::Tensor beta,            // [B, T, H] fp32
+    torch::Tensor g,               // [B, T, H] fp32 (cumsum'd g, from prep)
+    torch::Tensor A,               // [B, T, H, BT] fp32 (output)
+    torch::Tensor cu_seqlens,      // [N+1] int32
+    torch::Tensor chunk_indices);  // [NT, 2] int32
 
 // solve_tril + recompute_w_u FUSED. Same (NT, B*H) grid; A_inv [64,64]
 // stays on-chip between the fp32 16x16 forward-substitution + Schur phase
 // and the V_DOT2_F32_F16 w/u production phase.
 void gdn_prefill_solve_wy_rdna2(
-    torch::Tensor A,            // [B, T, H, BT] fp32 (from kkt)
-    torch::Tensor k,            // [B, T, Hg, K] fp16
-    torch::Tensor v,            // [B, T, H, V] fp16
-    torch::Tensor beta,         // [B, T, H] fp32
-    torch::Tensor g,            // [B, T, H] fp32 (cumsum'd g, from prep)
-    torch::Tensor A_inv,        // [B, T, H, BT] fp16 (output)
-    torch::Tensor w,            // [B, T, H, K] fp16 (output)
-    torch::Tensor u,            // [B, T, H, V] fp16 (output)
-    torch::Tensor cu_seqlens,   // [N+1] int32
-    torch::Tensor chunk_indices);// [NT, 2] int32
+    torch::Tensor A,               // [B, T, H, BT] fp32 (from kkt)
+    torch::Tensor k,               // [B, T, Hg, K] fp16
+    torch::Tensor v,               // [B, T, H, V] fp16
+    torch::Tensor beta,            // [B, T, H] fp32
+    torch::Tensor g,               // [B, T, H] fp32 (cumsum'd g, from prep)
+    torch::Tensor A_inv,           // [B, T, H, BT] fp16 (output)
+    torch::Tensor w,               // [B, T, H, K] fp16 (output)
+    torch::Tensor u,               // [B, T, H, V] fp16 (output)
+    torch::Tensor cu_seqlens,      // [N+1] int32
+    torch::Tensor chunk_indices);  // [NT, 2] int32
 
 // chunk_gated_delta_rule_fwd_h (serial inter-chunk recurrence). Reuses
 // Stage-1 decode layout (256 threads = 32 v-rows x 8 k-slices, h [32,128]
 // fp32 register-resident). initial_state = h0, final_state = last h per seq.
 void gdn_prefill_delta_h_rdna2(
-    torch::Tensor k,                  // [B, T, Hg, K] fp16
-    torch::Tensor u,                  // [B, T, H, V] fp16
-    torch::Tensor w,                  // [B, T, H, K] fp16
-    torch::Tensor g,                  // [B, T, H] fp32 (cumsum'd g)
-    torch::Tensor h,                  // [NT, H, V, K] fp16 (per-chunk h, output)
-    torch::Tensor v_new,              // [B, T, H, V] fp16 (output)
-    c10::optional<torch::Tensor> initial_state,  // [N, H, V, K] fp32 or undefined
-    c10::optional<torch::Tensor> final_state,    // [N, H, V, K] fp32 or undefined
-    c10::optional<torch::Tensor> cu_seqlens,     // [N+1] int32 or undefined
+    torch::Tensor k,      // [B, T, Hg, K] fp16
+    torch::Tensor u,      // [B, T, H, V] fp16
+    torch::Tensor w,      // [B, T, H, K] fp16
+    torch::Tensor g,      // [B, T, H] fp32 (cumsum'd g)
+    torch::Tensor h,      // [NT, H, V, K] fp16 (per-chunk h, output)
+    torch::Tensor v_new,  // [B, T, H, V] fp16 (output)
+    c10::optional<torch::Tensor>
+        initial_state,                         // [N, H, V, K] fp32 or undefined
+    c10::optional<torch::Tensor> final_state,  // [N, H, V, K] fp32 or undefined
+    c10::optional<torch::Tensor> cu_seqlens,   // [N+1] int32 or undefined
     c10::optional<torch::Tensor> chunk_offsets,  // [N+1] int32 or undefined
-    int64_t chunk_size);              // must be 64
+    int64_t chunk_size);                         // must be 64
 
 // chunk_fwd_o. q.A (intra-chunk) + q.h (state) with V_DOT2_F32_F16 and the
 // inclusive `>=` causal mask. h: 5D non-varlen or 4D varlen, fp16 or fp32.
 void gdn_prefill_o_rdna2(
-    torch::Tensor q,             // [B, T, Hg, K] fp16 contiguous in K
-    torch::Tensor k,             // [B, T, Hg, K] fp16 contiguous in K
-    torch::Tensor v,             // [B, T, H, V] fp16 contiguous in V
-    torch::Tensor h,             // 5D non-varlen or 4D varlen; fp16 or fp32
-    torch::Tensor g,             // [B, T, H] fp32 (cumsum'd g)
-    torch::Tensor o,             // [B, T, H, V] fp16 (output)
+    torch::Tensor q,  // [B, T, Hg, K] fp16 contiguous in K
+    torch::Tensor k,  // [B, T, Hg, K] fp16 contiguous in K
+    torch::Tensor v,  // [B, T, H, V] fp16 contiguous in V
+    torch::Tensor h,  // 5D non-varlen or 4D varlen; fp16 or fp32
+    torch::Tensor g,  // [B, T, H] fp32 (cumsum'd g)
+    torch::Tensor o,  // [B, T, H, V] fp16 (output)
     double scale,
-    torch::Tensor cu_seqlens,    // [N+1] int32
-    torch::Tensor chunk_offsets);// [N+1] int32
+    torch::Tensor cu_seqlens,      // [N+1] int32
+    torch::Tensor chunk_offsets);  // [N+1] int32
 
 // Paged MQA logits for DeepSeek V4 Lightning Indexer on AMD RDNA2
 // (gfx1030). AITER is CDNA-only and crashes on gfx1030; this kernel
@@ -417,10 +417,12 @@ void gdn_prefill_o_rdna2(
 // sum kernel. Output is logits [B*next_n, max_model_len] fp32 with -inf
 // in padded slots. Top-K selection is done by the standard upstream
 // `top_k_per_row_decode` kernel (runs on gfx1030).
-torch::Tensor paged_mqa_logits_decode_rdna2(
-    torch::Tensor q_fp8, torch::Tensor kv_cache, torch::Tensor weights,
-    torch::Tensor context_lens, torch::Tensor block_tables,
-    int64_t max_model_len);
+torch::Tensor paged_mqa_logits_decode_rdna2(torch::Tensor q_fp8,
+                                            torch::Tensor kv_cache,
+                                            torch::Tensor weights,
+                                            torch::Tensor context_lens,
+                                            torch::Tensor block_tables,
+                                            int64_t max_model_len);
 // ===== RDNA2 declarations backported from rdna2_extras ops.h =====
 // (Group1-9 ported the .cu sources + torch_bindings.cpp registrations;
 //  these are the matching ops.h declarations needed to make them compile.)
@@ -436,78 +438,68 @@ void gated_rms_norm(torch::Tensor& out, const torch::Tensor& input,
                     double epsilon, int64_t activation);
 
 void moe_w8a16_gemm_rdna2(torch::Tensor a, torch::Tensor c,
-                           torch::Tensor b_q_weight, torch::Tensor b_scales,
-                           torch::Tensor b_qzeros, torch::Tensor topk_weights,
-                           torch::Tensor sorted_token_ids,
-                           torch::Tensor expert_ids,
-                           torch::Tensor num_tokens_post_padded,
-                           int64_t top_k, int64_t block_size_m,
-                           bool mul_topk_weight, int64_t output_topk);
+                          torch::Tensor b_q_weight, torch::Tensor b_scales,
+                          torch::Tensor b_qzeros, torch::Tensor topk_weights,
+                          torch::Tensor sorted_token_ids,
+                          torch::Tensor expert_ids,
+                          torch::Tensor num_tokens_post_padded, int64_t top_k,
+                          int64_t block_size_m, bool mul_topk_weight,
+                          int64_t output_topk);
 
 void moe_mxfp4_gemm_rdna2(torch::Tensor a, torch::Tensor c,
-                           torch::Tensor b_q_weight, torch::Tensor b_scales,
-                           torch::Tensor topk_weights,
-                           torch::Tensor sorted_token_ids,
-                           torch::Tensor expert_ids,
-                           torch::Tensor num_tokens_post_padded,
-                           int64_t top_k, int64_t block_size_m,
-                           bool mul_topk_weight, int64_t output_topk);
+                          torch::Tensor b_q_weight, torch::Tensor b_scales,
+                          torch::Tensor topk_weights,
+                          torch::Tensor sorted_token_ids,
+                          torch::Tensor expert_ids,
+                          torch::Tensor num_tokens_post_padded, int64_t top_k,
+                          int64_t block_size_m, bool mul_topk_weight,
+                          int64_t output_topk);
 
-void moe_w8a16_fp8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
-                               torch::Tensor b_q_weight,
-                               torch::Tensor b_scales,
-                               torch::Tensor b_qzeros,
-                               torch::Tensor topk_weights,
-                               torch::Tensor sorted_token_ids,
-                               torch::Tensor expert_ids,
-                               torch::Tensor num_tokens_post_padded,
-                               int64_t top_k, int64_t block_size_m,
-                               bool mul_topk_weight, int64_t output_topk);
+void moe_w8a16_fp8_gemm_rdna2(
+    torch::Tensor a, torch::Tensor c, torch::Tensor b_q_weight,
+    torch::Tensor b_scales, torch::Tensor b_qzeros, torch::Tensor topk_weights,
+    torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
+    torch::Tensor num_tokens_post_padded, int64_t top_k, int64_t block_size_m,
+    bool mul_topk_weight, int64_t output_topk);
 
 void mxfp4_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                       torch::Tensor b_q_weight, torch::Tensor b_scales,
                       int64_t size_m, int64_t size_n, int64_t size_k);
 
-
 void sparse_mla_decode_rdna2(
-    torch::Tensor q,                  // [B, H, D] fp16 or bf16
-    torch::Tensor main_cache,         // [num_blocks, block_size, 576] uint8
-    torch::Tensor main_indices,       // [nnz] int32
-    torch::Tensor main_indptr,        // [B+1] int32
-    torch::Tensor extra_cache,        // [num_blocks, block_size, 576] uint8 (may be empty)
-    torch::Tensor extra_indices,      // [nnz_extra] int32 (may be empty)
-    torch::Tensor extra_indptr,       // [B+1] int32 (zeroed when no extra)
-    int64_t main_block_size,
-    int64_t main_num_rows,
-    int64_t extra_block_size,
-    int64_t extra_num_rows,
-    double scale,
-    torch::Tensor attn_sink,          // [H] fp32 or empty
+    torch::Tensor q,             // [B, H, D] fp16 or bf16
+    torch::Tensor main_cache,    // [num_blocks, block_size, 576] uint8
+    torch::Tensor main_indices,  // [nnz] int32
+    torch::Tensor main_indptr,   // [B+1] int32
+    torch::Tensor
+        extra_cache,  // [num_blocks, block_size, 576] uint8 (may be empty)
+    torch::Tensor extra_indices,  // [nnz_extra] int32 (may be empty)
+    torch::Tensor extra_indptr,   // [B+1] int32 (zeroed when no extra)
+    int64_t main_block_size, int64_t main_num_rows, int64_t extra_block_size,
+    int64_t extra_num_rows, double scale,
+    torch::Tensor attn_sink,  // [H] fp32 or empty
     torch::Tensor out);
 
 void sparse_mla_prefill_rdna2(
-    torch::Tensor q,                  // [T, H, D] fp16 or bf16
-    torch::Tensor kv,                 // [skv, D] fp16/bf16 (contiguous rows)
-    torch::Tensor indices,            // [nnz] int32
-    torch::Tensor indptr,             // [T + 1] int32
-    int64_t num_kv,
-    double scale,
-    torch::Tensor attn_sink,          // [H] fp32 or empty
+    torch::Tensor q,        // [T, H, D] fp16 or bf16
+    torch::Tensor kv,       // [skv, D] fp16/bf16 (contiguous rows)
+    torch::Tensor indices,  // [nnz] int32
+    torch::Tensor indptr,   // [T + 1] int32
+    int64_t num_kv, double scale,
+    torch::Tensor attn_sink,  // [H] fp32 or empty
     torch::Tensor out);
 
 void reshape_and_cache_int8_rdna2(
-    torch::Tensor key,         // [num_tokens, H_kv, D] fp16
-    torch::Tensor value,       // [num_tokens, H_kv, D] fp16
-    torch::Tensor kv_cache,    // [2, num_blocks, H_kv, D + 4, block_size] int8
-    torch::Tensor slot_mapping // [num_tokens] int32 (-1 = skip)
+    torch::Tensor key,          // [num_tokens, H_kv, D] fp16
+    torch::Tensor value,        // [num_tokens, H_kv, D] fp16
+    torch::Tensor kv_cache,     // [2, num_blocks, H_kv, D + 4, block_size] int8
+    torch::Tensor slot_mapping  // [num_tokens] int32 (-1 = skip)
 );
 
-void reshape_and_cache_flash_rdna2(
-    torch::Tensor key,
-    torch::Tensor value,
-    torch::Tensor key_cache,
-    torch::Tensor value_cache,
-    torch::Tensor slot_mapping);
+void reshape_and_cache_flash_rdna2(torch::Tensor key, torch::Tensor value,
+                                   torch::Tensor key_cache,
+                                   torch::Tensor value_cache,
+                                   torch::Tensor slot_mapping);
 
 void gdn_decode_rdna2(
     torch::Tensor mixed_qkv,          // [B, 2*H*K + HV*V] fp16
@@ -518,18 +510,17 @@ void gdn_decode_rdna2(
     torch::Tensor out,                // [B, 1, HV, V] fp16
     torch::Tensor initial_state,      // [blocks, HV, V, K] fp32, in-place
     torch::Tensor ssm_state_indices,  // [B] int32
-    double scale,
-    bool use_qk_l2norm);
+    double scale, bool use_qk_l2norm);
 
 // causal_conv1d_update for AMD RDNA2 (gfx1030). Single-token decode path:
 // per-batch depthwise FIR filter with conv_state shift-left + append.
 // cudagraph-safe (no global scratch, all state in registers).
 void causal_conv1d_update_rdna2(
-    torch::Tensor x,                  // [batch, dim, 1] fp16
-    torch::Tensor conv_state,         // [num_cache_lines, dim, state_len] fp16
-    torch::Tensor weight,            // [dim, width] fp16
-    torch::Tensor bias,              // [dim] fp16 or undefined
-    torch::Tensor out,               // [batch, dim, 1] fp16
+    torch::Tensor x,                   // [batch, dim, 1] fp16
+    torch::Tensor conv_state,          // [num_cache_lines, dim, state_len] fp16
+    torch::Tensor weight,              // [dim, width] fp16
+    torch::Tensor bias,                // [dim] fp16 or undefined
+    torch::Tensor out,                 // [batch, dim, 1] fp16
     torch::Tensor conv_state_indices,  // [batch] int32
     bool silu_activation);
 
@@ -547,17 +538,16 @@ void causal_conv1d_fwd_rdna2(
     torch::Tensor cache_indices,      // [batch] int32
     torch::Tensor has_initial_state,  // [batch] bool or undefined
     torch::Tensor out,                // [dim, cu_seqlen] fp16
-    bool silu_activation,
-    int64_t null_block_id = 0);
+    bool silu_activation, int64_t null_block_id = 0);
 
-void mrope_forward_rdna2(
-    torch::Tensor q,                  // [num_tokens, n_qh * hd] fp16
-    torch::Tensor k,                  // [num_tokens, n_kh * hd] fp16
-    torch::Tensor cos,                // [3, num_tokens, rd/2] fp16
-    torch::Tensor sin,                // [3, num_tokens, rd/2] fp16
-    int64_t num_tokens, int64_t n_qh, int64_t n_kh, int64_t hd, int64_t rd,
-    int64_t sec_t, int64_t sec_h, int64_t sec_w, bool is_interleaved,
-    bool is_neox_style);
+void mrope_forward_rdna2(torch::Tensor q,    // [num_tokens, n_qh * hd] fp16
+                         torch::Tensor k,    // [num_tokens, n_kh * hd] fp16
+                         torch::Tensor cos,  // [3, num_tokens, rd/2] fp16
+                         torch::Tensor sin,  // [3, num_tokens, rd/2] fp16
+                         int64_t num_tokens, int64_t n_qh, int64_t n_kh,
+                         int64_t hd, int64_t rd, int64_t sec_t, int64_t sec_h,
+                         int64_t sec_w, bool is_interleaved,
+                         bool is_neox_style);
 
 // ---------------------------------------------------------------------------
 // HC prefill HIP kernels for Qwen4Exp / Qwen3.8-Flash-Next on gfx1030.
@@ -567,39 +557,33 @@ void mrope_forward_rdna2(
 // ---------------------------------------------------------------------------
 
 void hc_grouped_gemma_rmsnorm_rdna2(
-    torch::Tensor x,           // [N, DIM] fp16, last-dim contiguous
-    torch::Tensor weight,      // [GROUP_DIM] or [DIM] fp16
-    torch::Tensor y,           // [N, DIM] fp16
-    int64_t num_groups,
-    double eps);
+    torch::Tensor x,       // [N, DIM] fp16, last-dim contiguous
+    torch::Tensor weight,  // [GROUP_DIM] or [DIM] fp16
+    torch::Tensor y,       // [N, DIM] fp16
+    int64_t num_groups, double eps);
 
-void hc_silu_rdna2(
-    torch::Tensor x,           // [N, DIM] fp16
-    torch::Tensor y,           // [N, DIM] fp16
-    int64_t hc_count);
+void hc_silu_rdna2(torch::Tensor x,  // [N, DIM] fp16
+                   torch::Tensor y,  // [N, DIM] fp16
+                   int64_t hc_count);
 
-void hc_gate_mix_rdna2(
-    torch::Tensor x,           // [N, DIM] fp16
-    torch::Tensor gate,        // [N, DIM] fp16
-    torch::Tensor y,           // [N, DIM/HC] fp16
-    int64_t hc_count);
+void hc_gate_mix_rdna2(torch::Tensor x,     // [N, DIM] fp16
+                       torch::Tensor gate,  // [N, DIM] fp16
+                       torch::Tensor y,     // [N, DIM/HC] fp16
+                       int64_t hc_count);
 
-void hc_combine_rdna2(
-    torch::Tensor residual,         // [N, DIM] fp16
-    torch::Tensor block_output,     // [N, DIM/HC] fp16
-    torch::Tensor injection_logits, // [N, HC] fp16
-    torch::Tensor out,              // [N, DIM] fp16
-    int64_t hc_count);
+void hc_combine_rdna2(torch::Tensor residual,          // [N, DIM] fp16
+                      torch::Tensor block_output,      // [N, DIM/HC] fp16
+                      torch::Tensor injection_logits,  // [N, HC] fp16
+                      torch::Tensor out,               // [N, DIM] fp16
+                      int64_t hc_count);
 
-void hc_combine_norm_rdna2(
-    torch::Tensor residual,         // [N, DIM] fp16
-    torch::Tensor block_output,     // [N, DIM/HC] fp16
-    torch::Tensor injection_logits, // [N, HC] fp16
-    torch::Tensor norm_weight,      // [DIM/HC] or [DIM] fp16
-    torch::Tensor out,              // [N, DIM] fp16 (combined)
-    torch::Tensor y,                // [N, DIM] fp16 (post-norm)
-    int64_t hc_count,
-    double eps);
+void hc_combine_norm_rdna2(torch::Tensor residual,          // [N, DIM] fp16
+                           torch::Tensor block_output,      // [N, DIM/HC] fp16
+                           torch::Tensor injection_logits,  // [N, HC] fp16
+                           torch::Tensor norm_weight,  // [DIM/HC] or [DIM] fp16
+                           torch::Tensor out,  // [N, DIM] fp16 (combined)
+                           torch::Tensor y,    // [N, DIM] fp16 (post-norm)
+                           int64_t hc_count, double eps);
 
 // ---------------------------------------------------------------------------
 // QSA decode HIP kernels for Qwen4Exp / Qwen3.8-Flash-Next on gfx1030.
@@ -607,36 +591,25 @@ void hc_combine_norm_rdna2(
 // ---------------------------------------------------------------------------
 
 void qsa_store_cache_rows_rdna2(
-    torch::Tensor rows,       // [num_rows, WIDTH] fp16
-    torch::Tensor slots,      // [num_rows] int32
-    torch::Tensor cache,      // [num_blocks, PAGE_SIZE, WIDTH] fp16
-    int64_t page_size,
-    int64_t width);
+    torch::Tensor rows,   // [num_rows, WIDTH] fp16
+    torch::Tensor slots,  // [num_rows] int32
+    torch::Tensor cache,  // [num_blocks, PAGE_SIZE, WIDTH] fp16
+    int64_t page_size, int64_t width);
 
 void qsa_compress_groups_rdna2(
-    torch::Tensor raw_keys,
-    torch::Tensor raw_positions,
-    torch::Tensor compressor_state_cache,
-    torch::Tensor rope_cache,
-    torch::Tensor compressor_state_table,
-    torch::Tensor token_to_req,
-    torch::Tensor query_start_loc,
-    torch::Tensor logical_positions,
-    torch::Tensor compressed_slots,
-    torch::Tensor pooled,
-    torch::Tensor first_positions,
-    int64_t compress_ratio,
-    int64_t compressor_state_size,
-    int64_t head_dim,
-    bool load_rope_positions);
+    torch::Tensor raw_keys, torch::Tensor raw_positions,
+    torch::Tensor compressor_state_cache, torch::Tensor rope_cache,
+    torch::Tensor compressor_state_table, torch::Tensor token_to_req,
+    torch::Tensor query_start_loc, torch::Tensor logical_positions,
+    torch::Tensor compressed_slots, torch::Tensor pooled,
+    torch::Tensor first_positions, int64_t compress_ratio,
+    int64_t compressor_state_size, int64_t head_dim, bool load_rope_positions);
 
-torch::Tensor qsa_mqa_paged_rdna2(
-    torch::Tensor q_fp16,
-    torch::Tensor kv_cache,
-    torch::Tensor weights,
-    torch::Tensor context_lens,
-    torch::Tensor block_tables,
-    int64_t max_model_len);
+torch::Tensor qsa_mqa_paged_rdna2(torch::Tensor q_fp16, torch::Tensor kv_cache,
+                                  torch::Tensor weights,
+                                  torch::Tensor context_lens,
+                                  torch::Tensor block_tables,
+                                  int64_t max_model_len);
 
 // ---------------------------------------------------------------------------
 // PLE dilated short-conv HIP kernels for Qwen4Exp / Qwen3.8-Flash-Next on
@@ -647,24 +620,18 @@ void ple_short_conv_decode_rdna2(
     torch::Tensor x,           // [B, D] fp16
     torch::Tensor conv_state,  // [num_lines, D, state_len] fp16 (in-place)
     torch::Tensor weight,      // [D, K] fp16
-    std::optional<torch::Tensor> bias,        // [D] fp16 or undefined
-    torch::Tensor out,         // [B, D] fp16
-    torch::Tensor state_idx,   // [B] int32
-    std::optional<torch::Tensor> has_init,    // [B] uint8 or undefined
-    int64_t dilation,
-    int64_t state_len,
-    bool silu,
-    int64_t null_block);
+    std::optional<torch::Tensor> bias,      // [D] fp16 or undefined
+    torch::Tensor out,                      // [B, D] fp16
+    torch::Tensor state_idx,                // [B] int32
+    std::optional<torch::Tensor> has_init,  // [B] uint8 or undefined
+    int64_t dilation, int64_t state_len, bool silu, int64_t null_block);
 
 void ple_short_conv_prefill_rdna2(
-    torch::Tensor x_packed,    // [B, D, max_len] fp16
-    torch::Tensor init_state,  // [B, D, state_len] fp16
-    torch::Tensor weight,      // [D, K] fp16
-    std::optional<torch::Tensor> bias,        // [D] fp16 or undefined
-    torch::Tensor out,         // [B, D, max_len] fp16
-    torch::Tensor lengths,     // [B] int32
-    std::optional<torch::Tensor> valid_state, // [B] uint8 or undefined
-    int64_t dilation,
-    int64_t state_len,
-    bool silu);
-
+    torch::Tensor x_packed,                    // [B, D, max_len] fp16
+    torch::Tensor init_state,                  // [B, D, state_len] fp16
+    torch::Tensor weight,                      // [D, K] fp16
+    std::optional<torch::Tensor> bias,         // [D] fp16 or undefined
+    torch::Tensor out,                         // [B, D, max_len] fp16
+    torch::Tensor lengths,                     // [B] int32
+    std::optional<torch::Tensor> valid_state,  // [B] uint8 or undefined
+    int64_t dilation, int64_t state_len, bool silu);

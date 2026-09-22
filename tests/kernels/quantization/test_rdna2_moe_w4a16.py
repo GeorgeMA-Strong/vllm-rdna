@@ -553,3 +553,110 @@ def test_quantized_zero_stays_zero(scale):
         0,
     )
     torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+def _resident_skinny_case(m, k, n, topk=10):
+    """Real shuffle plus independent FP16-dequant reference, including EP holes."""
+    from types import SimpleNamespace
+
+    e, group = 4, 128
+    torch.manual_seed(731)
+    q13 = torch.randint(0, 16, (e, k, 2 * n), device=device, dtype=torch.int32)
+    q2 = torch.randint(0, 16, (e, n, k), device=device, dtype=torch.int32)
+
+    def pack(q):
+        packed = torch.zeros(
+            q.shape[0],
+            q.shape[1] // 8,
+            q.shape[2],
+            device=device,
+            dtype=torch.int32,
+        )
+        for j in range(8):
+            packed |= q[:, j::8] << (4 * j)
+        for expert in range(e):
+            ops.gptq_shuffle(
+                packed[expert], torch.empty(0, device=device, dtype=torch.int32), 4
+            )
+        return packed
+
+    s13 = _make_scales(e, k // group, 2 * n, torch.float16) * 0.2
+    s2 = _make_scales(e, n // group, k, torch.float16) * 0.2
+    layer = SimpleNamespace(
+        w13_weight_packed=pack(q13),
+        w2_weight_packed=pack(q2),
+        w13_weight_scale=s13,
+        w2_weight_scale=s2,
+        w13_qzeros=_make_qzeros(e, k // group, 2 * n),
+        w2_qzeros=_make_qzeros(e, n // group, k),
+        rdna2_w1_buf=torch.zeros(m * topk, 2 * n, device=device, dtype=torch.float16),
+        rdna2_act_buf=torch.empty(m * topk, n, device=device, dtype=torch.float16),
+        rdna2_empty_tw=torch.empty(0, device=device),
+    )
+    x = torch.randn(m, k, device=device, dtype=torch.float16)
+    ids = torch.arange(m * topk, device=device).reshape(m, topk) % (e * 2)
+    emap = torch.tensor([2, -1, 0, -1, 3, -1, 1, -1], device=device, dtype=torch.int32)
+    weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1)
+    w13 = ((q13.float() - 8) * s13.float().repeat_interleave(group, dim=1)).half()
+    w2 = ((q2.float() - 8) * s2.float().repeat_interleave(group, dim=1)).half()
+    return layer, x, ids, weights, emap, w13, w2
+
+
+def _run_resident_skinny(layer, x, ids, weights, emap, act, out):
+    torch.ops._rocm_C.moe_resident_int4_decode(
+        x,
+        layer.w13_weight_packed,
+        layer.w13_weight_scale,
+        layer.w2_weight_packed,
+        layer.w2_weight_scale,
+        weights,
+        ids,
+        act,
+        out,
+        128,
+        emap,
+    )
+
+
+@gfx1030_only
+@pytest.mark.parametrize("m", [1, 3, 4])
+@pytest.mark.parametrize("k,n", [(256, 128), (2560, 640)])
+def test_resident_skinny_decode_reference_and_graph(m, k, n):
+    if not hasattr(torch.ops._rocm_C, "moe_resident_int4_decode"):
+        pytest.skip("resident skinny op not built")
+    layer, x, ids, weights, emap, w13, w2 = _resident_skinny_case(m, k, n)
+    act = torch.empty(m, 10, n, device=device, dtype=torch.float16)
+    out = torch.empty_like(x)
+
+    def reference():
+        result = torch.zeros_like(x, dtype=torch.float32)
+        for row in range(m):
+            for slot in range(10):
+                expert = int(emap[ids[row, slot]])
+                if expert < 0:
+                    continue
+                gate_up = (x[row].float() @ w13[expert].float()).half().float()
+                hidden = (torch.nn.functional.silu(gate_up[:n]) * gate_up[n:]).half()
+                result[row] += (hidden.float() @ w2[expert].float()) * weights[
+                    row, slot
+                ]
+        return result.half()
+
+    _run_resident_skinny(layer, x, ids, weights, emap, act, out)
+    torch.testing.assert_close(out, reference(), atol=3e-3, rtol=1e-2)
+    assert torch.isfinite(out).all()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_resident_skinny(layer, x, ids, weights, emap, act, out)
+    # A captured graph must observe changed activations, routes and weights.
+    x.mul_(0.5)
+    ids.copy_((ids + 1) % emap.numel())
+    weights.copy_(weights.flip(1))
+    graph.replay()
+    torch.testing.assert_close(out, reference(), atol=3e-3, rtol=1e-2)
+    # Every output/activation must be overwritten even with no local experts.
+    emap.fill_(-1)
+    graph.replay()
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+    torch.testing.assert_close(act, torch.zeros_like(act), atol=0, rtol=0)
