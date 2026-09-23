@@ -31,7 +31,8 @@ shared expert, PLE offload, TunableOp table, and maximum four requests.
 
 ## Prepared launch
 
-The first test profile is selected by the checked-in test unit. When a test
+The follow-up full-and-piecewise profile is selected by the checked-in test unit after
+the pure piecewise qualification failed during decode warmup replay. When a test
 window is approved, the operator can switch the server checkout through Git,
 install or link the checked-in unit, and start it. Those lifecycle actions are
 intentionally not included in the validation script.
@@ -40,7 +41,7 @@ Foreground command for the first profile:
 
 ```bash
 cd /home/george/v620-experiments/baseline-git-20260922
-export V620_PIECEWISE_PROFILE=piecewise-breakable
+export V620_PIECEWISE_PROFILE=full-and-piecewise-breakable
 export V620_HOST=0.0.0.0 V620_PORT=8080
 exec tools/rdna2/serve_v620_piecewise_test.sh
 ```
@@ -48,7 +49,7 @@ exec tools/rdna2/serve_v620_piecewise_test.sh
 Use `--dry-run` to print the resolved Python command without starting a model:
 
 ```bash
-V620_PIECEWISE_PROFILE=piecewise-breakable \
+V620_PIECEWISE_PROFILE=full-and-piecewise-breakable \
   tools/rdna2/serve_v620_piecewise_test.sh --dry-run
 ```
 
@@ -57,7 +58,7 @@ V620_PIECEWISE_PROFILE=piecewise-breakable \
 Run the validator only after the test service is healthy:
 
 ```bash
-V620_PIECEWISE_PROFILE=piecewise-breakable \
+V620_PIECEWISE_PROFILE=full-and-piecewise-breakable \
   tools/rdna2/validate_v620_piecewise_test.sh
 ```
 
