@@ -41,7 +41,7 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
     --host "$host" --port "$port" --tensor-parallel-size 4
     --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
     --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
-    --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4294967296
+    --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4026531840
     --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,12]}'
     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
     --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
