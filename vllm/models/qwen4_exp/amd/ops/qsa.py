@@ -7,7 +7,6 @@ from __future__ import annotations
 import logging as _logging
 import math
 import os as _os
-import time as _time
 
 import torch
 
@@ -618,25 +617,6 @@ _QSA_STAGES = _qsa_env_int(
 _QSA_OVERRIDES = {
     k: v for k, v in _os.environ.items() if k.startswith("VLLM_RDNA_QSA_")
 }
-_QSA_TIMING = _os.environ.get("VLLM_QSA_TIMING") == "1"
-
-
-def _qsa_timing_sync(
-    stage: str, tensor: torch.Tensor, started: float, **details: int
-) -> float:
-    if not _QSA_TIMING:
-        return started
-    torch.accelerator.synchronize(tensor.device)
-    now = _time.perf_counter()
-    _logging.getLogger(__name__).warning(
-        "[QSA_TIMING] stage=%s elapsed_ms=%.3f %s",
-        stage,
-        (now - started) * 1e3,
-        " ".join(f"{key}={value}" for key, value in details.items()),
-    )
-    return now
-
-
 if _QSA_OVERRIDES:
     _logging.getLogger(__name__).warning("QSA overrides active: %s", _QSA_OVERRIDES)
 _logging.getLogger(__name__).info(
@@ -820,16 +800,6 @@ def qsa_select_paged_tokens(
     if not rows:
         return out
 
-    timing_started = _time.perf_counter()
-    if _QSA_TIMING:
-        _logging.getLogger(__name__).warning(
-            "[QSA_TIMING] stage=start rows=%d max_seq_len=%s pages=%d page_size=%d",
-            rows,
-            max_seq_len,
-            page_table.shape[1],
-            k_cache.shape[1],
-        )
-
     columns = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
     if max_seq_len is not None:
@@ -859,9 +829,6 @@ def qsa_select_paged_tokens(
             sequence_lengths,
             compress_ratio,
             num_columns=columns,
-        )
-        timing_started = _qsa_timing_sync(
-            "score", q, timing_started, rows=row_end - row_start, columns=columns
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
@@ -900,9 +867,6 @@ def qsa_select_paged_tokens(
                 logits.stride(1),
                 block_topk,
             )
-        timing_started = _qsa_timing_sync(
-            "topk", q, timing_started, rows=row_end - row_start, columns=columns
-        )
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
@@ -911,9 +875,6 @@ def qsa_select_paged_tokens(
             compress_ratio,
             token_topk,
             out[row_slice],
-        )
-        timing_started = _qsa_timing_sync(
-            "expand", q, timing_started, rows=row_end - row_start, columns=columns
         )
     return out
 
