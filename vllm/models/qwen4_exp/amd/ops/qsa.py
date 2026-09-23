@@ -624,7 +624,7 @@ _QSA_TIMING = _os.environ.get("VLLM_QSA_TIMING") == "1"
 def _qsa_timing_sync(
     stage: str, tensor: torch.Tensor, started: float, **details: int
 ) -> float:
-    if not _QSA_TIMING or torch.accelerator.current_stream().is_capturing():
+    if not _QSA_TIMING:
         return started
     torch.accelerator.synchronize(tensor.device)
     now = _time.perf_counter()
