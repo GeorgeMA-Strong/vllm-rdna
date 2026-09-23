@@ -73,9 +73,10 @@ systemctl --user enable --now v620-tp4-git.service
 curl --fail http://127.0.0.1:8080/health
 ```
 
-The service was **not** installed or started during the port campaign. Tests
-used the same launcher on port 8082 with isolated transient units. The old
-fast service was left stopped during these comparisons.
+The Git service was installed on September 23, 2026. The old fast unit is
+disabled. Commit `945bba272` reached `/health` in 378 seconds, from
+09:56:38 to 10:02:56 UTC. It allocated the historical 4 GiB KV cache:
+284,229 tokens and 1.08x maximum concurrency at the 262,144-token limit.
 
 ## 16k measurement
 

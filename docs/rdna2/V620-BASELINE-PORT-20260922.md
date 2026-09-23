@@ -211,13 +211,35 @@ output tokens. The service reported a zero percent prefix-cache hit rate.
 | Coding 128k | 143,875 | 928.6 | 73.4 | 154.93 | Yes, after retry |
 
 The coding 128k group took 410 seconds because its first request exceeded the
-240-second client timeout. The successful retry still measured only 928.6
-prefill tokens/s. A separate coding 128k run with retries disabled also timed
-out after 240 seconds, leaving the request active in the engine. The service
-was restarted to cancel it. This is a reproducible long-context regression,
-not a result that should be averaged with the other five cases.
+240-second client timeout. A separate coding 128k run with retries disabled
+also timed out. The port launcher had reduced the deployed service's KV cache
+from 4 GiB (`4294967296`) to 3.75 GiB (`4026531840`) and reduced the image cap
+from 1,638,400 to 1,048,576 pixels. Commit `945bba272` restores the exact
+deployed values. With the 4 GiB cache, the engine reports 284,229 cache tokens
+and 1.08x maximum concurrency at the 262,144-token model limit.
+
+The corrected Git service completed the pinned `llm-context-bench` matrix on
+September 23, 2026. Retries were disabled. Coding 32k completed but was
+excluded by the harness for a dominant repeated token, the same known fixture
+behavior recorded by the historical combined run.
+
+| Case | Prompt tokens | Prefill tokens/s | Generation tokens/s | TTFT s | Valid |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Regular 32k | 33,455 | 1,977.3 | 54.6 | 16.92 | Yes |
+| Coding 32k | n/a | n/a | n/a | n/a | No: repeated output |
+| Regular 64k | 66,913 | 1,927.4 | 58.8 | 34.72 | Yes |
+| Coding 64k | 71,971 | 1,928.7 | 71.0 | 37.32 | Yes |
+| Regular 128k | 133,816 | 1,819.7 | 54.9 | 73.54 | Yes |
+| Coding 128k | 143,855 | 1,787.6 | 68.3 | 80.47 | Yes |
+
+An immediately preceding isolated coding 128k run measured 1,806.3 prefill
+tokens/s and 67.8 generation tokens/s at 79.64 seconds TTFT. Service startup
+took 378 seconds, within four seconds of the saved combined build's 373.879
+seconds.
 
 Raw server artifacts:
 
 - `/home/george/v620-experiments/git-fast-5e4b5d580-32-128k-20260922.json`
 - `/home/george/v620-experiments/git-fast-5e4b5d580-coding128k-repeat-20260922.json`
+- `/home/george/v620-experiments/git-4g-coding128-20260923.json`
+- `/home/george/v620-experiments/git-4g-full-32-128-20260923.json`
