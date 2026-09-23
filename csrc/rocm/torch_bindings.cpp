@@ -61,7 +61,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor w2, Tensor w2_scale, Tensor topk_weights, Tensor topk_ids, "
       "Tensor! act_buf, Tensor! output, int group_size, Tensor? expert_map) "
       "-> ()");
-  rocm_ops.impl("moe_skinny_int4_decode", torch::kCUDA, &moe_skinny_int4_decode);
+  rocm_ops.impl("moe_skinny_int4_decode", torch::kCUDA,
+                &moe_skinny_int4_decode);
+
+  // Native resident-layout W4A16 MoE skinny GEMV.
+  rocm_ops.def(
+      "moe_resident_int4_decode(Tensor input, Tensor w13, Tensor w13_scale, "
+      "Tensor w2, Tensor w2_scale, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor! act_buf, Tensor! output, int group_size, Tensor? expert_map) "
+      "-> ()");
+  rocm_ops.impl("moe_resident_int4_decode", torch::kCUDA,
+                &moe_resident_int4_decode);
 
   // gfx1030 fp16/int8 skinny GEMM for decode-sized M (T43/T45).
   rocm_ops.def("gemv_f16_rdna2(Tensor x, Tensor w, Tensor? bias) -> Tensor");
@@ -102,7 +112,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // no tensor arguments -> no dispatch key; register as catch-all
   rocm_ops.def("rdna_ar_timed_out(int handle) -> bool", &rdna_ar_timed_out);
   // T44b abort record; leapdragon/vllm-rdna2-qwen (Aron Hsiao).
-  rocm_ops.def("rdna_ar_timeout_info(int handle) -> int", &rdna_ar_timeout_info);
+  rocm_ops.def("rdna_ar_timeout_info(int handle) -> int",
+               &rdna_ar_timeout_info);
   rocm_ops.def("rdna_ar_fast_calls(int handle) -> int", &rdna_ar_fast_calls);
   rocm_ops.def("rdna2_set_graph_capturing(bool on) -> ()",
                &rdna2_set_graph_capturing);
@@ -139,8 +150,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 
   // Immortal hipMalloc workspace for GDN/FA eager 16k prefill. Never
   // returns pages to the caching allocator (FULL-graph poison).
-  rocm_ops.def(
-      "rdna2_immortal_zeros(Tensor ref, int[] size) -> Tensor");
+  rocm_ops.def("rdna2_immortal_zeros(Tensor ref, int[] size) -> Tensor");
   rocm_ops.impl("rdna2_immortal_zeros", torch::kCUDA,
                 &rdna2_immortal_zeros_from_ref);
 
@@ -150,8 +160,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "fa_rdna2_decode_paged(Tensor Q, Tensor key_cache, Tensor value_cache, "
       "Tensor block_table, Tensor seq_lens, int block_size, int kv_splits, "
       "int sliding_window) -> Tensor");
-  rocm_ops.impl("fa_rdna2_decode_paged", torch::kCUDA,
-                &fa_rdna2_decode_paged);
+  rocm_ops.impl("fa_rdna2_decode_paged", torch::kCUDA, &fa_rdna2_decode_paged);
 
   // GDN packed single-token decode for AMD RDNA2 (gfx1030). Dispatched
   // from Qwen3NextGatedDeltaNet._forward_core_decode_non_spec on gfx10x.
@@ -220,8 +229,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "gdn_prefill_kkt_rdna2(Tensor k, Tensor beta, Tensor g, Tensor! A, "
       "Tensor cu_seqlens, Tensor chunk_indices) -> ()");
-  rocm_ops.impl("gdn_prefill_kkt_rdna2", torch::kCUDA,
-                &gdn_prefill_kkt_rdna2);
+  rocm_ops.impl("gdn_prefill_kkt_rdna2", torch::kCUDA, &gdn_prefill_kkt_rdna2);
 
   rocm_ops.def(
       "gdn_prefill_solve_wy_rdna2(Tensor A, Tensor k, Tensor v, Tensor beta, "
@@ -241,8 +249,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "gdn_prefill_o_rdna2(Tensor q, Tensor k, Tensor v, Tensor h, "
       "Tensor g, Tensor! o, float scale, Tensor cu_seqlens, "
       "Tensor chunk_offsets) -> ()");
-  rocm_ops.impl("gdn_prefill_o_rdna2", torch::kCUDA,
-                &gdn_prefill_o_rdna2);
+  rocm_ops.impl("gdn_prefill_o_rdna2", torch::kCUDA, &gdn_prefill_o_rdna2);
 
   rocm_ops.def(
       "fa_rdna2_prefill_paged_varlen_splitk(Tensor Q, Tensor key_cache, "
@@ -318,8 +325,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "gemm_w8a16_fp8_dense(Tensor a, Tensor b_q_weight, Tensor b_scales, "
       "Tensor(a!) c, int group_size) -> ()");
-  rocm_ops.impl("gemm_w8a16_fp8_dense", torch::kCUDA,
-                &gemm_w8a16_fp8_dense);
+  rocm_ops.impl("gemm_w8a16_fp8_dense", torch::kCUDA, &gemm_w8a16_fp8_dense);
 
   // Paged MQA logits for DeepSeek V4 Lightning Indexer (gfx1030).
   // Replaces the AITER-only decode path of rocm_aiter_sparse_attn_indexer.
@@ -337,7 +343,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // a_scale_K_groups: number of K-blocks in a_scale (1 for per-row/tensor).
   rocm_ops.def(
       "gemm_w8a8_fp8_dense(Tensor a_q, Tensor a_scale, Tensor b_q_weight, "
-      "Tensor b_scales, Tensor(a!) c, int group_size, int a_scale_K_groups) -> ()");
+      "Tensor b_scales, Tensor(a!) c, int group_size, int a_scale_K_groups) -> "
+      "()");
   rocm_ops.impl("gemm_w8a8_fp8_dense", torch::kCUDA, &gemm_w8a8_fp8_dense);
 
   // Sparse MLA decode for DeepSeek V4 (gfx1030). Replaces the Triton
@@ -403,8 +410,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("hc_grouped_gemma_rmsnorm_rdna2", torch::kCUDA,
                 &hc_grouped_gemma_rmsnorm_rdna2);
 
-  rocm_ops.def(
-      "hc_silu_rdna2(Tensor x, Tensor(a!) y, int hc_count) -> ()");
+  rocm_ops.def("hc_silu_rdna2(Tensor x, Tensor(a!) y, int hc_count) -> ()");
   rocm_ops.impl("hc_silu_rdna2", torch::kCUDA, &hc_silu_rdna2);
 
   rocm_ops.def(
@@ -421,8 +427,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "hc_combine_norm_rdna2(Tensor residual, Tensor block_output, "
       "Tensor injection_logits, Tensor norm_weight, Tensor(a!) out, "
       "Tensor(a!) y, int hc_count, float eps) -> ()");
-  rocm_ops.impl("hc_combine_norm_rdna2", torch::kCUDA,
-                &hc_combine_norm_rdna2);
+  rocm_ops.impl("hc_combine_norm_rdna2", torch::kCUDA, &hc_combine_norm_rdna2);
 
   // Qwen4Exp QSA decode HIP (opt-in: VLLM_RDNA_QSA_HIP=1).
   rocm_ops.def(
@@ -446,8 +451,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "qsa_mqa_paged_rdna2(Tensor q_fp16, Tensor kv_cache, Tensor weights, "
       "Tensor context_lens, Tensor block_tables, int max_model_len) "
       "-> Tensor");
-  rocm_ops.impl("qsa_mqa_paged_rdna2", torch::kCUDA,
-                &qsa_mqa_paged_rdna2);
+  rocm_ops.impl("qsa_mqa_paged_rdna2", torch::kCUDA, &qsa_mqa_paged_rdna2);
 
   // Qwen4Exp PLE dilated short-conv HIP (opt-in: VLLM_RDNA_PLE_CONV_HIP=1).
   rocm_ops.def(
@@ -490,8 +494,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? pre_scale, Tensor? post_scale, float scale) -> ()");
   rocm_ops.impl("exl3_hadamard_128", torch::kCUDA, &exl3_hadamard_128);
 
-  rocm_ops.def(
-      "exl3_dequant_bits6_mul1(Tensor trellis, Tensor(a!) out) -> ()");
+  rocm_ops.def("exl3_dequant_bits6_mul1(Tensor trellis, Tensor(a!) out) -> ()");
   rocm_ops.impl("exl3_dequant_bits6_mul1", torch::kCUDA,
                 &exl3_dequant_bits6_mul1);
 

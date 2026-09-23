@@ -54,6 +54,26 @@
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
+// Form the small signed INT4 value before applying its scale. Folding the
+// scale into the large 1024/64 encoding offsets rounds away cancellation in
+// fp16: even quantized zero then becomes a nonzero weight.
+__forceinline__ __device__ void refresh_moe_group(
+    int group, int n, const uint32_t* zeros, const half* scales, int size_n,
+    int zero_offset, half2 (&z)[4][2], half2 (&y)[4][2],
+    half2 (&group_scales)[4]) {
+  int column_zeros[4];
+  half column_scales[4];
+  vllm::gptq_rdna2::load4_zeros(zeros + group * (size_n / 8), n, column_zeros);
+  vllm::gptq_rdna2::load4_scales<half>(scales + group * size_n, n,
+                                       column_scales);
+  #pragma unroll
+  for (int col = 0; col < 4; ++col) {
+    vllm::gptq_rdna2::prep_zero_scale_fp16(
+        column_zeros[col] + zero_offset, __float2half_rn(1.0f), z[col], y[col]);
+    group_scales[col] = __half2half2(column_scales[col]);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fused MoE kernel.
 // ---------------------------------------------------------------------------
@@ -110,7 +130,7 @@ __global__ void moe_gemm_q4_kernel_rdna2(
   const int offset_m_base = token_block * BLOCK_SIZE_M;
 
   if (offset_k + t < end_k) {
-#pragma unroll
+  #pragma unroll
     for (int m = 0; m < BLOCK_SIZE_M; ++m) {
       int32_t token_id = sorted_token_ids[offset_m_base + m];
       int token_row = token_id / top_k;
@@ -137,20 +157,20 @@ __global__ void moe_gemm_q4_kernel_rdna2(
   const uint32_t* b_ptr = expert_weights + qk * size_n + n;
 
   // Per-column dequant constants (4 columns per thread)
-  half2 z1z16_h[4][2], y1y16_h[4][2];
+  half2 z1z16_h[4][2], y1y16_h[4][2], group_scales[4];
 
   // GPTQv1: zero_offset = 1
   constexpr int zero_offset = 1;
 
   // Refresh dequant constants for current group + 4 columns at n
-  vllm::gptq_rdna2::refresh_group<4>(group, n, expert_qzeros,
-                                     reinterpret_cast<const half*>(expert_scales),
-                                     size_n, zero_offset, z1z16_h, y1y16_h);
+  refresh_moe_group(group, n, expert_qzeros,
+                    reinterpret_cast<const half*>(expert_scales), size_n,
+                    zero_offset, z1z16_h, y1y16_h, group_scales);
 
   float block_c[BLOCK_SIZE_M][4];
-#pragma unroll
+  #pragma unroll
   for (int m = 0; m < BLOCK_SIZE_M; ++m) {
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < 4; ++j) block_c[m][j] = 0.0f;
   }
 
@@ -160,35 +180,43 @@ __global__ void moe_gemm_q4_kernel_rdna2(
     if (k == nextgroup) {
       group++;
       nextgroup += groupsize;
-      vllm::gptq_rdna2::refresh_group<4>(group, n, expert_qzeros,
-                                         reinterpret_cast<const half*>(expert_scales),
-                                         size_n, zero_offset, z1z16_h, y1y16_h);
+      refresh_moe_group(group, n, expert_qzeros,
+                        reinterpret_cast<const half*>(expert_scales), size_n,
+                        zero_offset, z1z16_h, y1y16_h, group_scales);
     }
 
     // Prefetch 4 weight words (128 bytes)
     int4 b_w[4];
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < 4; ++j) {
       b_w[j] = *(const int4*)(b_ptr + j * size_n);
     }
     b_ptr += 4 * size_n;
 
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const int a_off = (k - offset_k) + 8 * j;
 
       // fp16 path: dequant via bit-trick, dot via v_dot2_f32_f16
       half2 dq[4][4];
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0], z1z16_h[0],
-                                           y1y16_h[0]);
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1], z1z16_h[1],
-                                           y1y16_h[1]);
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2], z1z16_h[2],
-                                           y1y16_h[2]);
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3], z1z16_h[3],
-                                           y1y16_h[3]);
+      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0],
+                                            z1z16_h[0], y1y16_h[0]);
+      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1],
+                                            z1z16_h[1], y1y16_h[1]);
+      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2],
+                                            z1z16_h[2], y1y16_h[2]);
+      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3],
+                                            z1z16_h[3], y1y16_h[3]);
 
-#pragma unroll
+  #pragma unroll
+      for (int col = 0; col < 4; ++col) {
+  #pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+          dq[col][pair] = __hmul2(dq[col][pair], group_scales[col]);
+        }
+      }
+
+  #pragma unroll
       for (int m = 0; m < BLOCK_SIZE_M; ++m) {
         const half* a_ptr = reinterpret_cast<const half*>(&block_a[m][a_off]);
         block_c[m][0] += vllm::gptq_rdna2::dot22_8_f(dq[0], a_ptr);
@@ -201,7 +229,7 @@ __global__ void moe_gemm_q4_kernel_rdna2(
   }
 
   // --- Epilogue: apply topk_weight and atomic-add to output ---
-#pragma unroll
+  #pragma unroll
   for (int m = 0; m < BLOCK_SIZE_M; ++m) {
     int32_t token_id = sorted_token_ids[offset_m_base + m];
     if (token_id / top_k >= size_m) continue;
@@ -209,7 +237,7 @@ __global__ void moe_gemm_q4_kernel_rdna2(
     // Apply router weight
     if (mul_topk_weight && topk_weights != nullptr) {
       float tw = topk_weights[token_id];
-#pragma unroll
+  #pragma unroll
       for (int j = 0; j < 4; ++j) block_c[m][j] *= tw;
     }
 
@@ -382,7 +410,8 @@ void moe_gptq_gemm_rdna2(torch::Tensor a, torch::Tensor c,
     // via __nv_bfloat16 -> half promotion. Path not used by production
     // (gfx1030 serves only fp16 weights); kept as compile-only fallback so
     // the op does not silently segfault on rare bf16 inputs.
-    TORCH_CHECK(false, "bfloat16 path is not yet implemented for gfx1030; "
+    TORCH_CHECK(false,
+                "bfloat16 path is not yet implemented for gfx1030; "
                 "the W4A16 helper kernel uses fp16 v_dot2 instructions only");
   }
 }

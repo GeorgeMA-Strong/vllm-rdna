@@ -68,7 +68,7 @@ command=("$venv/bin/python" -m vllm.entrypoints.openai.api_server
     --reasoning-parser qwen3
     --default-chat-template-kwargs '{"enable_thinking":false}'
     --limit-mm-per-prompt "$mm_limit"
-    --mm-processor-kwargs '{"max_pixels":1638400}')
+    --mm-processor-kwargs '{"max_pixels":602112}')
 if (( mtp_tokens > 0 )); then
     command+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$mtp_tokens}")
 fi

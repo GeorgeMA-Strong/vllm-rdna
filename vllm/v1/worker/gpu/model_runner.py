@@ -165,8 +165,13 @@ logger = init_logger(__name__)
 
 # --- DEBUG: per-step phase timing (gated by DBG_VLLM_STEP_TIMING=1) ---
 _DBG_STEP_TIMING = os.environ.get("DBG_VLLM_STEP_TIMING") == "1"
-_dbg_phase_ns = {}
-print(f"[DIAG_GMR_SUB] gpu/model_runner.py imported: _DBG_STEP_TIMING={_DBG_STEP_TIMING}, DBG_VLLM_STEP_TIMING env={os.environ.get('DBG_VLLM_STEP_TIMING')!r}", flush=True)
+_dbg_phase_ns: dict[str, float] = {}
+print(
+    f"[DIAG_GMR_SUB] gpu/model_runner.py imported: "
+    f"_DBG_STEP_TIMING={_DBG_STEP_TIMING}, "
+    f"DBG_VLLM_STEP_TIMING env={os.environ.get('DBG_VLLM_STEP_TIMING')!r}",
+    flush=True,
+)
 
 
 class _DbgPhase:
@@ -190,9 +195,7 @@ class _DbgPhase:
 def _dbg_flush_step(rank: int, step: int) -> None:
     if not _DBG_STEP_TIMING or not _dbg_phase_ns:
         return
-    parts = " ".join(
-        f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items()
-    )
+    parts = " ".join(f"{p}={v / 1e3:.1f}us" for p, v in _dbg_phase_ns.items())
     print(f"[STEP_TIMING rank={rank} step={step}] {parts}", flush=True)
     _dbg_phase_ns.clear()
 
@@ -586,11 +589,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
+            slot_mapping_enabled.append(
+                not isinstance(layer_spec, (CircularBufferSpec, MambaSpec))
             )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
@@ -634,6 +641,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group=max_num_blocks_per_group,
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
+            slot_mapping_enabled=slot_mapping_enabled,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,

@@ -1,0 +1,23 @@
+[Unit]
+Description=V620 TP4 fast service from the Git checkout
+Conflicts=v620-tp4-fast.service v620-tp4-default.service v620-serve-intel.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/george/v620-experiments/baseline-git-20260922
+Environment=V620_ENABLE_RESIDENT=1
+Environment=V620_ENABLE_SKINNY=1
+Environment=VLLM_RDNA_FUSED_SE=1
+Environment=V620_HOST=0.0.0.0
+Environment=V620_PORT=8080
+ExecStart=/bin/bash /home/george/v620-experiments/baseline-git-20260922/tools/rdna2/serve_v620_baseline.sh
+Restart=on-failure
+RestartSec=10s
+KillMode=control-group
+TimeoutStopSec=90s
+MemoryMax=236223201280
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target

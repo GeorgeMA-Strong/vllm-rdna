@@ -20,7 +20,7 @@ Historical combined deployment 82926d228: TP4, PP1, EP4, MTP2, FP16 dense, Intel
 
 Coding 32K was excluded for repetition, also observed in baseline. The combined stack improved valid 16K/32K prefill by 31–33% against the immediately collected 1,529–1,543 tok/s baseline. Because that deployment included changes outside this PR, the result does not isolate the QSA bound's contribution. No consistent end-to-end decode improvement was established. Later fused-draft testing retained 2,015–2,040 prefill but showed no matched-acceptance decode gain.
 
-A later rejected QSA graph-capture experiment measured 1,369–1,389 prefill tok/s. Its launcher omitted environment values normally supplied by the default systemd unit, so it was not a controlled comparison of the graph flag alone. The cause of the slowdown remains unresolved. Restored default throughput has not been rebenchmarked. Do not interpret the historical 2k numbers as a fresh verification of the current process.
+A later rejected QSA graph-capture experiment measured 1,369–1,389 prefill tok/s. Its launcher omitted environment values normally supplied by the default systemd unit, so it was not a controlled comparison of the graph flag alone. The cause of that slowdown remains unresolved. The Git service was rebenchmarked after restoring the deployed launcher values; it measured 1,977 at 32k, 1,927–1,929 at 64k, and 1,788–1,820 prefill tokens/s at 128k. Do not interpret the historical 2k numbers as a fresh verification of the current process.
 
 ## Validation
 
@@ -81,12 +81,12 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
  --model /home/george/v620-vllm/models/intel-autoround --served-model-name active qwen3.8-flash-next
  --host 0.0.0.0 --port 8080 --tensor-parallel-size 4 --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
  --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
- --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4026531840
+ --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4294967296
  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,12]}'
  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
  --default-chat-template-kwargs '{"enable_thinking":false}'
- --limit-mm-per-prompt '{"image":255,"video":32}' --mm-processor-kwargs '{"max_pixels":1048576}'
+ --limit-mm-per-prompt '{"image":255,"video":32}' --mm-processor-kwargs '{"max_pixels":602112}'
  --enable-prefix-caching --mamba-cache-mode align --kernel-config '{"moe_backend":"triton"}')
 if [[ ${1:-} == --dry-run ]]; then printf '%q ' "${command[@]}"; printf '\n'; exit 0; fi
 if pgrep -u "$(id -u)" -f 'vllm.entrypoints|VLLM::EngineCore|VLLM::Worker' >/dev/null; then
@@ -98,14 +98,13 @@ cd "$root/source"
 exec "${command[@]}" "$@"
 ```
 
-The 3.75 GiB KV allocation retains 266,945 cache tokens (1.02x the
-262,144-token model context) while reserving 256 MiB per GPU for vision
-workspaces. The 1,048,576-pixel processor cap prevents the Torch SDPA vision
-encoder from exhausting the remaining VRAM when multiple large images appear
-after a long cached prefix. On four V620s, a regression request with 24,073
-prompt tokens followed by two 1024x1024 images completed in 12 seconds with
-HTTP 200; peak usage was 29.1 GiB per card and all four workers remained
-healthy. Do not use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` with
+The reproduced deployment uses a 3.75 GiB KV allocation and a 602,112-pixel
+vision cap. Its initial 128k coding timeout was caused by old Mamba state
+blocks not being retired across null gaps, not by the cache allocation.
+Backport commit `b619cf991` fixes the retirement cursor while preserving the
+served checkpoint/replay implementation. The clean 143,855-token coding case
+then completed at 1,813.9 prefill tokens/s and 78.2 generation tokens/s. Do not
+use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` with
 CPU PLE offload: its ROCm CUDA IPC registration can fail with
 `pidfd_getfd: Operation not permitted`.
 
@@ -128,4 +127,5 @@ export PYTHONPATH=/home/george/v620-vllm-testing/context-bench-92286b2/src
 
 Open target PRs checked before publication: PR #12 concerns CPU PLE/MTP startup and does not contain this QSA bound. Upstream vLLM PR #56500 reuses a bounded NVIDIA QSA logits workspace but preserves its existing scoring width; this PR independently reduces the AMD scoring width to the live prefill context. Base is the fork's rdna_extras, not mainline vLLM.
 
-AI assistance was used. Historical server tests are recorded above; the clean cherry-pick has not been requalified end-to-end. Publishing this PR makes no changes to the live service.
+AI assistance was used. Historical and September 23 Git-service tests are
+recorded above. The live service runs the Git branch documented here.

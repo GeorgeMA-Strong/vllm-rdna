@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    is_full_attention_spec,
 )
 from vllm.v1.request import Request
 
@@ -301,6 +302,33 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
+        """Return the positions reachable by a replaying prompt.
+
+        An identical MTP resend recomputes the final prompt token, while an
+        extended sibling can match the prompt's final aligned block.  For an
+        aligned prompt these are different boundaries, and sparse retention
+        must preserve both.
+        """
+        # A last-block drop changes the model-level replay point only when a
+        # full-attention group performs that drop.  A SWA-only EAGLE group
+        # needs the ordinary replay boundary; its own manager adds the extra
+        # proof block through ``use_eagle`` in ``reachable_block_mask``.
+        eagle_full_attention = any(
+            i in self.eagle_group_ids and is_full_attention_spec(group.kv_cache_spec)
+            for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+        )
+        if not eagle_full_attention:
+            return (
+                request.num_prompt_tokens
+                - 1
+                - (request.num_prompt_tokens - 1) % self.scheduler_block_size,
+            )
+        block = self.scheduler_block_size
+        resend = (request.num_prompt_tokens - 1) // block * block
+        extension = request.num_prompt_tokens // block * block
+        return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.
@@ -321,7 +349,30 @@ class KVCacheCoordinator(ABC):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundaries=self.get_replay_boundaries(request),
             )
+            if (
+                os.environ.get("VLLM_TRACE_PREFIX_CACHE") == "1"
+                and getattr(self, "_prefix_trace_budget", 200) > 0
+            ):
+                self._prefix_trace_budget = (
+                    getattr(self, "_prefix_trace_budget", 200) - 1
+                )
+                blocks = manager.req_to_blocks.get(request.request_id, [])
+                logger.info(
+                    "PREFIX_WRITE group=%s type=%s computed=%s cache=%s "
+                    "replay=%s states=%s",
+                    manager.kv_cache_group_id,
+                    type(manager.kv_cache_spec).__name__,
+                    num_computed_tokens,
+                    num_tokens_to_cache,
+                    self.get_replay_boundaries(request),
+                    [
+                        (i, b.block_id)
+                        for i, b in enumerate(blocks)
+                        if not b.is_null and b.block_hash is not None
+                    ][-8:],
+                )
 
     def free(self, request_id: str) -> None:
         """
@@ -600,7 +651,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
         group_block_sizes = [
-            manager.block_size for manager in self.single_type_managers
+            manager.block_size
+            for manager, group in zip(
+                self.single_type_managers, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.prefix_cacheable
         ]
         assert all(
             block_size % hash_block_size == 0 for block_size in group_block_sizes
@@ -644,7 +699,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__
-                for manager in self.single_type_managers
+                for manager, group in zip(
+                    self.single_type_managers, kv_cache_config.kv_cache_groups
+                )
+                if group.kv_cache_spec.prefix_cacheable
                 if not manager.supports_fine_grained_hash_lookup
                 and manager.block_size != hash_block_size
             }
@@ -674,6 +732,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not g.kv_cache_spec.prefix_cacheable:
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids
@@ -693,8 +753,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     SpecGroup(spec, [i], manager_cls, use_eagle)
                 )
 
-        assert len(self.attention_groups) > 1, (
-            "HybridKVCacheCoordinator requires at least two attention groups."
+        assert self.attention_groups, (
+            "HybridKVCacheCoordinator requires at least one cacheable group."
         )
 
         # Put full attention first: its efficient left-to-right scan provides
@@ -758,7 +818,30 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
+                replay_boundaries=self.get_replay_boundaries(request),
             )
+            if (
+                os.environ.get("VLLM_TRACE_PREFIX_CACHE") == "1"
+                and getattr(self, "_prefix_trace_budget", 200) > 0
+            ):
+                self._prefix_trace_budget = (
+                    getattr(self, "_prefix_trace_budget", 200) - 1
+                )
+                blocks = manager.req_to_blocks.get(request.request_id, [])
+                logger.info(
+                    "PREFIX_WRITE group=%s type=%s computed=%s cache=%s "
+                    "replay=%s states=%s",
+                    manager.kv_cache_group_id,
+                    type(manager.kv_cache_spec).__name__,
+                    num_computed_tokens,
+                    num_tokens_to_cache,
+                    self.get_replay_boundaries(request),
+                    [
+                        (i, b.block_id)
+                        for i, b in enumerate(blocks)
+                        if not b.is_null and b.block_hash is not None
+                    ][-8:],
+                )
 
     def find_longest_cache_hit(
         self,
@@ -855,6 +938,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         else 1
                     ),
                 )
+                if (
+                    os.environ.get("VLLM_TRACE_PREFIX_CACHE") == "1"
+                    and getattr(self, "_prefix_trace_budget", 200) > 0
+                ):
+                    self._prefix_trace_budget = (
+                        getattr(self, "_prefix_trace_budget", 200) - 1
+                    )
+                    logger.info(
+                        "PREFIX_LOOKUP group=%s type=%s max=%s hit=%s eagle=%s",
+                        group_ids,
+                        type(spec).__name__,
+                        _max_length,
+                        _new_hit_length,
+                        drop_eagle_block,
+                    )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -892,7 +990,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         if os.environ.get("VLLM_DEBUG_PREFIX_HIT") == "1":
             logger.info(
                 "HYBRID-HIT max=%s hit=%s longest=%s per_group=%s specs=%s",
-                max_cache_hit_length, hit_length, longest_hit_length,
+                max_cache_hit_length,
+                hit_length,
+                longest_hit_length,
                 hit_length_by_group,
                 [type(g.spec).__name__ for g in self.attention_groups],
             )
