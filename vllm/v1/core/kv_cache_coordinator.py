@@ -196,11 +196,12 @@ class KVCacheCoordinator(ABC):
             The number of blocks to allocate.
         """
         num_blocks_to_allocate = 0
+        diag_parts: list[str] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                manager_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -210,7 +211,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                manager_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -219,6 +220,20 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
+            num_blocks_to_allocate += manager_blocks
+            if (
+                os.environ.get("VLLM_SCHED_BLOCK_DIAG") == "1"
+                and total_computed_tokens >= 126976
+            ):
+                diag_parts.append(f"{i}:{type(manager).__name__}={manager_blocks}")
+        if diag_parts:
+            logger.warning(
+                "[SCHED_BLOCK_DIAG] group_alloc req=%s computed=%d need=%d groups=%s",
+                request_id,
+                total_computed_tokens,
+                num_blocks_to_allocate,
+                ",".join(diag_parts),
+            )
         return num_blocks_to_allocate
 
     def allocate_new_computed_blocks(
