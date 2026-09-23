@@ -34,4 +34,4 @@ export VLLM_RDNA_FUSED_SE=${VLLM_RDNA_FUSED_SE:-1}
 
 printf 'Prepared V620 CUDA graph test profile: %s\n' "$profile" >&2
 printf 'Compilation config: %s\n' "$V620_COMPILATION_CONFIG" >&2
-exec "$source_dir/tools/rdna2/serve_v620_baseline.sh" "$@"
+exec /bin/bash "$source_dir/tools/rdna2/serve_v620_baseline.sh" "$@"
