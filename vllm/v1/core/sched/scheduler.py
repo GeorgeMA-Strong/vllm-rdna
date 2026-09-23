@@ -702,17 +702,6 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
-                if os.environ.get("VLLM_SCHED_BLOCK_DIAG") == "1":
-                    pool = self.kv_cache_manager.block_pool
-                    logger.warning(
-                        "[SCHED_BLOCK_DIAG] before req=%s computed=%d "
-                        "new_tokens=%d free_blocks=%d total_blocks=%d",
-                        request.request_id,
-                        request.num_computed_tokens,
-                        num_new_tokens,
-                        pool.get_num_free_blocks(),
-                        pool.num_gpu_blocks,
-                    )
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
@@ -722,16 +711,6 @@ class Scheduler(SchedulerInterface):
 
                     if new_blocks is not None:
                         # The request can be scheduled.
-                        if os.environ.get("VLLM_SCHED_BLOCK_DIAG") == "1":
-                            pool = self.kv_cache_manager.block_pool
-                            logger.warning(
-                                "[SCHED_BLOCK_DIAG] after req=%s computed=%d "
-                                "new_tokens=%d free_blocks=%d",
-                                request.request_id,
-                                request.num_computed_tokens,
-                                num_new_tokens,
-                                pool.get_num_free_blocks(),
-                            )
                         break
 
                     # The request cannot be scheduled.
