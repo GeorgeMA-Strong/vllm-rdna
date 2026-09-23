@@ -8,6 +8,7 @@ runtime=${V620_RUNTIME:-/home/george/v620-experiments/upstream-20260915/v620-vll
 model=${V620_MODEL:-/home/george/v620-vllm/models/intel-autoround}
 port=${V620_PORT:-${V620_TEST_PORT:-8082}}
 host=${V620_HOST:-127.0.0.1}
+compilation_config=${V620_COMPILATION_CONFIG:-'{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,12]}'}
 export PYTHONPATH=$source_dir
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_PLE_CPU_OFFLOAD=1 VLLM_USE_V2_MODEL_RUNNER=1
@@ -42,7 +43,7 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
     --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
     --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
     --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4026531840
-    --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,12]}'
+    --compilation-config "$compilation_config"
     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
     --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
     --default-chat-template-kwargs '{"enable_thinking":false}'
