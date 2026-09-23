@@ -212,34 +212,43 @@ output tokens. The service reported a zero percent prefix-cache hit rate.
 
 The coding 128k group took 410 seconds because its first request exceeded the
 240-second client timeout. A separate coding 128k run with retries disabled
-also timed out. The port launcher had reduced the deployed service's KV cache
-from 4 GiB (`4294967296`) to 3.75 GiB (`4026531840`) and reduced the image cap
-from 1,638,400 to 1,048,576 pixels. Commit `945bba272` restores the exact
-deployed values. With the 4 GiB cache, the engine reports 284,229 cache tokens
-and 1.08x maximum concurrency at the 262,144-token model limit.
+also timed out. Scheduler instrumentation showed that this was not a capacity
+limit: at each 4,096-token prefill chunk, four Mamba managers allocated new
+state blocks but did not retire their previous states across null gaps. Block
+use therefore grew by eight per chunk instead of four. At 135,168 computed
+tokens only three of 278 blocks remained, the next eight-block reservation
+failed, and the only request was preempted and restarted from zero.
 
-The corrected Git service completed the pinned `llm-context-bench` matrix on
-September 23, 2026. Retries were disabled. Coding 32k completed but was
+Commit `b619cf991` backports mainline vLLM commit `fadfe1c7d` (`[Bugfix][Core]
+Retire Mamba states across null gaps (#55450)`) while retaining the served
+branch's checkpoint/replay implementation. The same instrumented request then
+crossed 135,168 computed tokens with 123 blocks free before allocation and 119
+after it. The pinned 143,855-token coding prompt completed at 3.75 GiB with
+1,832.6 prefill tokens/s and 70.2 generation tokens/s. Commits `5030766bc` and
+`b88acd94d` remove the temporary scheduler instrumentation.
+
+The clean 3.75 GiB Git service completed the pinned `llm-context-bench` matrix
+on September 23, 2026. Retries were disabled. Coding 32k completed but was
 excluded by the harness for a dominant repeated token, the same known fixture
 behavior recorded by the historical combined run.
 
 | Case | Prompt tokens | Prefill tokens/s | Generation tokens/s | TTFT s | Valid |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Regular 32k | 33,455 | 1,977.3 | 54.6 | 16.92 | Yes |
+| Regular 32k | 33,455 | 1,977.2 | 67.5 | 16.92 | Yes |
 | Coding 32k | n/a | n/a | n/a | n/a | No: repeated output |
-| Regular 64k | 66,913 | 1,927.4 | 58.8 | 34.72 | Yes |
-| Coding 64k | 71,971 | 1,928.7 | 71.0 | 37.32 | Yes |
-| Regular 128k | 133,816 | 1,819.7 | 54.9 | 73.54 | Yes |
-| Coding 128k | 143,855 | 1,787.6 | 68.3 | 80.47 | Yes |
+| Regular 64k | 66,913 | 1,932.5 | 56.6 | 34.63 | Yes |
+| Coding 64k | 71,971 | 1,928.0 | 69.8 | 37.33 | Yes |
+| Regular 128k | 133,816 | 1,823.5 | 54.9 | 73.38 | Yes |
+| Coding 128k | 143,855 | 1,813.9 | 78.2 | 79.31 | Yes |
 
-An immediately preceding isolated coding 128k run measured 1,806.3 prefill
-tokens/s and 67.8 generation tokens/s at 79.64 seconds TTFT. Service startup
-took 378 seconds, within four seconds of the saved combined build's 373.879
-seconds.
+An immediately preceding instrumented coding 128k run measured 1,832.6
+prefill tokens/s and 70.2 generation tokens/s at 78.50 seconds TTFT. Clean
+service startup took 352 seconds, compared with 373.879 seconds for the saved
+combined build.
 
 Raw server artifacts:
 
 - `/home/george/v620-experiments/git-fast-5e4b5d580-32-128k-20260922.json`
 - `/home/george/v620-experiments/git-fast-5e4b5d580-coding128k-repeat-20260922.json`
-- `/home/george/v620-experiments/git-4g-coding128-20260923.json`
-- `/home/george/v620-experiments/git-4g-full-32-128-20260923.json`
+- `/home/george/v620-experiments/git-mamba-retire-375g-coding128-20260923.json`
+- `/home/george/v620-experiments/git-final-mamba-retire-375g-32-128-20260923.json`

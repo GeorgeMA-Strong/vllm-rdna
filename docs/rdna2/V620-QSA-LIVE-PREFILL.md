@@ -98,13 +98,13 @@ cd "$root/source"
 exec "${command[@]}" "$@"
 ```
 
-The measured deployment uses a 4 GiB KV allocation, which retains 284,229
-cache tokens (1.08x the 262,144-token model context). A later 3.75 GiB and
-1,048,576-pixel safety experiment was accidentally carried into the first Git
-launcher. Its 128k coding request timed out. Restoring the measured 4 GiB and
-1,638,400-pixel values recovered 1,787.6-1,806.3 prefill tokens/s for the
-143,855-token coding prompt. Do not use
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` with
+The reproduced deployment uses a 3.75 GiB KV allocation and a 1,638,400-pixel
+vision cap. Its initial 128k coding timeout was caused by old Mamba state
+blocks not being retired across null gaps, not by the cache allocation.
+Backport commit `b619cf991` fixes the retirement cursor while preserving the
+served checkpoint/replay implementation. The clean 143,855-token coding case
+then completed at 1,813.9 prefill tokens/s and 78.2 generation tokens/s. Do not
+use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` with
 CPU PLE offload: its ROCm CUDA IPC registration can fail with
 `pidfd_getfd: Operation not permitted`.
 
