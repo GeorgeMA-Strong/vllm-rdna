@@ -47,7 +47,7 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
     --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
     --default-chat-template-kwargs '{"enable_thinking":false}'
     --limit-mm-per-prompt '{"image":255,"video":32}'
-    --mm-processor-kwargs '{"max_pixels":1638400}'
+    --mm-processor-kwargs '{"max_pixels":602112}'
     --enable-prefix-caching --mamba-cache-mode align
     --kernel-config '{"moe_backend":"triton"}')
 if [[ ${1:-} == --dry-run ]]; then

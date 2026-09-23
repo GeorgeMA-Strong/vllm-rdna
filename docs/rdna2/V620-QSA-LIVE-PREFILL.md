@@ -86,7 +86,7 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
  --default-chat-template-kwargs '{"enable_thinking":false}'
- --limit-mm-per-prompt '{"image":255,"video":32}' --mm-processor-kwargs '{"max_pixels":1638400}'
+ --limit-mm-per-prompt '{"image":255,"video":32}' --mm-processor-kwargs '{"max_pixels":602112}'
  --enable-prefix-caching --mamba-cache-mode align --kernel-config '{"moe_backend":"triton"}')
 if [[ ${1:-} == --dry-run ]]; then printf '%q ' "${command[@]}"; printf '\n'; exit 0; fi
 if pgrep -u "$(id -u)" -f 'vllm.entrypoints|VLLM::EngineCore|VLLM::Worker' >/dev/null; then
@@ -98,7 +98,7 @@ cd "$root/source"
 exec "${command[@]}" "$@"
 ```
 
-The reproduced deployment uses a 3.75 GiB KV allocation and a 1,638,400-pixel
+The reproduced deployment uses a 3.75 GiB KV allocation and a 602,112-pixel
 vision cap. Its initial 128k coding timeout was caused by old Mamba state
 blocks not being retired across null gaps, not by the cache allocation.
 Backport commit `b619cf991` fixes the retirement cursor while preserving the
