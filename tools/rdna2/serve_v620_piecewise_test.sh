@@ -11,6 +11,9 @@ export V620_PIECEWISE_PROFILE=$profile
 case "$profile" in
     piecewise-breakable)
         export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+        # Keep QSA inside the graph.  Its split-K scratch is staged by the
+        # graph-safe workspace commit, avoiding the failing eager replay.
+        export VLLM_RDNA_QSA_GRAPH_CAPTURE=1
         export V620_COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"PIECEWISE","compile_ranges_endpoints":[]}'
         ;;
     full-and-piecewise-breakable)
