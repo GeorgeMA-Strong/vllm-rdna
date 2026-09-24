@@ -1012,6 +1012,23 @@ class RocmPlatform(Platform):
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
 
+        # gfx10x: VLLM_USE_RDNA2_FA=1 opts into the standalone FA-RDNA2
+        # backend, but the flag cannot reach the engine-core and worker
+        # processes (their environment is replaced at spawn). Pin the backend
+        # here instead - AttentionConfig propagates to the workers normally.
+        attention_config = vllm_config.attention_config
+        selected_attn = attention_config.backend
+        if (
+            (selected_attn is None or str(selected_attn).lower() == "auto")
+            and os.environ.get("VLLM_USE_RDNA2_FA") == "1"
+            and on_gfx10x()
+        ):
+            attention_config.backend = AttentionBackendEnum.RDNA_ATTN
+            logger.info(
+                "VLLM_USE_RDNA2_FA=1: pinning the attention backend to "
+                "RDNA_ATTN (FA-RDNA2)."
+            )
+
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
             # decode context parallel does not support full cudagraphs
             if parallel_config.decode_context_parallel_size > 1:
