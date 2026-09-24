@@ -202,6 +202,28 @@ def test_mrope_get_positions_contiguous_per_capture_size():
     assert p2048.data_ptr() == p8.data_ptr()
 
 
+def test_mrv1_contiguous_positions_per_capture_size():
+    """MRV1 mrope/XD-RoPE views carry the dummy column; the compiled
+    input must be contiguous with the runtime token count."""
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    src = torch.zeros(3, 2049, dtype=torch.int64)
+    packed = torch.empty(3 * 2048, dtype=torch.int64)
+    assert src[:, :8].stride() == (2049, 1)
+    p8 = GPUModelRunner._contiguous_positions(src, packed, 3, 8)
+    assert p8.shape == (3, 8)
+    assert p8.is_contiguous()
+    assert p8.stride() == (8, 1)
+    p2048 = GPUModelRunner._contiguous_positions(src, packed, 3, 2048)
+    assert p2048.shape == (3, 2048)
+    assert p2048.stride() == (2048, 1)
+    assert p2048.data_ptr() == p8.data_ptr()
+    assert GPUModelRunner._contiguous_positions(src, packed, 3, 0).shape == (
+        3,
+        0,
+    )
+
+
 def test_clone_activations_makes_index_views_contiguous():
     """RoPE positions are (3, 8) views of a (3, 2049) buffer; inductor
     asserts stride (8, 1) at capture size 8."""
