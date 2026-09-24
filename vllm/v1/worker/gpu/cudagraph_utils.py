@@ -351,7 +351,9 @@ class CudaGraphManager:
             for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
                 if mode not in self._capture_descs:
                     continue
-                if rocm_full_executes_as_piecewise(mode, self.compilation_config):
+                if rocm_full_executes_as_piecewise(
+                    mode, self.compilation_config
+                ) and self.cudagraph_mode.has_piecewise_cudagraphs():
                     logger.info_once(
                         "ROCm FULL decode executes piecewise CUDA graphs "
                         "(GDN/FA stay eager; inductor FULL replay cannot "
