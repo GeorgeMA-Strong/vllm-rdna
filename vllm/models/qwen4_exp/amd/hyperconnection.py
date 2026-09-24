@@ -159,9 +159,7 @@ class GatedResidual(nn.Module):
         CUDA graphs specialize on the trace-time stride and abort capture when
         the runtime tensor differs, so materialize the slice here.
         """
-        return dai[
-            :, self.lora_rank : self.lora_rank + self.hc_count
-        ].contiguous()
+        return dai[:, self.lora_rank : self.lora_rank + self.hc_count].contiguous()
 
     def mix(
         self, hidden_states: torch.Tensor
@@ -196,9 +194,7 @@ class GatedResidual(nn.Module):
                 self.lora_rank,
                 self.hc_count,
             )
-            injection = (
-                self._injection_slice(dai) if self.use_combine else None
-            )
+            injection = self._injection_slice(dai) if self.use_combine else None
             if os.environ.get("VLLM_HC_NAN_DEBUG") == "1" and not (
                 torch.cuda.is_current_stream_capturing()
             ):
@@ -282,9 +278,7 @@ class GatedResidual(nn.Module):
                 self.lora_rank,
                 self.hc_count,
             )
-            injection = (
-                self._injection_slice(dai) if self.use_combine else None
-            )
+            injection = self._injection_slice(dai) if self.use_combine else None
             if os.environ.get("VLLM_HC_NAN_DEBUG") == "1" and not (
                 torch.cuda.is_current_stream_capturing()
             ):

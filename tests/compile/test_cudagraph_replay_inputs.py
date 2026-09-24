@@ -38,18 +38,17 @@ def test_eager_piecewise_splits_tp_collectives():
     "capture", [CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL_AND_PIECEWISE]
 )
 def test_rocm_full_executes_as_piecewise(monkeypatch, is_rocm, mode, capture):
-    """Direct FULL captures survive; only compiled piecewise captures redirect."""
+    """FULL_AND_PIECEWISE keeps the FULL decode graph on every platform.
+
+    Piecewise graphs still cover mixed and prefill batches. Replaying FULL
+    decode as piecewise dropped decode throughput about 2x on the V620 stack.
+    """
     from vllm.v1.worker.gpu.cudagraph_utils import rocm_full_executes_as_piecewise
 
     monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
     cfg = CompilationConfig(mode=mode, cudagraph_mode=capture)
     assert not rocm_full_executes_as_piecewise(CUDAGraphMode.PIECEWISE, cfg)
-    expected = (
-        is_rocm
-        and mode == CompilationMode.VLLM_COMPILE
-        and capture == CUDAGraphMode.FULL_AND_PIECEWISE
-    )
-    assert rocm_full_executes_as_piecewise(CUDAGraphMode.FULL, cfg) == expected
+    assert not rocm_full_executes_as_piecewise(CUDAGraphMode.FULL, cfg)
 
 
 def test_rocm_inductor_fpp_splits_tp_collectives():

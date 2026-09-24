@@ -1170,6 +1170,7 @@ class GPUModelRunner(
             if self.uses_xdrope_dim > 0:
                 return self.xdrope_positions.gpu[:, num_tokens]
             return self.positions[num_tokens]
+
     @staticmethod
     def _contiguous_positions(
         src: torch.Tensor,
@@ -1188,7 +1189,6 @@ class GPUModelRunner(
         dst = packed[: num_dims * num_tokens].view(num_dims, num_tokens)
         dst.copy_(src[:, :num_tokens])
         return dst
-
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True

@@ -1512,7 +1512,7 @@ class VllmConfig:
                 "compilation mode is %s. Setting cudagraph_mode=%s. Use "
                 "--compilation-config "
                 "'{\"mode\":3,\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' "
-                "for compiled piecewise CUDA graphs.",
+                "for compiled piecewise CUDA graphs alongside FULL decode.",
                 requested,
                 CompilationMode.VLLM_COMPILE,
                 self.compilation_config.mode,

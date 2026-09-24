@@ -295,9 +295,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._prepare_eplb_forward(num_tokens)
 
         self.on_prefill_begin(num_reqs)
-        # ROCm compiled FULL decode replays the piecewise graphs (see
-        # rocm_full_executes_as_piecewise), so a FULL dispatch must route to
-        # the piecewise runner instead of a FULL graph that was never captured.
+        # When FULL replay is redirected onto piecewise graphs, a FULL
+        # dispatch must not look up a graph that was never captured.
         runtime_mode = (
             CUDAGraphMode.PIECEWISE
             if rocm_full_executes_as_piecewise(
