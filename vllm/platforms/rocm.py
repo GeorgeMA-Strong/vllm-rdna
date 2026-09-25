@@ -171,7 +171,14 @@ def with_amdsmi_context(fn):
         try:
             return fn(*args, **kwargs)
         finally:
-            amdsmi_shut_down()
+            # amdsmi init/shutdown are not re-entrant: a concurrent user or an
+            # earlier shutdown leaves the library at AMDSMI_STATUS_NOT_INIT, and
+            # a failing shutdown inside this finally masks an otherwise
+            # successful call so the caller's fallback never runs.
+            try:
+                amdsmi_shut_down()
+            except Exception:
+                pass
 
     return wrapper
 
