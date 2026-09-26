@@ -344,6 +344,20 @@ def test_offloading_skips_scratch_group():
     assert scheduler._sliding_window_groups == (1,)
 
 
+def test_shared_group_mtp_does_not_mark_every_cache_group_as_draft():
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    config = _make_vllm_config()
+    config.speculative_config = MagicMock()
+    config.speculative_config.use_eagle.return_value = True
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert not any(group.is_eagle_group for group in scheduler_config.kv_group_configs)
+
+
 def test_zero_blocks_skips_tensor_layout_validation():
     kv_cache_config = _make_sizing_kv_cache_config(packed=False)
     kv_cache_config.num_blocks = 0

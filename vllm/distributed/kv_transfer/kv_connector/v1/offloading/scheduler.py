@@ -230,7 +230,14 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.speculative_config.use_eagle()
         )
         if use_eagle and not eagle_groups:
-            eagle_groups = {group.group_id for group in spec.config.groups}
+            # Shared-group MTP models have no separately annotated draft cache
+            # group. Marking every target group as volatile can collapse a
+            # valid hybrid-cache hit to zero at lookup time.
+            logger.info_once(
+                "KV offloading: speculative decoding is enabled but no "
+                "KV-cache group is annotated as a drafter group; treating "
+                "all groups as non-draft for offloading."
+            )
 
         if eagle_groups:
             logger.info(
@@ -405,7 +412,7 @@ class RequestOffloadState:
         """
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
-        if group_config.is_eagle_group and is_decoding:
+        if group_config.is_eagle_group and is_decoding and not self.req.is_finished():
             num_chunks = max(0, num_chunks - 1)
         num_allocated_chunks = (
             len(group_state.block_ids) // self.config.blocks_per_chunk
@@ -762,9 +769,10 @@ class OffloadingConnectorScheduler:
                 )
 
                 # For eagle groups, query one extra chunk that will be popped.
-                # We only need to increase the query size for sliding window groups.
+                # This is required for full-attention groups too; otherwise
+                # the pop can push a hybrid sibling below its chunk boundary.
                 query_max = max_hit_size_tokens
-                if is_eagle_unverified and sliding_window_size_in_chunks is not None:
+                if is_eagle_unverified:
                     query_max = min(
                         max_hit_size_tokens + tokens_per_chunk,
                         len(offload_keys) * tokens_per_chunk,
