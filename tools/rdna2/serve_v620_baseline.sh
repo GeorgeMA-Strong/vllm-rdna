@@ -50,6 +50,9 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
     --mm-processor-kwargs '{"max_pixels":602112}'
     --enable-prefix-caching --mamba-cache-mode align
     --kernel-config '{"moe_backend":"triton"}')
+if [[ -n ${V620_KV_OFFLOAD_GB:-} ]]; then
+    command+=(--kv-offloading-size "$V620_KV_OFFLOAD_GB")
+fi
 if [[ ${1:-} == --dry-run ]]; then
     printf '%q ' "${command[@]}"
     printf '\n'
