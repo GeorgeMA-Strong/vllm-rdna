@@ -280,6 +280,7 @@ def test_cpu_spec_replicated_sizing_on_shared_region(monkeypatch, world_size: in
     import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
 
     monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_rocm", lambda: False)
     worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     spec = _create_spec(
         cpu_bytes_to_use=worker_kv_bytes_per_block * 8,
@@ -335,6 +336,7 @@ def test_cpu_spec_replicated_layout_truth_matrix(
     monkeypatch.setattr(
         cpu_spec_module.current_platform, "is_cuda_alike", lambda: cuda_alike
     )
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_rocm", lambda: False)
     worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     spec = _create_spec(
         cpu_bytes_to_use=worker_kv_bytes_per_block * 8,
@@ -371,6 +373,7 @@ def test_cpu_spec_create_worker_uses_mmap_on_cuda_alike(monkeypatch):
         return MagicMock()
 
     monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_rocm", lambda: False)
     monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", fake_region_ctor)
     monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", fake_worker_ctor)
     monkeypatch.setattr(
@@ -499,6 +502,7 @@ def test_cpu_spec_create_worker_rank_assignment(
     import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
 
     monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_rocm", lambda: False)
     worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     spec = _create_spec(
         cpu_bytes_to_use=worker_kv_bytes_per_block * 8,
