@@ -2880,7 +2880,7 @@ class TestEagle:
         # persisted so a resumed request can restore the complete context.
         runner.run(
             decoded_tokens=[EOS_TOKEN_ID],
-            expected_stored=((1, 3),),
+            expected_stored=((0, 4), (1, 3), (1, 4)),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
