@@ -26,9 +26,10 @@ export HSA_FORCE_FINE_GRAIN_PCIE=1 HSA_ENABLE_SDMA=0 OMP_NUM_THREADS=4
 export TOKENIZERS_PARALLELISM=false PYTHONFAULTHANDLER=1
 export VLLM_CAUSAL_CONV1D_RDNA2_FWD=0 VLLM_CAUSAL_CONV1D_RDNA2_UPDATE=0
 export VLLM_ENABLE_STARTUP_PLAN=0 VLLM_ROCM_USE_AITER=0 TORCH_BLAS_PREFER_HIPBLASLT=0
-export VLLM_CACHE_ROOT=$source_dir/cache/vllm TRITON_CACHE_DIR=$source_dir/cache/triton
-export TORCHINDUCTOR_CACHE_DIR=$source_dir/cache/inductor
-export TORCH_EXTENSIONS_DIR=$source_dir/cache/extensions
+cache_dir=${V620_CACHE_DIR:-$source_dir/cache}
+export VLLM_CACHE_ROOT=$cache_dir/vllm TRITON_CACHE_DIR=$cache_dir/triton
+export TORCHINDUCTOR_CACHE_DIR=$cache_dir/inductor
+export TORCH_EXTENSIONS_DIR=$cache_dir/extensions
 export PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
 export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
 sdk=$runtime/.venv/lib/python3.12/site-packages/_rocm_sdk_core
