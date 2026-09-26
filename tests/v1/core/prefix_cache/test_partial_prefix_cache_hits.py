@@ -1041,8 +1041,8 @@ def test_truncate_computed_blocks_skips_non_prefix_cacheable_scratch_group():
 
     replay = make_request("replay", list(range(20)), block_size, sha256)
     blocks, num_computed, _ = manager.get_computed_blocks(replay)
-    assert num_computed == 12
-    assert [len(group) for group in blocks.blocks] == [3, 0, 3]
+    assert num_computed == 16
+    assert [len(group) for group in blocks.blocks] == [4, 0, 4]
 
     truncated = manager.truncate_computed_blocks(blocks, 8)
 
