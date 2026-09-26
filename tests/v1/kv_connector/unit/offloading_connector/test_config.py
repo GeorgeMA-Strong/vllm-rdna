@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
     SchedulerOffloadConfig,
     is_store_reachable_swa_chunk,
 )
@@ -335,6 +336,12 @@ def test_offloading_skips_scratch_group():
     assert [group.group_id for group in offloading_config.groups] == [0, 2]
     assert [group.group_idx for group in scheduler_config.kv_group_configs] == [0, 2]
     assert offloading_config.worker_kv_bytes_per_block == page_size
+
+    scheduler = OffloadingConnectorScheduler(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+    assert scheduler._lookup_groups == (0, 1)
+    assert scheduler._sliding_window_groups == (1,)
 
 
 def test_zero_blocks_skips_tensor_layout_validation():
