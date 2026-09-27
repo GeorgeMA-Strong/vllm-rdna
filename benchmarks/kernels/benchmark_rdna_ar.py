@@ -127,6 +127,10 @@ def run(args):
                     row["rccl_us_per_collective"] = (
                         graph_latency(rccl_graph, args.repeats) / 2
                     )
+                    # RCCL graph references must be released before destroying
+                    # their process group, otherwise teardown can wait forever.
+                    rccl_graph.reset()
+                graph.reset()
                 if rank == 0:
                     print(json.dumps(row), flush=True)
             oversized = torch.empty(65536 // width + 1, dtype=dtype, device=device)
