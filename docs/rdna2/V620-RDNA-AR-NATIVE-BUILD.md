@@ -59,6 +59,24 @@ modifying the active service's source files.
 
 ## GPU findings (September 27)
 
+### Test provenance
+
+The GPU and model measurements below were collected on
+`codex/rdna-decode-performance-investigation`, which also contained the RAM KV
+offload changes proposed in
+[PR #24](https://github.com/opengfx1030/vllm-rdna/pull/24). The commit identifiers
+below refer to that original tested history. Model-level RAM reload observations
+therefore describe the combined experimental stack, not this all-reduce change
+alone.
+
+The review branch, `codex/rdna-ar-correctness`, cherry-picks only the all-reduce
+fixes, qualification tools, and this report onto `rdna_extras` at `3d67bdf49`.
+It does not include PR #24 or change a systemd service. The focused 16-test CPU
+suite was rerun on this clean branch; GPU/model qualification has not been
+repeated on the newer base. Re-run the hardware gates before deployment.
+
+### Output ownership and collective qualification
+
 The rebuilt binary exposed a second, independent bug: the native all-reduce
 returned views of one process-global persistent output. Two consecutive calls
 overwrote the first result on all four ranks. The committed qualification
