@@ -122,4 +122,5 @@ order; retaining FP16 weights does not imply bit-identical outputs.
 `rocblas-f30bb442e9b5/` adds 574 online-tuned FP16 rows per rank for the MTP
 verify batch shapes (M = 16/24/32) and the rest of the serving workload. See its
 `README.md` for the recipe and measured deltas (MTP-2 reaches 73.8 tok/s at
-8×16k/1k vs MTP-0's 67.3 once these rows are used).
+8×16k/1k vs MTP-0's 67.3 once these rows are used). End-to-end reproduction
+steps: `docs/rdna2/MTP-FASTEST-PATH.md`.
