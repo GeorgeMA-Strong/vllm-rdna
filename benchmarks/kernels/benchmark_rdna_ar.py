@@ -15,6 +15,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
+from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.rdna_all_reduce import RdnaOneShotAllReduce
 
 
@@ -52,6 +53,8 @@ def run(args):
     backend = RdnaOneShotAllReduce(dist.group.WORLD, device)
     agree(not backend.disabled, "native startup self-test")
     rccl = dist.new_group(backend="nccl", timeout=timedelta(seconds=90))
+    pynccl = PyNcclCommunicator(dist.group.WORLD, device)
+    agree(not pynccl.disabled, "vLLM RCCL communicator startup")
     rank_sum = 10
     try:
         for dtype in (torch.float16, torch.float32):
@@ -130,12 +133,34 @@ def run(args):
                     # RCCL graph references must be released before destroying
                     # their process group, otherwise teardown can wait forever.
                     rccl_graph.reset()
+                    with torch.cuda.stream(stream):
+                        pynccl.all_reduce(x, stream=stream)
+                    torch.cuda.current_stream().wait_stream(stream)
+                    torch.accelerator.synchronize()
+                    dist.barrier()
+                    pynccl_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(pynccl_graph, stream=stream):
+                        direct1 = pynccl.all_reduce(x, stream=stream)
+                        direct2 = pynccl.all_reduce(z, stream=stream)
+                    pynccl_graph.replay()
+                    torch.accelerator.synchronize()
+                    agree(
+                        bool(torch.equal(first, direct1)), "vLLM RCCL first reference"
+                    )
+                    agree(
+                        bool(torch.equal(second, direct2)), "vLLM RCCL second reference"
+                    )
+                    row["vllm_rccl_us_per_collective"] = (
+                        graph_latency(pynccl_graph, args.repeats) / 2
+                    )
+                    pynccl_graph.reset()
                 graph.reset()
                 if rank == 0:
                     print(json.dumps(row), flush=True)
             oversized = torch.empty(65536 // width + 1, dtype=dtype, device=device)
             agree(not backend.should_use(oversized), "oversized payload fallback")
     finally:
+        pynccl.destroy()
         dist.destroy_process_group(rccl)
         dist.destroy_process_group()
 

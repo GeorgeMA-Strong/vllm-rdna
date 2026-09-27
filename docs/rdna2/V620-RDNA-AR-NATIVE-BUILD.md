@@ -104,6 +104,40 @@ Server evidence is under
 `correctness-output-fix.log`, and `latency-qualified.log`.
 Model-level qualification is still required before changing the default service.
 
+### Intel model qualification
+
+The isolated Intel AutoRound service used the rebuilt extension, a 32 KiB RDNA
+cutoff, MTP2, FULL_DECODE_ONLY graphs, and 64 GiB RAM KV offload. Both TP and EP
+groups selected `RDNA_ONESHOT` before `PYNCCL`. Three simultaneous short chats
+passed exact tool-name/argument checks and resumed correctly after staggered
+synthetic tool returns. RAM KV loads occurred during those continuations.
+
+`llm-context-bench` coding performance results (one measured repetition, 1,024
+output tokens, 12% input-token tolerance):
+
+| Input tier | Actual prompt tokens | RDNA decode tokens/s | TTFT seconds | Valid |
+| --- | ---: | ---: | ---: | --- |
+| 8K, one chat | 8,964 | 68.37 | 6.43 | Yes |
+| 64K, one chat | 71,991 | 65.94 | 49.97 | Yes |
+| 128K, one chat | 143,875 | 64.09 | 103.88 | Yes |
+
+The three-chat 8K run completed all requests, but one response failed the
+benchmark's dominant-token gate: 217 hyphens in generated comment/copyright
+headers exceeded the 20% threshold. The aggregate group remains invalid;
+do not present it as a validated throughput result or weaken the validator.
+These performance checks do not establish code-quality correctness.
+
+Cold-cache startup spent several minutes compiling Triton GDN prefill variants,
+confirmed by a worker stack sample in `make_amdgcn`. During the 128K request,
+a long GPU wait was initially suspected to be a stall; the request completed
+normally and passed validation before the service was stopped for comparison.
+No RDNA wedge marker was produced. Long prefill pauses alone are not evidence
+of a deadlock.
+
+RCCL A/B comparison and full-VRAM multi-session offload stress are separate
+qualification steps; no production performance gain is established by these
+RDNA-only measurements.
+
 ## Qualification gates before activation
 
 1. Preflight reports the intended checkout's Python and native extension,
