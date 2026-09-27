@@ -161,6 +161,10 @@ if TYPE_CHECKING:
     VLLM_FORCE_CUSTOM_ALL_REDUCE: bool = False
     # Force gemv_f16_rdna2 for gfx1030 n<=5 instead of qualified wvSplitK.
     VLLM_RDNA_DENSE_GEMV: bool = False
+    # hippihx V1 consume (github.com/BlivionIaG/hippihx). Off by default.
+    VLLM_HIPPIHX: bool = False
+    VLLM_HIPPIHX_LIB: str | None = None
+    VLLM_HIPPIHX_CODE_OBJECT: str | None = None
     VLLM_RDNA_AR: str = "0"
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -1409,6 +1413,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force donor gemv_f16_rdna2 on gfx1030 even for n<=5 (A/B vs wvSplitK).
     # From PR #5 / GeorgeMA-Strong Flash-Next candidate.
     "VLLM_RDNA_DENSE_GEMV": lambda: os.getenv("VLLM_RDNA_DENSE_GEMV", "0") == "1",
+    # hippihx V1 consume. VLLM_HIPPIHX=1 loads VLLM_HIPPIHX_LIB
+    # (libhippihx_v1.so) and the current device's code object from
+    # VLLM_HIPPIHX_CODE_OBJECT (a hippihx_<arch>.hsaco file, or the directory
+    # holding it). An op runs through hippihx only when its V1 plan is
+    # ready; otherwise the extras kernel runs as before.
+    "VLLM_HIPPIHX": lambda: os.getenv("VLLM_HIPPIHX", "0") == "1",
+    "VLLM_HIPPIHX_LIB": lambda: os.getenv("VLLM_HIPPIHX_LIB"),
+    "VLLM_HIPPIHX_CODE_OBJECT": lambda: os.getenv("VLLM_HIPPIHX_CODE_OBJECT"),
     # gfx10x push all-reduce (one-shot under VLLM_RDNA_AR_ONESHOT_KB, default
     # 32; two-shot above that up to VLLM_RDNA_AR_MAX_KB, default 20480 = a
     # full 4096-token batch at hidden 2560 fp16). fp16, bf16, and fp32.
