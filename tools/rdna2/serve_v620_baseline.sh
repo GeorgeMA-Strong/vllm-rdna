@@ -66,6 +66,9 @@ if [[ -n ${V620_PROFILE_DIR:-} ]]; then
     profile_dir=${profile_dir//$'\t'/\\t}
     command+=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$profile_dir\",\"ignore_frontend\":true,\"delay_iterations\":16,\"max_iterations\":16,\"torch_profiler_with_stack\":false,\"torch_profiler_dump_cuda_time_total\":false}")
 fi
+if [[ -n ${V620_WORKER_EXTENSION_CLS:-} ]]; then
+    command+=(--worker-extension-cls "$V620_WORKER_EXTENSION_CLS")
+fi
 if [[ ${1:-} == --dry-run ]]; then
     printf '%q ' "${command[@]}"
     printf '\n'
