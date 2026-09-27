@@ -39,7 +39,9 @@ export VLLM_ROCM_MOE_PREFILL=0 VLLM_GDN_HIP_PREFILL=0
 export VLLM_RDNA_FUSED_SE=1
 export VLLM_TUNED_CONFIG_FOLDER=$source_dir/tuned-moe
 export VLLM_RDNA_DENSE_INT8=0 VLLM_RDNA_DENSE_INT8_ONLY=0 VLLM_RDNA_DENSE_GEMV=0
-export VLLM_RDNA_AR=1 VLLM_RDNA_AR_MAX_KB=${VLLM_RDNA_AR_MAX_KB:-20480} VLLM_RDNA_AR_BLOCKS=0 VLLM_RDNA_AR_PACE=0
+# Two-shot is racy under PCIe load (wedges warmup: 'peer flag never arrived');
+# default to the pre-two-shot path: one-shot up to 64 KiB, RCCL above.
+export VLLM_RDNA_AR=1 VLLM_RDNA_AR_MAX_KB=${VLLM_RDNA_AR_MAX_KB:-64} VLLM_RDNA_AR_ONESHOT_KB=${VLLM_RDNA_AR_ONESHOT_KB:-64} VLLM_RDNA_AR_BLOCKS=0 VLLM_RDNA_AR_PACE=0
 export HSA_FORCE_FINE_GRAIN_PCIE=1 HSA_ENABLE_SDMA=0 OMP_NUM_THREADS=4
 export TOKENIZERS_PARALLELISM=false PYTHONFAULTHANDLER=1
 export VLLM_CAUSAL_CONV1D_RDNA2_FWD=0 VLLM_CAUSAL_CONV1D_RDNA2_UPDATE=0
@@ -94,7 +96,8 @@ exec "$runtime/bin/python" -m vllm.entrypoints.openai.api_server \
   --attention-backend "$attention_backend" \
   --tensor-parallel-size 4 --enable-expert-parallel \
   --dtype float16 --max-model-len ${MAXLEN:-262144} --block-size 1024 \
-  --max-num-seqs 8 --max-num-batched-tokens 4096 \
+  --max-num-seqs 8 --max-num-batched-tokens ${MAXBAT:-4096} \
+  --long-prefill-token-threshold ${LPTH:-0} \
   --kv-cache-memory-bytes 4026531840 \
   --compilation-config "{\"mode\":$compile_mode,\"cudagraph_mode\":\"$cg_mode\",\"cudagraph_capture_sizes\":$capture_sizes$cg_extra}" \
   "${spec_args[@]}" \

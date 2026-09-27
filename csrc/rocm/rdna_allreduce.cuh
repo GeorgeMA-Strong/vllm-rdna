@@ -40,7 +40,7 @@
 // Second flag row for the two-shot allgather. One-shot uses row 0 only.
 #define RDNA_AR_FLAG_STRIDE 16
 // Messages at or below this stay on one-shot unless VLLM_RDNA_AR_ALGO overrides.
-#define RDNA_AR_ONESHOT_MAX 32768
+#define RDNA_AR_ONESHOT_MAX 65536
 
 // T44b (2026-09-07) -- abort record. Before this, a collective that hit the spin cap set a bare
 // sticky flag that only the boot self-test ever read: mid-serving, every later collective also

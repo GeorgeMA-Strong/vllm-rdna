@@ -29,8 +29,8 @@ rdna_ar, and `VLLM_FORCE_CUSTOM_ALL_REDUCE` is no longer needed on gfx10x.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `VLLM_RDNA_AR` | `0` (library), `1` (launchers) | opt-in; dispatch ahead of CUSTOM/RCCL |
-| `VLLM_RDNA_AR_MAX_KB` | `20480` | the gate; 20480 KiB = 4096 × 2560 × 2 B |
-| `VLLM_RDNA_AR_ONESHOT_KB` | `32` | one-shot below, two-shot above |
+| `VLLM_RDNA_AR_MAX_KB` | `64` | gate for the one-shot path; above it falls through to RCCL |
+| `VLLM_RDNA_AR_ONESHOT_KB` | `64` | keep equal to MAX_KB: the two-shot range is disabled |
 | `VLLM_RDNA_AR_ALGO` | `auto` | `auto` \| `oneshot` \| `twoshot` |
 | `VLLM_RDNA_AR_BLOCKS` / `_PACE` | `0` / `0` | launch-width / push pacing |
 | `VLLM_RDNA_AR_SPIN_CAP` | ~2 s | abort bound; a wedge writes `$VLLM_CACHE_ROOT/rdna_ar_wedged` |
@@ -60,24 +60,43 @@ Using ['PYNCCL'] all-reduce backends (in dispatch order) ...
 Measured cost of that fallback: ~5–10 % decode (see below). Check for
 `rdna_ar: disabled` in the serve log after every config change.
 
-## Gate requirement — do not lower it
+## Two-shot is disabled by default (2026-09-27, late)
 
-The boot self-test's two-shot trial fails intermittently when the gate is
-small (observed on this board):
+Two-shot (`ONESHOT_KB` < size ≤ `MAX_KB`) is **not boot-safe under PCIe
+load**: it intermittently loses the peer-flag handshake and wedges —
+
+```
+RuntimeError: rdna_ar wedged: rank 0 timed out after ~1953 ms of spinning
+at collective #72: peer rank 1's flag never arrived ...
+```
+
+— raised by `rdna_ar_check()` during the startup warmup, which kills engine
+init. The boot self-test passes, then a later warmup/serving call wedges; the
+wedge marker (`$VLLM_CACHE_ROOT/rdna_ar_wedged`) then forces RCCL on subsequent
+boots. The one-shot path (≤ 64 KiB) is unaffected and has run for weeks.
+
+**Repro**: boot with `VLLM_RDNA_AR_MAX_KB=20480` (two-shot enabled) while a
+co-tenant generates PCIe traffic; watch for a wedge in warmup. Re-enable the
+wide gate only after the two-shot flag handshake (phases 2/4) is fixed.
+
+The following small-gate failures are the same defect at the bottom of the
+two-shot range:
 
 | `VLLM_RDNA_AR_MAX_KB` | self-test two-shot trial | verdict |
 | --- | --- | --- |
 | 64 KiB | 64 KiB | **FAIL** — wrong result (26.6–28.6 vs expected 30.0), 3/3 launches |
 | 128 KiB | 128 KiB | **FAIL** — spin-cap abort: "peer rank 1's flag never arrived … collective #10" (phase 4) + partial wrong result |
-| 1 MiB | 1 MiB | PASS |
-| 20 MiB | 20 MiB | PASS (3 launches) |
+| 1 MiB | 1 MiB | PASS (but flaky under load) |
+| 20 MiB | 20 MiB | PASS sometimes; **wedged warmup under co-tenant load (×2)** |
 
 Keep the gate at the default `20480` (or at least ≥ 1 MiB). The failure is a
 cross-call sync bug in the two-shot path near the bottom of its range; the
 exact boundary between 128 KiB and 1 MiB is uncharacterised and a standalone
 probe sweep is the planned follow-up.
 
-## Measured (4× V620, TP=4, Flash-Next AWQ W4A16, Triton attn, MTP=0/2)
+## Measured (two-shot era — historical; keep disabled until fixed)
+
+4× V620, TP=4, Flash-Next AWQ W4A16, Triton attn, MTP=0/2:
 
 - two-shot 20 MB ≈ **5.7 ms per call** (boot self-test, all ranks agreeing)
 - cold 16k/1k prefill **1755 tok/s vs 1686 tok/s on RCCL (+4 %)**

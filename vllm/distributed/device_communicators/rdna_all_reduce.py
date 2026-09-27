@@ -119,10 +119,10 @@ class RdnaOneShotAllReduce:
         self._ops = ops
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        # 20480 KiB = a full 4096-token prefill batch at hidden 2560 fp16.
-        # See the module docstring: smaller gates can mis-reduce in the
-        # boot self-test and self-disable the backend.
-        max_kb = int(os.getenv("VLLM_RDNA_AR_MAX_KB", "20480"))
+        # 64 KiB keeps the default on the proven one-shot path; the two-shot
+        # range is racy under PCIe load (warmup wedges). See the module
+        # docstring and pair with VLLM_RDNA_AR_ONESHOT_KB >= MAX_KB.
+        max_kb = int(os.getenv("VLLM_RDNA_AR_MAX_KB", "64"))
         self.max_bytes = max_kb * 1024
         if not (2 <= self.world_size <= 8):
             return
