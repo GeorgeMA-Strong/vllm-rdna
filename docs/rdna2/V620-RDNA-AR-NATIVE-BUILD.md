@@ -98,10 +98,18 @@ during RCCL teardown because the harness retained the final captured graph.
 Resetting captured graphs before destroying the group fixed that harness issue;
 the repeated run exited successfully.
 
+A final microbenchmark at `c88b2bc8b` also compared the actual vLLM
+`PyNcclCommunicator` path, not only PyTorch's process group. All correctness
+checks and cleanup passed. FP16 RDNA versus direct-vLLM RCCL latencies were
+30.4/79.1 µs at 5,120 bytes, 44.1/79.4 µs at 15,360 bytes, 54.2/74.4 µs at
+30,720 bytes, and 117.0/61.0 µs at 61,440 bytes. The small-message benefit is
+real in isolation, but does not establish a model-throughput improvement.
+
 Server evidence is under
 `/home/george/v620-experiments/rdna-ar-results-20260927/`:
 `correctness-before.log`, `correctness-before-repeat.log`,
 `correctness-output-fix.log`, and `latency-qualified.log`.
+The direct-vLLM comparison is in `latency-vllm-rccl.log`.
 Model-level qualification is still required before changing the default service.
 
 ### Intel model qualification
@@ -115,16 +123,26 @@ synthetic tool returns. RAM KV loads occurred during those continuations.
 `llm-context-bench` coding performance results (one measured repetition, 1,024
 output tokens, 12% input-token tolerance):
 
-| Input tier | Actual prompt tokens | RDNA decode tokens/s | TTFT seconds | Valid |
-| --- | ---: | ---: | ---: | --- |
-| 8K, one chat | 8,964 | 68.37 | 6.43 | Yes |
-| 64K, one chat | 71,991 | 65.94 | 49.97 | Yes |
-| 128K, one chat | 143,875 | 64.09 | 103.88 | Yes |
+| Input tier | Actual prompt tokens | RDNA decode tokens/s | RCCL decode tokens/s | RDNA / RCCL TTFT seconds |
+| --- | ---: | ---: | ---: | ---: |
+| 8K, one chat | 8,964 | 68.37 | 64.23 | 6.43 / 6.43 |
+| 64K, one chat | 71,991 | 65.94 | 65.93 | 49.97 / 49.63 |
+| 128K, one chat | 143,875 | 64.09 | 66.34 | 103.88 / 103.67 |
+
+All six single-session trials passed benchmark validation. The RCCL baseline
+used the same native build, model, graph settings, warmed compilation cache,
+and RAM offload capacity, with only RDNA dispatch disabled. These single-trial
+measurements use unique request tags; generated outputs and MTP acceptance
+can vary. They do not demonstrate a consistent decode gain: observed changes
+were +6.5%, effectively zero, and -3.4% respectively.
 
 The three-chat 8K run completed all requests, but one response failed the
 benchmark's dominant-token gate: 217 hyphens in generated comment/copyright
 headers exceeded the 20% threshold. The aggregate group remains invalid;
 do not present it as a validated throughput result or weaken the validator.
+The matched RCCL three-chat run passed all three outputs: 22.16 decode tokens/s
+per stream (median), 56.24 aggregate tokens/s over the shared generation window.
+Do not compare that valid group with the rejected RDNA group as a speedup claim.
 These performance checks do not establish code-quality correctness.
 
 Cold-cache startup spent several minutes compiling Triton GDN prefill variants,
@@ -134,9 +152,9 @@ normally and passed validation before the service was stopped for comparison.
 No RDNA wedge marker was produced. Long prefill pauses alone are not evidence
 of a deadlock.
 
-RCCL A/B comparison and full-VRAM multi-session offload stress are separate
-qualification steps; no production performance gain is established by these
-RDNA-only measurements.
+Full-VRAM multi-session offload stress remains a separate qualification step.
+The experiment does not establish a consistent production performance gain;
+do not promote RDNA to the default service on this evidence alone.
 
 ## Qualification gates before activation
 
