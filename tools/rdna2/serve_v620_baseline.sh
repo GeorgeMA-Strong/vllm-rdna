@@ -58,6 +58,10 @@ fi
 if [[ ${V620_SKIP_MM_PROFILING:-0} == 1 ]]; then
     command+=(--skip-mm-profiling)
 fi
+if [[ -n ${V620_PROFILE_DIR:-} ]]; then
+    command+=(--profiler-config '{"profiler":"torch","ignore_frontend":true,"delay_iterations":16,"max_iterations":16,"torch_profiler_with_stack":false,"torch_profiler_dump_cuda_time_total":false}'
+        --profiler-config.torch_profiler_dir "$V620_PROFILE_DIR")
+fi
 if [[ ${1:-} == --dry-run ]]; then
     printf '%q ' "${command[@]}"
     printf '\n'
