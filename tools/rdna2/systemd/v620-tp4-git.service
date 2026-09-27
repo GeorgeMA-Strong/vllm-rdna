@@ -1,11 +1,12 @@
 [Unit]
-Description=V620 TP4 with 64 GiB RAM KV offload from the Git checkout
+Description=V620 Swift 1.5 AutoRound TP4 with 64 GiB RAM KV offload
 Conflicts=v620-tp4-fast.service v620-tp4-default.service v620-serve-intel.service
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=/home/george/v620-experiments/kv-offload-ram-20260926
+Environment=V620_MODEL=/home/george/models/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound
 Environment=V620_ENABLE_RESIDENT=0
 Environment=V620_ENABLE_SKINNY=0
 Environment=V620_SKIP_MM_PROFILING=0
