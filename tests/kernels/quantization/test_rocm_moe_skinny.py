@@ -63,6 +63,20 @@ def test_moe_skinny_decode_supported_accepts_expert_map():
     assert moe_skinny_decode_supported(**kwargs) is True
 
 
+@pytest.mark.parametrize("m", [1, 3, 6, 9, 12, 16])
+def test_moe_skinny_opt_in_covers_concurrent_mtp_rows(monkeypatch, m):
+    monkeypatch.setenv("VLLM_ROCM_MOE_SKINNY_MAX_M", "16")
+    assert moe_skinny_decode_supported(**{**_BASE, "num_tokens": m})
+
+
+@pytest.mark.parametrize("limit", [8, 16, 100])
+@pytest.mark.parametrize("m", [0, 8, 9, 16, 17])
+def test_moe_skinny_limit_preserves_native_bounds(monkeypatch, limit, m):
+    monkeypatch.setenv("VLLM_ROCM_MOE_SKINNY_MAX_M", str(limit))
+    expected = 1 <= m <= min(limit, 16)
+    assert moe_skinny_decode_supported(**{**_BASE, "num_tokens": m}) == expected
+
+
 def _pack_sequential_int4(w: torch.Tensor) -> torch.Tensor:
     """Pack K-sequential nibbles into int32: bits 4*j hold k=i*8+j."""
     rows, k = w.shape
@@ -82,7 +96,9 @@ def _silu(x: torch.Tensor) -> torch.Tensor:
     reason="HIP kernel test needs a GPU",
 )
 @pytest.mark.parametrize("scale_multiplier", [0.1, 1.0])
-def test_moe_skinny_int4_decode_matches_dequant_ref(scale_multiplier):
+@pytest.mark.parametrize("m", [1, 3, 6, 9, 12, 16])
+@pytest.mark.parametrize("mapped", [False, True])
+def test_moe_skinny_int4_decode_matches_dequant_ref(scale_multiplier, m, mapped):
     from vllm.platforms import current_platform
     from vllm.platforms.rocm import on_gfx10x
 
@@ -97,7 +113,7 @@ def test_moe_skinny_int4_decode_matches_dequant_ref(scale_multiplier):
     from vllm import _custom_ops as ops
 
     device = "cuda"
-    e, m, k, n, topk, group = 4, 2, 128, 64, 2, 32
+    e, k, n, topk, group = 4, 128, 64, 2, 32
     torch.manual_seed(0)
 
     # Symmetric uint4b8 codes in 0..15.
@@ -116,13 +132,24 @@ def test_moe_skinny_int4_decode_matches_dequant_ref(scale_multiplier):
 
     x = torch.randn(m, k, dtype=torch.float16, device=device)
     topk_ids = torch.randint(0, e, (m, topk), dtype=torch.int32, device=device)
+    expert_map = None
+    if mapped:
+        expert_map = torch.tensor([2, -1, 0, -1], dtype=torch.int32, device=device)
+        # Include graph-padded rows which have no local expert contribution.
+        topk_ids[-1].fill_(1)
     topk_w = torch.softmax(torch.randn(m, topk, device=device), dim=-1).to(
         torch.float32
     )
 
     act = torch.empty(m, topk, n, dtype=torch.float16, device=device)
     out = torch.empty(m, k, dtype=torch.float16, device=device)
-    ops.moe_skinny_int4_decode(x, w13, s13, w2, s2, topk_w, topk_ids, act, out, group)
+
+    def launch():
+        ops.moe_skinny_int4_decode(
+            x, w13, s13, w2, s2, topk_w, topk_ids, act, out, group, expert_map
+        )
+
+    launch()
 
     def dequant(nibbles: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         return (nibbles.float() - 8.0) * scales.float().repeat_interleave(group, dim=-1)
@@ -139,6 +166,10 @@ def test_moe_skinny_int4_decode_matches_dequant_ref(scale_multiplier):
     for mi in range(m):
         for s in range(topk):
             expert = int(topk_ids[mi, s])
+            if expert_map is not None:
+                expert = int(expert_map[expert])
+            if expert < 0:
+                continue
             gate = xf[mi] @ w13_fp[expert, :n].T
             up = xf[mi] @ w13_fp[expert, n:].T
             # The public workspace/output contract is FP16. Keep FP32 matrix
@@ -151,3 +182,22 @@ def test_moe_skinny_int4_decode_matches_dequant_ref(scale_multiplier):
     # Unit-scale synthetic weights can exceed FP16's output range; the larger
     # case checks that overflow agrees, while the smaller case must stay finite.
     torch.testing.assert_close(out.float(), ref.half().float(), atol=2e-2, rtol=2e-2)
+
+    # Verify capture uses the changing input and writes all output rows, including
+    # nonlocal/padded rows. Compare identical arithmetic, without new tolerances.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        launch()
+    for factor in (0.5, -1.0, 0.0):
+        x.mul_(factor)
+        launch()
+        eager = out.clone()
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(out, eager, atol=0, rtol=0)
+    graph.reset()

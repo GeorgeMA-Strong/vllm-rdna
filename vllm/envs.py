@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_MOE_SKINNY: bool = True
+    VLLM_ROCM_MOE_SKINNY_MAX_M: int = 8
     VLLM_RDNA_MOE_RESIDENT: bool = False
     VLLM_RDNA_MOE_RESIDENT_SKINNY: bool = False
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1390,6 +1391,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_RDNA_MOE_RESIDENT_SKINNY", "0"))
     ),
     "VLLM_ROCM_MOE_SKINNY": lambda: bool(int(os.getenv("VLLM_ROCM_MOE_SKINNY", "1"))),
+    # Opt in to larger concurrent/MTP decode batches; native hard limit is 16.
+    "VLLM_ROCM_MOE_SKINNY_MAX_M": lambda: int(
+        os.getenv("VLLM_ROCM_MOE_SKINNY_MAX_M", "8")
+    ),
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
