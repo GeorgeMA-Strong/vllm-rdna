@@ -18,6 +18,9 @@ export PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1
 
 `TUNING=1` re-tunes only shapes missing from the table.
 
+Never place these files under `/tmp` (wiped on reboot) or in a run-specific CWD;
+`~/.cache/tunableop/` is the canonical location.
+
 ## Measured (4× V620, TP4, Qwen3.8-Flash-Next-AWQ-W4A16, MTP=2, c=8, seed 12345)
 
 | cell | MTP-0 | MTP-2 (no rows) | MTP-2 + these rows |
