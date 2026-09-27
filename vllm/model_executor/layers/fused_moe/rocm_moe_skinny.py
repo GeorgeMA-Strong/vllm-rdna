@@ -15,8 +15,10 @@ It must **not** run on ``CompressedTensorsWNA16RDNA2MoEMethod`` weights.
 Those are shuffled Exllama ``[E, K/8, N]``. Calling this kernel on them
 is silently wrong, not a launch failure.
 
-Gated to gfx10x, fp16, symmetric int4, SILU, M<=8, optional EP expert mapping,
+Gated to gfx10x, fp16, symmetric int4, SILU, optional EP expert mapping,
 no ``apply_router_weight_on_input``. ``VLLM_ROCM_MOE_SKINNY=0`` disables.
+The default M cap is 8. ``VLLM_ROCM_MOE_SKINNY_MAX_M=16`` opts into larger
+concurrent/MTP batches; values above 16 cannot exceed the native hard limit.
 
 Handover A/B (do this on gfx1030 before making skinny the production
 Triton-WNA16 decode path, and before writing a shuffled-layout sibling):
@@ -46,7 +48,7 @@ Correctness:
     ``test_rocm_moe_skinny.py`` (sequential packing).
   * EP uses the global-to-local expert map; nonlocal experts contribute zero.
   * Asymmetric zp must not.
-  * Prefill M>8 must stay tile Triton / RDNA2 HIP.
+  * Batches above the configured cap stay tile Triton / RDNA2 HIP.
 
 Measure:
 
@@ -78,8 +80,8 @@ logger = init_logger(__name__)
 _ROCM_MOE_SKINNY: bool | None = None
 _LOGGED_USE = False
 
-# Dispatch M cap (kernel itself allows 1..16). Recipe gated at 8.
-_MAX_M = 8
+# Kernel hard limit; the independently configurable dispatch cap defaults to 8.
+_MAX_M = 16
 
 
 def rocm_moe_skinny_available() -> bool:
@@ -119,7 +121,7 @@ def moe_skinny_decode_supported(
         return False
     if hidden_dtype != torch.float16:
         return False
-    if num_tokens < 1 or num_tokens > _MAX_M:
+    if num_tokens < 1 or num_tokens > min(envs.VLLM_ROCM_MOE_SKINNY_MAX_M, _MAX_M):
         return False
     if activation != MoEActivation.SILU:
         return False
