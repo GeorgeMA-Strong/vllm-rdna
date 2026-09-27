@@ -1410,12 +1410,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # From PR #5 / GeorgeMA-Strong Flash-Next candidate.
     "VLLM_RDNA_DENSE_GEMV": lambda: os.getenv("VLLM_RDNA_DENSE_GEMV", "0") == "1",
     # gfx10x push all-reduce (one-shot under VLLM_RDNA_AR_ONESHOT_KB, default
-    # 32; two-shot above that up to VLLM_RDNA_AR_MAX_KB, default 64). fp16,
-    # bf16, and fp32. Default off. "1" dispatches ahead of CUSTOM / RCCL.
-    # Not implied by VLLM_FORCE_CUSTOM_ALL_REDUCE. Related:
-    # VLLM_RDNA_AR_ALGO (auto|oneshot|twoshot), VLLM_RDNA_AR_BLOCKS,
-    # VLLM_RDNA_AR_PACE, VLLM_RDNA_AR_SPIN_CAP. A wedge writes
-    # $VLLM_CACHE_ROOT/rdna_ar_wedged.
+    # 32; two-shot above that up to VLLM_RDNA_AR_MAX_KB, default 20480 = a
+    # full 4096-token batch at hidden 2560 fp16). fp16, bf16, and fp32.
+    # Default off. "1" dispatches ahead of CUSTOM / RCCL. Not implied by
+    # VLLM_FORCE_CUSTOM_ALL_REDUCE. Related: VLLM_RDNA_AR_ALGO
+    # (auto|oneshot|twoshot), VLLM_RDNA_AR_BLOCKS, VLLM_RDNA_AR_PACE,
+    # VLLM_RDNA_AR_SPIN_CAP. A wedge writes $VLLM_CACHE_ROOT/rdna_ar_wedged.
+    # Small gates (64-2048 KiB observed) can fail the boot self-test's
+    # two-shot trial and self-disable the backend -- keep the gate wide.
     "VLLM_RDNA_AR": lambda: os.getenv("VLLM_RDNA_AR", "0").strip().lower() or "0",
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

@@ -16,10 +16,14 @@ non-contiguous spans custom all-reduce already allows.
 Staging and flags are uncached device memory (peer announce is a posted P2P
 store; we poll locally). Sequence numbers live on device (graph-capture
 safe). Messages up to VLLM_RDNA_AR_ONESHOT_KB (default 32) use one-shot.
-Larger messages up to VLLM_RDNA_AR_MAX_KB (default 64) use a push two-shot
-(reduce-scatter + allgather) so prefill chunks do not need
-VLLM_FORCE_CUSTOM_ALL_REDUCE. VLLM_RDNA_AR_ALGO=oneshot|twoshot|auto selects
-the kernel. VLLM_RDNA_AR_BLOCKS / VLLM_RDNA_AR_PACE pace PCIe push bursts.
+Larger messages up to VLLM_RDNA_AR_MAX_KB (default 20480 = a full 4096-token
+batch at hidden 2560 fp16) use a push two-shot (reduce-scatter + allgather)
+so prefill chunks do not need VLLM_FORCE_CUSTOM_ALL_REDUCE. Small gates
+(64-2048 KiB observed on gfx1030) can fail the boot self-test's two-shot
+trial with a nondeterministic wrong result, which self-disables the backend
+and silently falls back to RCCL -- keep the gate at the default or larger.
+VLLM_RDNA_AR_ALGO=oneshot|twoshot|auto selects the kernel.
+VLLM_RDNA_AR_BLOCKS / VLLM_RDNA_AR_PACE pace PCIe push bursts.
 VLLM_RDNA_AR_SPIN_CAP bounds the wait.
 
 T44b wedge handling: a spin-cap abort records phase/peer/sequence in a
@@ -115,8 +119,10 @@ class RdnaOneShotAllReduce:
         self._ops = ops
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        # Decode-sized default; prefill chunks are faster on RCCL.
-        max_kb = int(os.getenv("VLLM_RDNA_AR_MAX_KB", "64"))
+        # 20480 KiB = a full 4096-token prefill batch at hidden 2560 fp16.
+        # See the module docstring: smaller gates can mis-reduce in the
+        # boot self-test and self-disable the backend.
+        max_kb = int(os.getenv("VLLM_RDNA_AR_MAX_KB", "20480"))
         self.max_bytes = max_kb * 1024
         if not (2 <= self.world_size <= 8):
             return
