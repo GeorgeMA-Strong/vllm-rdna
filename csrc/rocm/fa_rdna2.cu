@@ -165,6 +165,35 @@ __device__ __forceinline__ void fa_clip_kv_walk(int& lo, int& hi, int q_first,
   }
 }
 
+// Sequence of decode query token `tok` and the number of keys it attends to.
+// Without cu_query_lens every query token is its own sequence. With it, a
+// sequence's queries are its last q_len positions (spec-decode verify or a
+// short extend), so token i of a q_len-token query sees seq_len - (q_len -
+// 1 - i) keys: the causal mask becomes a per-token KV length. Tokens past
+// the last query (graph padding) see none.
+__device__ __forceinline__ int fa_decode_token_seq(const int* cu_query_lens,
+                                                   int num_seqs, int tok,
+                                                   const int* seq_lens,
+                                                   int& kv_len) {
+  if (cu_query_lens == nullptr) {
+    kv_len = seq_lens[tok];
+    return tok;
+  }
+  // Last sequence starting at or before tok (zero-length ones are skipped).
+  int lo = 0, hi = num_seqs;
+  while (hi - lo > 1) {
+    const int mid = (lo + hi) >> 1;
+    if (cu_query_lens[mid] <= tok) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const int end = cu_query_lens[lo + 1];
+  kv_len = tok < end ? seq_lens[lo] - (end - 1 - tok) : 0;
+  return lo;
+}
+
 // fp8 e4m3fn -> fp16 conversion (software, no fp8 hardware needed on gfx1030)
 // e4m3: [S(1) | E(4) | M(3)], bias=7
 // fp16:  [S(1) | E(5) | M(10)], bias=15
@@ -281,7 +310,9 @@ __global__ __launch_bounds__(128)
     const float k_scale,
     const float v_scale,
     const float* __restrict__ k_scale_per_tok,
-    const float* __restrict__ v_scale_per_tok) {
+    const float* __restrict__ v_scale_per_tok,
+    const int* __restrict__ cu_query_lens,
+    const int num_seqs) {
 
   const int token_idx = blockIdx.x;
   const int h_q = blockIdx.y;
@@ -291,8 +322,10 @@ __global__ __launch_bounds__(128)
   if (token_idx >= num_tokens || h_q >= H_q || split >= kv_splits) return;
 
   // Per-query sequence length and block table base.
-  const int seq_len = seq_lens[token_idx];
-  const int* my_block_table = block_table + token_idx * max_blocks;
+  int seq_len;
+  const int seq = fa_decode_token_seq(cu_query_lens, num_seqs, token_idx,
+                                      seq_lens, seq_len);
+  const int* my_block_table = block_table + seq * max_blocks;
   if (seq_len <= 0) {
     // Empty sequence: write zeros and skip.
     if (t < HEAD_DIM_PAGED_128) {
@@ -545,7 +578,9 @@ __global__ __launch_bounds__(256)
     const float k_scale,
     const float v_scale,
     const float* __restrict__ k_scale_per_tok,
-    const float* __restrict__ v_scale_per_tok) {
+    const float* __restrict__ v_scale_per_tok,
+    const int* __restrict__ cu_query_lens,
+    const int num_seqs) {
 
   const int token_idx = blockIdx.x;
   const int h_q = blockIdx.y;
@@ -554,8 +589,10 @@ __global__ __launch_bounds__(256)
   const int h_kv = h_q / kv_group_num;
   if (token_idx >= num_tokens || h_q >= H_q || split >= kv_splits) return;
 
-  const int seq_len = seq_lens[token_idx];
-  const int* my_block_table = block_table + token_idx * max_blocks;
+  int seq_len;
+  const int seq = fa_decode_token_seq(cu_query_lens, num_seqs, token_idx,
+                                      seq_lens, seq_len);
+  const int* my_block_table = block_table + seq * max_blocks;
   if (seq_len <= 0) {
     if (t < 256) {
       O_partial[((token_idx * H_q + h_q) * kv_splits + split) * 256 + t] = 0.0f;
@@ -787,7 +824,8 @@ void fa_decode_paged_splitk_gqa_kernel_256(
     float* __restrict__ M_partial,
     float* __restrict__ L_partial,
     const int num_tokens, const int H_q, const int H_kv,
-    const int kv_splits, const float scale, const int sliding_window) {
+    const int kv_splits, const float scale, const int sliding_window,
+    const int* __restrict__ cu_query_lens, const int num_seqs) {
 
   const int token_idx = blockIdx.x;
   const int h_kv = blockIdx.y;
@@ -795,7 +833,9 @@ void fa_decode_paged_splitk_gqa_kernel_256(
   const int t = threadIdx.x;
   const int G = H_q / H_kv;
   if (token_idx >= num_tokens || h_kv >= H_kv || split >= kv_splits) return;
-  const int seq_len = seq_lens[token_idx];
+  int seq_len;
+  const int seq = fa_decode_token_seq(cu_query_lens, num_seqs, token_idx,
+                                      seq_lens, seq_len);
   if (seq_len <= 0) {
     if (t < 256) {
       for (int g = 0; g < G; ++g) {
@@ -831,7 +871,7 @@ void fa_decode_paged_splitk_gqa_kernel_256(
   }
   __syncthreads();
 
-  const int* my_bt = block_table + (int64_t)token_idx * max_blocks;
+  const int* my_bt = block_table + (int64_t)seq * max_blocks;
   float m_i[GQA_MAX_G], l_i[GQA_MAX_G], o_acc[GQA_MAX_G];
 #pragma unroll
   for (int g = 0; g < GQA_MAX_G; ++g) {
@@ -3112,7 +3152,8 @@ void fa_rdna2_decode_paged(
     int64_t kv_splits,
     int64_t sliding_window,
     double scale,
-    torch::Tensor out) {
+    torch::Tensor out,
+    c10::optional<torch::Tensor> cu_query_lens) {
   TORCH_CHECK(Q.is_cuda() && key_cache.is_cuda() && value_cache.is_cuda(),
               "Q/key_cache/value_cache must be on HIP device");
   TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
@@ -3133,6 +3174,20 @@ void fa_rdna2_decode_paged(
   TORCH_CHECK(kv_splits >= 1 && kv_splits <= MAX_SPLITS,
               "kv_splits must be in [1, 16]");
   fa_check_io(Q, out);
+  // With cu_query_lens, seq_lens/block_table rows are per sequence and each
+  // sequence contributes its last q_len positions as queries.
+  const int* cu_ptr = nullptr;
+  int num_seqs = 0;
+  if (cu_query_lens.has_value() && cu_query_lens->defined()) {
+    TORCH_CHECK(cu_query_lens->is_cuda() &&
+                    cu_query_lens->scalar_type() == torch::kInt32 &&
+                    cu_query_lens->dim() == 1 && cu_query_lens->size(0) >= 2,
+                "cu_query_lens must be a [num_seqs + 1] int32 tensor");
+    num_seqs = (int)cu_query_lens->size(0) - 1;
+    TORCH_CHECK(seq_lens.size(0) >= num_seqs && block_table.size(0) >= num_seqs,
+                "seq_lens/block_table need a row per sequence");
+    cu_ptr = cu_query_lens->data_ptr<int>();
+  }
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -3195,7 +3250,8 @@ void fa_rdna2_decode_paged(
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
         0.0f, 0.0f,
-        nullptr, nullptr);
+        nullptr, nullptr,
+        cu_ptr, num_seqs);
   } else if (fa_gqa_decode_enabled() && (int64_t)num_tokens * H_kv >= 4
              && x_dim == 8
              && kv_group_num > 1 && kv_group_num <= GQA_MAX_G
@@ -3237,7 +3293,8 @@ void fa_rdna2_decode_paged(
         (float*)M_partial.data_ptr(),
         (float*)L_partial.data_ptr(),
         num_tokens, H_q, H_kv,
-        (int)kv_splits, scale, (int)sliding_window);
+        (int)kv_splits, scale, (int)sliding_window,
+        cu_ptr, num_seqs);
   } else {
     constexpr int HEAD_DIM = 256;
     constexpr int THREADS = 256;
@@ -3275,7 +3332,8 @@ void fa_rdna2_decode_paged(
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
         0.0f, 0.0f,
-        nullptr, nullptr);
+        nullptr, nullptr,
+        cu_ptr, num_seqs);
   }
   hipError_t err1 = hipGetLastError();
   TORCH_CHECK(err1 == hipSuccess,
@@ -3408,7 +3466,8 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
         (float)k_scale, (float)v_scale,
-        nullptr, nullptr);
+        nullptr, nullptr,
+        nullptr, 0);
   } else {
     constexpr int HEAD_DIM = 256;
     constexpr int THREADS = 256;
@@ -3446,7 +3505,8 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
         (float)k_scale, (float)v_scale,
-        nullptr, nullptr);
+        nullptr, nullptr,
+        nullptr, 0);
   }
   hipError_t err1 = hipGetLastError();
   TORCH_CHECK(err1 == hipSuccess,
@@ -4786,7 +4846,8 @@ torch::Tensor fa_rdna2_decode_paged_int8(
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
         0.0f, 0.0f,  // scalar scales unused; IS_INT8 path uses per-tok ptrs
         (const float*)k_scale.data_ptr(),
-        (const float*)v_scale.data_ptr());
+        (const float*)v_scale.data_ptr(),
+        nullptr, 0);
   } else if (D == 256) {
     constexpr int HEAD_DIM = 256;
     constexpr int THREADS = 256;
@@ -4817,7 +4878,8 @@ torch::Tensor fa_rdna2_decode_paged_int8(
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
         0.0f, 0.0f,
         (const float*)k_scale.data_ptr(),
-        (const float*)v_scale.data_ptr());
+        (const float*)v_scale.data_ptr(),
+        nullptr, 0);
   } else {
     TORCH_CHECK(false, "int8 decode: only HEAD_DIM=128 or 256 supported");
   }

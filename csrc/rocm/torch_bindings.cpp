@@ -159,7 +159,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "fa_rdna2_decode_paged(Tensor Q, Tensor key_cache, Tensor value_cache, "
       "Tensor block_table, Tensor seq_lens, int block_size, int kv_splits, "
-      "int sliding_window, float scale, Tensor(a!) out) -> ()");
+      "int sliding_window, float scale, Tensor(a!) out, "
+      "Tensor? cu_query_lens=None) -> ()");
   rocm_ops.impl("fa_rdna2_decode_paged", torch::kCUDA, &fa_rdna2_decode_paged);
 
   // GDN packed single-token decode for AMD RDNA2 (gfx1030). Dispatched

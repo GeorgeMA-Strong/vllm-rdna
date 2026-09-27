@@ -37,11 +37,13 @@ def fa_rdna2_decode_paged(
     sliding_window: int = 0,
     scale: float | None = None,
     out: torch.Tensor | None = None,
+    cu_query_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FA2 split-K decode (one query token per sequence) from the paged cache.
+    """FA2 split-K decode from the paged cache, one CTA group per query token.
 
     Args:
-        Q: [num_tokens, H_q, D] fp16 queries, one per sequence.
+        Q: [num_tokens, H_q, D] fp16 queries; one per sequence unless
+            cu_query_lens is given.
         key_cache: [num_blocks, H_kv, D/x, block_size, x] fp16 paged K cache.
         value_cache: 5D fp16 view of the paged V cache
             (see rdna_attn._reinterpret_v_to_5d).
@@ -52,6 +54,10 @@ def fa_rdna2_decode_paged(
         sliding_window: Window size (0 = none).
         scale: Softmax scale; defaults to D ** -0.5.
         out: Optional output buffer shaped like Q.
+        cu_query_lens: Optional [num_seqs + 1] int32 cumulative query
+            lengths for multi-token queries (spec-decode verify, short
+            extends). Sequence s then owns queries cu[s]..cu[s+1]-1, which
+            are its last positions (causal); tokens past cu[-1] get zeros.
 
     Returns:
         The attention output ([num_tokens, H_q, D] fp16), i.e. ``out``.
@@ -68,6 +74,7 @@ def fa_rdna2_decode_paged(
         sliding_window,
         scale,
         out,
+        cu_query_lens,
     )
     return out
 
