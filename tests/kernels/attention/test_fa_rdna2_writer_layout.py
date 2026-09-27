@@ -113,12 +113,16 @@ def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense"):
     return key_cache, value_cache5, block_table.cuda(), per_seq_kv
 
 
-def _ref_attention(Q, per_seq_kv, cu_q, H_kv, causal):
+def _ref_attention(Q, per_seq_kv, cu_q, H_kv, causal, sliding_window=0,
+                   scale=None):
     """fp32 reference from raw K/V inputs. Q: [total_q, H_q, D]. For full
     prefill nq == sl per seq; for decode nq == 1 (query is the last token).
+    A sliding window keeps keys with q - k < sliding_window (vLLM semantics).
     """
     H_q, D = Q.shape[1], Q.shape[2]
     group = H_q // H_kv
+    if scale is None:
+        scale = 1.0 / math.sqrt(D)
     O = torch.zeros(Q.shape, dtype=torch.float32, device=Q.device)
     cu = [int(c) for c in cu_q]
     for s, (K, V) in enumerate(per_seq_kv):
@@ -130,12 +134,15 @@ def _ref_attention(Q, per_seq_kv, cu_q, H_kv, causal):
         Vf = V.float().repeat_interleave(group, dim=1)
         for c0 in range(0, nq, 256):
             c1 = min(c0 + 256, nq)
-            sc = torch.einsum("qhd,khd->qhk", Qf[c0:c1], Kf) / math.sqrt(D)
+            sc = torch.einsum("qhd,khd->qhk", Qf[c0:c1], Kf) * scale
+            qi = torch.arange(c0, c1, device=Q.device) + (sl - nq)
+            ki = torch.arange(sl, device=Q.device)
+            mask = torch.zeros(c1 - c0, sl, dtype=torch.bool, device=Q.device)
             if causal:
-                qi = torch.arange(c0, c1, device=Q.device) + (sl - nq)
-                ki = torch.arange(sl, device=Q.device)
-                mask = ki[None, :] > qi[:, None]
-                sc = sc.masked_fill(mask[:, None, :], float("-inf"))
+                mask |= ki[None, :] > qi[:, None]
+            if sliding_window > 0:
+                mask |= qi[:, None] - ki[None, :] >= sliding_window
+            sc = sc.masked_fill(mask[:, None, :], float("-inf"))
             p = sc.softmax(dim=-1)
             O[q0 + c0:q0 + c1] = torch.einsum("qhk,khd->qhd", p, Vf)
     return O.half()
@@ -163,7 +170,7 @@ def test_prefill_varlen_d256_writer_layout(sl, layout):
     kv_splits = min(8, (sl + 1023) // 1024)
     if kv_splits >= 2:
         out = fa.fa_rdna2_prefill_paged_varlen_splitk(
-            Q, kc, vc, bt, cu, seq_lens, bs, 1, 0, kv_splits)
+            Q, kc, vc, bt, cu, seq_lens, bs, causal=True, kv_splits=kv_splits)
     else:
         out = fa.fa_rdna2_prefill_paged_varlen(
             Q, kc, vc, bt, cu, seq_lens, bs, 1, 0)
@@ -242,7 +249,7 @@ def _run(fn, *args):
 # Chunked-prefill / prefix-cache path: the query tensor holds only a
 # mid-sequence chunk (nq < seq_len). The causal mask must use the absolute
 # query position (kv_offset + chunk-local index), not the chunk-local one.
-@pytest.mark.parametrize("kernel", ["general", "splitk", "short"])
+@pytest.mark.parametrize("kernel", ["general", "splitk", "short", "gqa"])
 def test_prefill_chunked_offset(kernel):
     if kernel == "short":
         H_q, H_kv, D, bs = 16, 4, 128, 16
@@ -257,9 +264,12 @@ def test_prefill_chunked_offset(kernel):
     seq_lens = torch.tensor([full], dtype=torch.int32, device="cuda")
     if kernel == "splitk":
         out = fa.fa_rdna2_prefill_paged_varlen_splitk(
-            Q, kc, vc, bt, cu, seq_lens, bs, 1, 0, 4)
+            Q, kc, vc, bt, cu, seq_lens, bs, causal=True, kv_splits=4)
     elif kernel == "short":
         out = fa.fa_rdna2_prefill_paged_varlen_short(
+            Q, kc, vc, bt, cu, seq_lens, bs, 1, 0)
+    elif kernel == "gqa":
+        out = fa.fa_rdna2_prefill_paged_varlen_gqa(
             Q, kc, vc, bt, cu, seq_lens, bs, 1, 0)
     else:
         out = fa.fa_rdna2_prefill_paged_varlen(
@@ -267,6 +277,103 @@ def test_prefill_chunked_offset(kernel):
     ref = _ref_attention(Q, per_seq_kv, [0, nq], H_kv, causal=True)
     err = _max_rel_err(out, ref)
     assert err < 5e-3, f"chunked {kernel} D={D}: max_rel_err={err}"
+
+
+def _run_prefill(kernel, Q, kc, vc, bt, cu, seq_lens, bs, **kw):
+    if kernel == "short":
+        return fa.fa_rdna2_prefill_paged_varlen_short(
+            Q, kc, vc, bt, cu, seq_lens, bs, **kw)
+    if kernel == "splitk":
+        return fa.fa_rdna2_prefill_paged_varlen_splitk(
+            Q, kc, vc, bt, cu, seq_lens, bs, kv_splits=4, **kw)
+    if kernel == "gqa":
+        return fa.fa_rdna2_prefill_paged_varlen_gqa(
+            Q, kc, vc, bt, cu, seq_lens, bs, **kw)
+    return fa.fa_rdna2_prefill_paged_varlen(
+        Q, kc, vc, bt, cu, seq_lens, bs, **kw)
+
+
+# Production D=256 prefill kernel (2 q-heads of a GQA group per CTA) on a
+# multi-sequence batch: fresh prompts plus a chunk behind a prefix.
+@pytest.mark.parametrize("layout", ["dense", "interleaved"])
+def test_prefill_gqa_d256_multiseq(layout):
+    H_q, H_kv, D, bs = 24, 4, 256, 784
+    seq_lens_l, q_lens = [37, 1000, 2000], [37, 1000, 500]
+    kc, vc, bt, per_seq_kv = _fill_cache(seq_lens_l, H_kv, D, bs, seed=11,
+                                         layout=layout)
+    cu_l = [0]
+    for n in q_lens:
+        cu_l.append(cu_l[-1] + n)
+    torch.manual_seed(11)
+    Q = torch.randn(cu_l[-1], H_q, D, dtype=torch.float16, device="cuda")
+    cu = torch.tensor(cu_l, dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor(seq_lens_l, dtype=torch.int32, device="cuda")
+    out = fa.fa_rdna2_prefill_paged_varlen_gqa(
+        Q, kc, vc, bt, cu, seq_lens, bs, 1, 0)
+    ref = _ref_attention(Q, per_seq_kv, cu_l, H_kv, causal=True)
+    err = _max_rel_err(out, ref)
+    assert err < 5e-3, f"gqa multiseq {layout}: max_rel_err={err}"
+
+
+# Sliding window: query q attends keys k with q - k < window, in every
+# prefill kernel (they used to keep window + 1 keys).
+@pytest.mark.parametrize("kernel", ["general", "splitk", "short", "gqa"])
+def test_prefill_sliding_window(kernel):
+    if kernel == "short":
+        H_q, H_kv, D, bs = 16, 4, 128, 16
+    else:
+        H_q, H_kv, D, bs = 24, 4, 256, 784
+    full, nq, window = 700, 300, 100
+    kc, vc, bt, per_seq_kv = _fill_cache([full], H_kv, D, bs, seed=5)
+    torch.manual_seed(5)
+    Q = torch.randn(nq, H_q, D, dtype=torch.float16, device="cuda")
+    cu = torch.tensor([0, nq], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([full], dtype=torch.int32, device="cuda")
+    out = _run_prefill(kernel, Q, kc, vc, bt, cu, seq_lens, bs,
+                       sliding_window=window)
+    ref = _ref_attention(Q, per_seq_kv, [0, nq], H_kv, causal=True,
+                         sliding_window=window)
+    err = _max_rel_err(out, ref)
+    assert err < 5e-3, f"window {kernel}: max_rel_err={err}"
+
+
+# The kernels use the caller's softmax scale (not a hardcoded 1/sqrt(D)) and
+# write into the caller's `out` buffer.
+@pytest.mark.parametrize("kernel", ["decode", "gqa", "short"])
+def test_custom_scale_into_out(kernel):
+    D = 128 if kernel == "short" else 256
+    H_q, H_kv, bs = (16, 4, 16) if D == 128 else (24, 4, 784)
+    sl = 600
+    nq = 1 if kernel == "decode" else sl
+    kc, vc, bt, per_seq_kv = _fill_cache([sl], H_kv, D, bs, seed=3)
+    torch.manual_seed(3)
+    Q = torch.randn(nq, H_q, D, dtype=torch.float16, device="cuda")
+    seq_lens = torch.tensor([sl], dtype=torch.int32, device="cuda")
+    out = torch.empty_like(Q)
+    scale = 0.05
+    if kernel == "decode":
+        res = fa.fa_rdna2_decode_paged(Q, kc, vc, bt, seq_lens, bs, 16, 0,
+                                       scale=scale, out=out)
+    else:
+        cu = torch.tensor([0, nq], dtype=torch.int32, device="cuda")
+        res = _run_prefill(kernel, Q, kc, vc, bt, cu, seq_lens, bs,
+                           scale=scale, out=out)
+    assert res.data_ptr() == out.data_ptr()
+    ref = _ref_attention(Q, per_seq_kv, [0, nq], H_kv,
+                         causal=kernel != "decode", scale=scale)
+    err = _max_rel_err(out, ref)
+    assert err < 5e-3, f"scale {kernel}: max_rel_err={err}"
+
+
+# Rows with seq_len 0 (CUDA-graph padding) must come out as zeros, not NaN.
+def test_decode_empty_rows_are_zero():
+    H_q, H_kv, D, bs = 24, 4, 256, 784
+    kc, vc, bt, _ = _fill_cache([300, 0], H_kv, D, bs, seed=9)
+    Q = torch.randn(2, H_q, D, dtype=torch.float16, device="cuda")
+    seq_lens = torch.tensor([300, 0], dtype=torch.int32, device="cuda")
+    out = fa.fa_rdna2_decode_paged(Q, kc, vc, bt, seq_lens, bs, 16, 0)
+    assert torch.isfinite(out).all()
+    assert (out[1] == 0).all()
 
 
 def test_metadata_carries_causal():
@@ -278,7 +385,9 @@ def test_metadata_carries_causal():
     end-to-end despite correct kernels.
     """
     from vllm.v1.attention.backend import CommonAttentionMetadata
-    from vllm.v1.attention.backends.rdna_attn import RdnaAttentionMetadata
+    from vllm.v1.attention.backends.rdna_attn import (
+        RdnaAttentionMetadataBuilder,
+    )
 
     cm = CommonAttentionMetadata(
         query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
@@ -291,8 +400,10 @@ def test_metadata_carries_causal():
         block_table_tensor=torch.zeros(1, 1, dtype=torch.int32),
         slot_mapping=torch.zeros(2, dtype=torch.int64),
     )
-    meta = RdnaAttentionMetadata.from_common(cm)
-    assert getattr(meta, "causal", None) is True
+    builder = RdnaAttentionMetadataBuilder.__new__(
+        RdnaAttentionMetadataBuilder)
+    meta = builder.build(0, cm)
+    assert meta.causal is True
 
 
 if __name__ == "__main__":
@@ -317,9 +428,19 @@ if __name__ == "__main__":
     results.append(("prefill  D=256 multiseq",
                     _run(test_prefill_varlen_d256_multiseq)))
     results.append(("metadata causal", _run(test_metadata_carries_causal)))
-    for kernel in ("general", "splitk", "short"):
+    for kernel in ("general", "splitk", "short", "gqa"):
         results.append((f"prefill  chunked-offset {kernel}",
                         _run(test_prefill_chunked_offset, kernel)))
+        results.append((f"prefill  sliding-window {kernel}",
+                        _run(test_prefill_sliding_window, kernel)))
+    for layout in ("dense", "interleaved"):
+        results.append((f"prefill  gqa multiseq {layout}",
+                        _run(test_prefill_gqa_d256_multiseq, layout)))
+    for kernel in ("decode", "gqa", "short"):
+        results.append((f"scale+out {kernel}",
+                        _run(test_custom_scale_into_out, kernel)))
+    results.append(("decode   empty rows",
+                    _run(test_decode_empty_rows_are_zero)))
     for name, res in results:
         print(f"{name}: {res}", flush=True)
     if any(r != "PASS" for _, r in results):

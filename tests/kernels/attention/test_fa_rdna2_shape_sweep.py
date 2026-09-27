@@ -3,19 +3,17 @@
 """Comprehensive shape sweep correctness harness for fa_rdna2 kernels.
 
 Tests each public kernel wrapper from vllm.v1.attention.ops.fa_rdna2_backend
-against a streaming fp32 reference across:
+(the registered torch.ops._rocm_C.fa_rdna2_* ops) against a streaming fp32
+reference across:
 - HEAD_DIM = 128 and 256
 - causal / noncausal
 - sliding window (where supported)
 
 Run via:
-    HIP_VISIBLE_DEVICES=2,4 python tests/kernels/attention/test_fa_rdna2_shape_sweep.py
+    pytest tests/kernels/attention/test_fa_rdna2_shape_sweep.py
 """
-import pathlib
-
 import pytest
 import torch
-from torch.utils.cpp_extension import load_inline
 
 # These tests only run on AMD RDNA2 hardware (gfx1030).
 pytestmark = pytest.mark.skipif(
@@ -23,70 +21,11 @@ pytestmark = pytest.mark.skipif(
     reason="Requires AMD RDNA2 (gfx1030) GPU",
 )
 
-_CU_PATH = (
-    pathlib.Path(__file__).resolve().parents[4]
-    / "csrc" / "rocm" / "fa_rdna2.cu"
-)
-assert _CU_PATH.is_file(), f"fa_rdna2.cu not found at {_CU_PATH}"
-_CUDA_SRC = _CU_PATH.read_text()
-
-_CPP_SRC = """
-torch::Tensor fa_rdna2_decode_paged(torch::Tensor Q, torch::Tensor key_cache,
-                                    torch::Tensor value_cache,
-                                    torch::Tensor block_table,
-                                    torch::Tensor seq_lens,
-                                    int64_t block_size, int64_t kv_splits,
-                                    int64_t sliding_window);
-torch::Tensor fa_rdna2_prefill_paged_varlen(torch::Tensor Q, torch::Tensor key_cache,
-                                            torch::Tensor value_cache,
-                                            torch::Tensor block_table,
-                                            torch::Tensor cu_query_lens,
-                                            torch::Tensor seq_lens,
-                                            int64_t block_size,
-                                            int64_t causal,
-                                            int64_t sliding_window);
-torch::Tensor fa_rdna2_prefill_paged_varlen_short(torch::Tensor Q,
-                                                  torch::Tensor key_cache,
-                                                  torch::Tensor value_cache,
-                                                  torch::Tensor block_table,
-                                                  torch::Tensor cu_query_lens,
-                                                  torch::Tensor seq_lens,
-                                                  int64_t block_size,
-                                                  int64_t causal,
-                                                  int64_t sliding_window);
-torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(torch::Tensor Q,
-                                                  torch::Tensor key_cache,
-                                                  torch::Tensor value_cache,
-                                                  torch::Tensor block_table,
-                                                  torch::Tensor cu_query_lens,
-                                                  torch::Tensor seq_lens,
-                                                  int64_t block_size,
-                                                  int64_t causal,
-                                                  int64_t kv_splits,
-                                                  int64_t sliding_window);
-"""
-
-
-_ext = None
+from vllm.v1.attention.ops import fa_rdna2_backend  # noqa: E402
 
 
 def _get_ext():
-    global _ext
-    if _ext is None:
-        _ext = load_inline(
-            name="test_fa_rdna2_shape_sweep",
-            cpp_sources=[_CPP_SRC],
-            cuda_sources=[_CUDA_SRC],
-            functions=[
-                "fa_rdna2_decode_paged",
-                "fa_rdna2_prefill_paged_varlen",
-                "fa_rdna2_prefill_paged_varlen_short",
-                "fa_rdna2_prefill_paged_varlen_splitk",
-            ],
-            extra_cuda_cflags=["-O3", "-std=c++17", "--offload-arch=gfx1030"],
-            verbose=False,
-        )
-    return _ext
+    return fa_rdna2_backend
 
 
 def _make_paged_kv(num_blocks, H_kv, D, block_size, x_dim, seed=0):
