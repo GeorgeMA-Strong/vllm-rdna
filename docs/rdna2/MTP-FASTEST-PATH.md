@@ -4,7 +4,8 @@ The exact configuration behind the numbers below, in reproduction order.
 
 ## Prerequisites
 
-- Fork branch `rdna_extras` at `70107560f` or later. It must include the
+- Fork branch `rdna_extras` at `22d6e3462` or later (two-shot `rdna_ar`
+  integration + the 20480 KiB gate default). It must include the
   draft-decode cudagraph fix `30632b2fa`; without it MTP≥1 loses 5–18 %.
 - venv built as `venv-7.14.0_0.28.0` (torch 2.12.0+rocm7.14.0, hip 7.14.60850,
   rocblas 5.5.0.cd957402). The shared rows are keyed to `librocblas.so.5`
@@ -25,7 +26,11 @@ MTP=0 bash scripts/serve_gfx1030_flashnext_mtp.sh   # plain decode (short prompt
 ```
 
 MTP=2 and the TunableOp rows are the launcher defaults. A healthy start logs
-`TunableOp lookup enabled for rocBLAS build f30bb442e9b5; tuning stays off`.
+`TunableOp lookup enabled for rocBLAS build f30bb442e9b5; tuning stays off`
+and `rdna_ar: one-shot all-reduce active (… max 20480 KB, oneshot 32 KB …)`.
+If the `rdna_ar` line says `disabled`, the gate is too small (the two-shot
+self-test fails below ~1 MiB) and the run silently falls back to RCCL, which
+costs ~5–10 % decode — keep `VLLM_RDNA_AR_MAX_KB` at 20480.
 A `WARNING` instead means the librocblas hash differs (rows are build-specific)
 or the rows are missing — serving still works with default FP16 algorithms.
 

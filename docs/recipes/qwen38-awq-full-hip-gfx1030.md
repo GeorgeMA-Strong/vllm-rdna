@@ -77,6 +77,9 @@ export NCCL_PROTO=Simple
 export RCCL_MSCCL_ENABLE=0
 export VLLM_FORCE_CUSTOM_ALL_REDUCE=0
 export VLLM_RDNA_AR=1
+# Older trees defaulted the gate to 64 KiB, which fails the two-shot boot
+# self-test and self-disables the backend; 20480 covers full prefill chunks.
+export VLLM_RDNA_AR_MAX_KB=20480
 # TRUE FULL is default-on. Stock custom AR copies into init-time IPC buffers.
 # VLLM_ROCM_TRUE_FULL=0  # only to restore FPP13 piecewise execute
 ```
