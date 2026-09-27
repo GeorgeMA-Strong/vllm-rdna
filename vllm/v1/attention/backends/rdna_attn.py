@@ -21,6 +21,7 @@ from typing import ClassVar
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers import hippihx_v1
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -281,6 +282,23 @@ class RdnaAttentionImpl(AttentionImpl):
         paged_block_size = key_cache.shape[3]
 
         if max_seqlen_q <= 1:
+            # hippihx V1 (VLLM_HIPPIHX=1): writes straight into `output`
+            # when its attention.fa_fdot2 plan is ready; otherwise the
+            # extras kernel below runs unchanged.
+            if hippihx_v1.enabled() and hippihx_v1.fa_fdot2_decode(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                block_table,
+                seqused_k,
+                output[:num_actual_tokens].view(
+                    num_actual_tokens, self.num_heads, self.head_size),
+                block_size=paged_block_size,
+                kv_splits=16,
+                sliding_window=sliding_window,
+                scale=self.scale,
+            ):
+                return output
             # kv_splits=16: sweep 2026-09-04 showed s16 >= s8 at every
             # (ctx, batch) cell for both D=256 geometries (Ornith
             # H_q16/H_kv4, Qwen3.8-27B-rank H_q6/H_kv1); decode CTAs are
