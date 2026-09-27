@@ -37,16 +37,19 @@ class DecodeLauncherTests(unittest.TestCase):
         self.assertEqual(profiled.returncode, 0, profiled.stderr)
         args = shlex.split(profiled.stdout)
         config = json.loads(args[args.index("--profiler-config") + 1])
-        self.assertEqual(
-            args[args.index("--profiler-config.torch_profiler_dir") + 1],
-            "/tmp/v620 trace",
-        )
+        self.assertEqual(config["torch_profiler_dir"], "/tmp/v620 trace")
         self.assertEqual(config["max_iterations"], 16)
         self.assertTrue(config["ignore_frontend"])
         for option in ("--speculative-config", "--compilation-config"):
             self.assertEqual(
                 args[args.index(option) + 1], normal[normal.index(option) + 1]
             )
+
+    def test_profiler_path_is_json_escaped(self):
+        path = '/tmp/trace "quoted" \\ newline\n tab\t'
+        args = shlex.split(self.launch(V620_PROFILE_DIR=path).stdout)
+        config = json.loads(args[args.index("--profiler-config") + 1])
+        self.assertEqual(config["torch_profiler_dir"], path)
 
 
 if __name__ == "__main__":
