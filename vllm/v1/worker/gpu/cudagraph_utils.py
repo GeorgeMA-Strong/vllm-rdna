@@ -199,6 +199,10 @@ class CudaGraphManager:
             return
 
         capture_sizes = sorted(capture_sizes)
+        # decode_query_len=1 (spec decode draft): a [3,6,12,24] ladder leaves
+        # >=7-req batches without a graph, so the draft step runs eager.
+        if self.decode_query_len == 1 and self.max_num_reqs not in capture_sizes:
+            capture_sizes = sorted({*capture_sizes, self.max_num_reqs})
         max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
