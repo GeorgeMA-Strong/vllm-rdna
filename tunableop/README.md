@@ -116,3 +116,10 @@ The second replays them on all four cards against FP32 references before writing
 the other three serving files. Run the full model's output checks and benchmark
 after qualification. Tuning may choose a different floating-point reduction
 order; retaining FP16 weights does not imply bit-identical outputs.
+
+## MTP rows (0.28.0 tree, venv-7.14.0_0.28.0)
+
+`rocblas-f30bb442e9b5/` adds 574 online-tuned FP16 rows per rank for the MTP
+verify batch shapes (M = 16/24/32) and the rest of the serving workload. See its
+`README.md` for the recipe and measured deltas (MTP-2 reaches 73.8 tok/s at
+8×16k/1k vs MTP-0's 67.3 once these rows are used).
