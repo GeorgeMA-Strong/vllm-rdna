@@ -63,6 +63,20 @@ def test_moe_skinny_decode_supported_accepts_expert_map():
     assert moe_skinny_decode_supported(**kwargs) is True
 
 
+@pytest.mark.parametrize("m", [1, 3, 6, 9, 12, 16])
+def test_moe_skinny_opt_in_covers_concurrent_mtp_rows(monkeypatch, m):
+    monkeypatch.setenv("VLLM_ROCM_MOE_SKINNY_MAX_M", "16")
+    assert moe_skinny_decode_supported(**{**_BASE, "num_tokens": m})
+
+
+@pytest.mark.parametrize("limit", [8, 16, 100])
+@pytest.mark.parametrize("m", [0, 8, 9, 16, 17])
+def test_moe_skinny_limit_preserves_native_bounds(monkeypatch, limit, m):
+    monkeypatch.setenv("VLLM_ROCM_MOE_SKINNY_MAX_M", str(limit))
+    expected = 1 <= m <= min(limit, 16)
+    assert moe_skinny_decode_supported(**{**_BASE, "num_tokens": m}) == expected
+
+
 def _pack_sequential_int4(w: torch.Tensor) -> torch.Tensor:
     """Pack K-sequential nibbles into int32: bits 4*j hold k=i*8+j."""
     rows, k = w.shape
