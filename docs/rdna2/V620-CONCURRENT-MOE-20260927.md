@@ -138,3 +138,17 @@ Model evidence: `bench-cap8-c3.json`, `bench-cap16-coding-c3.json`,
 the corresponding service logs, and before/after metrics in the same result
 directory. No full-VRAM long-session or multimodal stress test is claimed for
 this dispatch change. It remains opt-in; production promotion is separate.
+
+## Final service state
+
+After testing, the experimental services were stopped and the unchanged
+`v620-tp4-git.service` was restored. At 19:22 UTC its health check and a
+deterministic `2 + 2` completion passed. The API reported Intel AutoRound at
+`/home/george/v620-vllm/models/intel-autoround` with max length 262,144; the
+existing 64 GiB RAM-offload configuration and enabled boot service remain.
+The default runs its original KV-offload checkout, not this performance branch.
+
+Restoration recorded one automatic retry: the first start was refused by the
+overlap guard while an exiting process was still visible; ten seconds later
+the retry loaded successfully. PID 258139 then reached health without further
+restarts. `restored-models.json` and `restored-smoke.json` retain the API evidence.
