@@ -77,7 +77,9 @@ class DecodeLauncherTests(unittest.TestCase):
 
 class RawTraceTests(unittest.TestCase):
     def test_bounded_trace_restores_execute_model_after_two_steps(self):
-        worker = SimpleNamespace(rank=0, execute_model=lambda value: value + 1)
+        worker = V620DecodeTrace()
+        worker.rank = 0
+        worker.execute_model = lambda value: value + 1
         roctx = MagicMock()
         roctx.roctxProfilerResume.return_value = 0
         roctx.roctxProfilerPause.return_value = 0
@@ -91,7 +93,7 @@ class RawTraceTests(unittest.TestCase):
             patch.dict(sys.modules, {"torch": torch}),
             patch("ctypes.CDLL", return_value=roctx),
         ):
-            V620DecodeTrace.v620_start_decode_trace(worker, steps="2", delay="1")
+            worker.v620_start_decode_trace(steps="2", delay="1")
             self.assertEqual([worker.execute_model(n) for n in range(4)], [1, 2, 3, 4])
             result = json.loads((Path(path) / "steps-rank0.json").read_text())
             self.assertEqual(result["steps"], 2)
