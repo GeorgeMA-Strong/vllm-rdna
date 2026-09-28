@@ -112,6 +112,7 @@ exec "$runtime/bin/python" -m vllm.entrypoints.openai.api_server \
   --dtype float16 --max-model-len ${MAXLEN:-262144} --block-size 1024 \
   --max-num-seqs 8 --max-num-batched-tokens ${MAXBAT:-2048} \
   --long-prefill-token-threshold ${LPTH:-0} \
+  --prefill-schedule-interval ${PREFILL_INTERVAL:-1} \
   --kv-cache-memory-bytes 4026531840 \
   --compilation-config "{\"mode\":$compile_mode,\"cudagraph_mode\":\"$cg_mode\",\"cudagraph_capture_sizes\":$capture_sizes$cg_extra}" \
   "${spec_args[@]}" \
