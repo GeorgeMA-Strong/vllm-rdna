@@ -153,13 +153,9 @@ def _rdna2_w4a8_attempt(
     a_asum = torch.empty((num_tiles, g, mt), dtype=torch.int32, device=device)
     out = torch.empty((m, n), dtype=x_2d.dtype, device=device)
 
-    status = torch.ops._rocm_C.w4a8_act_quant_rdna2(
-        x_2d, group_size, a_i8, a_scale, a_asum
-    )
-    if status != 0:
-        return None
+    torch.ops._rocm_C.w4a8_act_quant_rdna2(x_2d, group_size, a_i8, a_scale, a_asum)
 
-    status = torch.ops._rocm_C.w4a8_gemm_rdna2(
+    return torch.ops._rocm_C.w4a8_gemm_rdna2(
         a_i8,
         w_q,
         w_zp,
@@ -173,9 +169,6 @@ def _rdna2_w4a8_attempt(
         W4A8_DEFAULT_CONFIG_ID,
         W4A8_DEFAULT_SPLIT_K,
     )
-    if status != 0:
-        return None
-    return out
 
 
 def _rdna2_w4a16_select_kernel(
