@@ -135,6 +135,8 @@ def _rdna2_w4a8_attempt(
     """Run the W4A8 prefill path; return the output tensor or None on fallback.
 
     Allocates A buffers per call (the prefill M is small, see the doc).
+    Branch-free on purpose: eligibility was decided before the call, and dynamo
+    treats any test on an op result inside the traced forward as data-dependent.
     The split-K accumulator uses packed-fp16 CAS atomics which are
     order-dependent; default split_k=1 uses plain stores so we can pass
     ``torch.empty`` for the output. Callers fall back to
