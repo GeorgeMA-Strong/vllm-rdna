@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.compilation.breakable_cudagraph import (
     eager_break_during_capture,
 )
@@ -46,9 +47,13 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayout,
+    KVCacheSpec,
     KVQuantMode,
     get_kv_quant_mode,
 )
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -78,6 +83,10 @@ def _gqa_mode() -> str:
         except OSError:
             pass
     return os.environ.get("VLLM_FA_RDNA2_GQA_MODE", "subgroup")
+
+
+def _split_decode_enabled() -> bool:
+    return os.environ.get("VLLM_FA_RDNA2_SPLIT_DECODE", "1") == "1"
 
 
 _fa_rdna2_module = None
@@ -124,7 +133,17 @@ class RdnaAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    # Decode-first split: the leading num_decodes requests (num_decode_tokens
+    # tokens, including spec-decode verify rows and short extends) run the
+    # split-K decode kernel, the rest a prefill kernel over
+    # prefill_query_start_loc (rebased to the first prefill token).
+    prefill_query_start_loc: torch.Tensor
+    max_prefill_seq_len: int
     causal: bool = True
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+    # None for single-token decode batches.
+    decode_query_start_loc: torch.Tensor | None = None
 
 
 class RdnaAttentionMetadataBuilder(
@@ -139,6 +158,21 @@ class RdnaAttentionMetadataBuilder(
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        if _split_decode_enabled():
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> AttentionCGSupport:
+        if (
+            _split_decode_enabled()
+            and os.environ.get("VLLM_FA_RDNA2_VERIFY_FULL_GRAPH", "1") == "1"
+        ):
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
 
     def build(
         self,
@@ -146,28 +180,49 @@ class RdnaAttentionMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> RdnaAttentionMetadata:
-        causal = common_attn_metadata.causal
+        cm = common_attn_metadata
+        causal = cm.causal
         if isinstance(causal, torch.Tensor):
             causal = bool(causal.all())
-        return RdnaAttentionMetadata(
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            max_query_len=common_attn_metadata.max_query_len,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            max_seq_len=common_attn_metadata.max_seq_len,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_table=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
+        meta = RdnaAttentionMetadata(
+            num_actual_tokens=cm.num_actual_tokens,
+            max_query_len=cm.max_query_len,
+            query_start_loc=cm.query_start_loc,
+            max_seq_len=cm.max_seq_len,
+            seq_lens=cm.seq_lens,
+            block_table=cm.block_table_tensor,
+            slot_mapping=cm.slot_mapping,
             causal=causal,
+            prefill_query_start_loc=cm.query_start_loc,
+            max_prefill_seq_len=cm.max_seq_len,
         )
+        if cm.max_query_len <= 1:
+            meta.num_decodes = cm.num_reqs
+            meta.num_decode_tokens = cm.num_actual_tokens
+            return meta
+        if self.reorder_batch_threshold is None or not causal:
+            return meta
+        nd, _, nd_tok, _ = split_decodes_and_prefills(
+            cm, decode_threshold=self.reorder_batch_threshold
+        )
+        if nd_tok == 0:
+            return meta
+        meta.num_decodes = nd
+        meta.num_decode_tokens = nd_tok
+        meta.decode_query_start_loc = cm.query_start_loc[: nd + 1]
+        if nd < cm.num_reqs:
+            meta.prefill_query_start_loc = cm.query_start_loc[nd:] - nd_tok
+            upper = cm.seq_lens_cpu_upper_bound
+            if upper is not None and upper.shape[0] > nd:
+                meta.max_prefill_seq_len = int(upper[nd:].max())
+        return meta
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> RdnaAttentionMetadata:
         attn_metadata = self.build(0, common_attn_metadata)
-        # seq_lens=1 keeps capture fast; replay writes the real values.
-        # query_start_loc keeps its capture pattern (uniform decodes are
-        # 1, 2, 4 or 8 * decode_width tokens, so cu is stable per graph).
         attn_metadata.seq_lens.fill_(1)
+        common_attn_metadata.query_start_loc.zero_()
         return attn_metadata
 
 
@@ -262,8 +317,6 @@ class RdnaAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         seqused_k = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
-        max_seqlen_k = attn_metadata.max_seq_len
-        cu_seqlens_q = attn_metadata.query_start_loc
 
         # FA-RDNA2 + MTP-verify has known online-softmax split-K drift
         # versus the Triton fallback; the prior gate used a `max_seqlen_q
@@ -293,7 +346,8 @@ class RdnaAttentionImpl(AttentionImpl):
         # The kernels write straight into the layer output (no copy kernel).
         out = output[:num_actual_tokens].view(
             num_actual_tokens, self.num_heads, self.head_size)
-        dst = out if out.is_contiguous() else None
+        dst = out if out.is_contiguous() else torch.empty(
+            out.shape, dtype=out.dtype, device=out.device)
 
         if max_seqlen_q <= 1:
             # hippihx V1 (VLLM_HIPPIHX=1): writes straight into `output`
@@ -318,7 +372,7 @@ class RdnaAttentionImpl(AttentionImpl):
             # H_q16/H_kv4, Qwen3.8-27B-rank H_q6/H_kv1); decode CTAs are
             # few (B*H_q) so more splits = more occupancy, and the
             # combine stage costs <10 us.
-            out_paged = fa.fa_rdna2_decode_paged(
+            fa.fa_rdna2_decode_paged(
                 q,
                 key_cache,
                 value_cache,
@@ -331,129 +385,151 @@ class RdnaAttentionImpl(AttentionImpl):
                 out=dst,
             )
         else:
-            _num_seqs = seqused_k.size(0)
-            # Uniform short causal batches (MTP verify, tail chunks): token i
-            # of a sequence with query length L attends to keys
-            # [0, S - (L - 1 - i)), which is exactly a single-token decode.
-            # Per-position decode calls reuse the validated decode kernel
-            # instead of walking the context with a prefill kernel.
-            if (dst is not None and 1 < max_seqlen_q <= 8
-                    and num_actual_tokens == _num_seqs * max_seqlen_q):
-                for _i in range(max_seqlen_q):
-                    _qi = q[_i::max_seqlen_q].contiguous()
-                    _si = (seqused_k - (max_seqlen_q - 1 - _i)).to(torch.int32)
-                    _di = torch.empty_like(_qi)
-                    fa.fa_rdna2_decode_paged(
-                        _qi,
-                        key_cache,
-                        value_cache,
-                        block_table,
-                        _si,
-                        paged_block_size,
-                        kv_splits=16,
-                        sliding_window=sliding_window,
-                        scale=self.scale,
-                        out=_di,
-                    )
-                    out[_i::max_seqlen_q].copy_(_di)
-                return output
-            _kv_splits = min(8, (max_seqlen_k + 1023) // 1024)
-            if os.environ.get("VLLM_BT_DEBUG", "0") == "1" and max_seqlen_k >= 784:
-                try:
-                    _kb = key_cache
-                    _nblk = min(8, block_table.shape[1])
-                    _bt = (
-                        block_table[:1, :_nblk].tolist()
-                        if block_table.numel()
-                        else []
-                    )
-                    _kmax = (
-                        float(_kb[_bt[0][:4]].abs().max().item())
-                        if _bt and _bt[0][:4] and _kb.shape[0] > max(_bt[0][:4])
-                        else -1.0
-                    )
-                    with open("/tmp/fa_kv.log", "a") as _f:
-                        _f.write(
-                            f"nat={num_actual_tokens} seqk={max_seqlen_k} "
-                            f"bs={paged_block_size} bt={_bt} kv_absmax={_kmax} "
-                            f"kc_ptr={key_cache.data_ptr()}\n"
-                        )
-                except Exception:
-                    pass
             if not attn_metadata.causal:
                 raise NotImplementedError(
                     "RDNA_ATTN: non-causal prefill not supported")
-            if max_seqlen_k < 4096 and self.head_size == 128:
-                out_paged = fa.fa_rdna2_prefill_paged_varlen_short(
-                    q,
+            nd = attn_metadata.num_decodes
+            nd_tok = attn_metadata.num_decode_tokens
+            if nd_tok:
+                # Verify rows and short extends: one split-K CTA group per
+                # query token instead of one prefill CTA walking the whole
+                # KV range per 16-64 query rows.
+                fa.fa_rdna2_decode_paged(
+                    q[:nd_tok],
                     key_cache,
                     value_cache,
-                    block_table,
-                    cu_seqlens_q,
-                    seqused_k,
+                    block_table[:nd],
+                    seqused_k[:nd],
                     paged_block_size,
-                    causal=True,
+                    kv_splits=16,
                     sliding_window=sliding_window,
                     scale=self.scale,
-                    out=dst,
+                    out=dst[:nd_tok],
+                    cu_query_lens=attn_metadata.decode_query_start_loc,
                 )
-            elif (self.head_size == 256
-                    and self.num_kv_heads
-                    and self.num_heads % self.num_kv_heads == 0
-                    and self.num_heads // self.num_kv_heads % 2 == 0
-                    and self.num_heads // self.num_kv_heads >= 2
-                    and _gqa_mode() == "subgroup"):
-                # 2 heads per CTA, (GROUP/2) CTAs per (q_block, h_kv).
-                if os.environ.get("VLLM_FA_RDNA2_GQA_DEBUG") == "1":
-                    print(f"[gqa-dispatch] mode=subgroup max_seqlen_k={max_seqlen_k} "
-                          f"heads={self.num_heads} kv_heads={self.num_kv_heads}",
-                          flush=True)
-                out_paged = fa.fa_rdna2_prefill_paged_varlen_gqa(
-                    q,
+            if nd_tok < num_actual_tokens:
+                self._forward_prefill(
+                    q[nd_tok:],
                     key_cache,
                     value_cache,
-                    block_table,
-                    cu_seqlens_q,
-                    seqused_k,
+                    block_table[nd:],
+                    attn_metadata.prefill_query_start_loc,
+                    seqused_k[nd:],
+                    attn_metadata.max_prefill_seq_len,
                     paged_block_size,
-                    causal=True,
-                    sliding_window=sliding_window,
-                    scale=self.scale,
-                    out=dst,
+                    sliding_window,
+                    dst[nd_tok:],
                 )
-            elif (_kv_splits >= 2 and _num_seqs <= 4
-                    and self.num_heads * _kv_splits >= 64):
-                out_paged = fa.fa_rdna2_prefill_paged_varlen_splitk(
-                    q,
-                    key_cache,
-                    value_cache,
-                    block_table,
-                    cu_seqlens_q,
-                    seqused_k,
-                    paged_block_size,
-                    causal=True,
-                    kv_splits=_kv_splits,
-                    sliding_window=sliding_window,
-                    scale=self.scale,
-                    out=dst,
-                )
-            else:
-                out_paged = fa.fa_rdna2_prefill_paged_varlen(
-                    q,
-                    key_cache,
-                    value_cache,
-                    block_table,
-                    cu_seqlens_q,
-                    seqused_k,
-                    paged_block_size,
-                    causal=True,
-                    sliding_window=sliding_window,
-                    scale=self.scale,
-                    out=dst,
-                )
-        if dst is None:
-            out.copy_(out_paged)
+        if dst is not out:
+            out.copy_(dst)
         return output
+
+    def _forward_prefill(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        max_seqlen_k: int,
+        paged_block_size: int,
+        sliding_window: int,
+        dst: torch.Tensor,
+    ) -> None:
+        fa = _get_fa_rdna2_module()
+        _num_seqs = seqused_k.size(0)
+        _kv_splits = min(8, (max_seqlen_k + 1023) // 1024)
+        if os.environ.get("VLLM_BT_DEBUG", "0") == "1" and max_seqlen_k >= 784:
+            try:
+                _kb = key_cache
+                _nblk = min(8, block_table.shape[1])
+                _bt = (
+                    block_table[:1, :_nblk].tolist()
+                    if block_table.numel()
+                    else []
+                )
+                _kmax = (
+                    float(_kb[_bt[0][:4]].abs().max().item())
+                    if _bt and _bt[0][:4] and _kb.shape[0] > max(_bt[0][:4])
+                    else -1.0
+                )
+                with open("/tmp/fa_kv.log", "a") as _f:
+                    _f.write(
+                        f"nat={q.shape[0]} seqk={max_seqlen_k} "
+                        f"bs={paged_block_size} bt={_bt} kv_absmax={_kmax} "
+                        f"kc_ptr={key_cache.data_ptr()}\n"
+                    )
+            except Exception:
+                pass
+        if max_seqlen_k < 4096 and self.head_size == 128:
+            fa.fa_rdna2_prefill_paged_varlen_short(
+                q,
+                key_cache,
+                value_cache,
+                block_table,
+                cu_seqlens_q,
+                seqused_k,
+                paged_block_size,
+                causal=True,
+                sliding_window=sliding_window,
+                scale=self.scale,
+                out=dst,
+            )
+        elif (self.head_size == 256
+                and self.num_kv_heads
+                and self.num_heads % self.num_kv_heads == 0
+                and self.num_heads // self.num_kv_heads % 2 == 0
+                and self.num_heads // self.num_kv_heads >= 2
+                and _gqa_mode() == "subgroup"):
+            # 2 heads per CTA, (GROUP/2) CTAs per (q_block, h_kv).
+            if os.environ.get("VLLM_FA_RDNA2_GQA_DEBUG") == "1":
+                print(f"[gqa-dispatch] mode=subgroup max_seqlen_k={max_seqlen_k} "
+                      f"heads={self.num_heads} kv_heads={self.num_kv_heads}",
+                      flush=True)
+            fa.fa_rdna2_prefill_paged_varlen_gqa(
+                q,
+                key_cache,
+                value_cache,
+                block_table,
+                cu_seqlens_q,
+                seqused_k,
+                paged_block_size,
+                causal=True,
+                sliding_window=sliding_window,
+                scale=self.scale,
+                out=dst,
+            )
+        elif (_kv_splits >= 2 and _num_seqs <= 4
+                and self.num_heads * _kv_splits >= 64):
+            fa.fa_rdna2_prefill_paged_varlen_splitk(
+                q,
+                key_cache,
+                value_cache,
+                block_table,
+                cu_seqlens_q,
+                seqused_k,
+                paged_block_size,
+                causal=True,
+                kv_splits=_kv_splits,
+                sliding_window=sliding_window,
+                scale=self.scale,
+                out=dst,
+            )
+        else:
+            fa.fa_rdna2_prefill_paged_varlen(
+                q,
+                key_cache,
+                value_cache,
+                block_table,
+                cu_seqlens_q,
+                seqused_k,
+                paged_block_size,
+                causal=True,
+                sliding_window=sliding_window,
+                scale=self.scale,
+                out=dst,
+            )
 
     forward_includes_kv_cache_update: bool = False
 

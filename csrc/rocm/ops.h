@@ -129,7 +129,8 @@ void fa_rdna2_decode_paged(torch::Tensor Q, torch::Tensor key_cache,
                            torch::Tensor value_cache, torch::Tensor block_table,
                            torch::Tensor seq_lens, int64_t block_size,
                            int64_t kv_splits, int64_t sliding_window,
-                           double scale, torch::Tensor out);
+                           double scale, torch::Tensor out,
+                           c10::optional<torch::Tensor> cu_query_lens);
 
 void fa_rdna2_prefill_paged_varlen(torch::Tensor Q, torch::Tensor key_cache,
                                    torch::Tensor value_cache,

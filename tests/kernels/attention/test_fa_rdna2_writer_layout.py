@@ -52,11 +52,11 @@ from vllm.v1.attention.backends.rdna_attn import (  # noqa: E402
 from vllm.v1.attention.ops import fa_rdna2_backend as fa  # noqa: E402
 
 
-def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense"):
+def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense", raw=False):
     """Allocate the production [2, nb, H_kv, D, bs] cache and fill it via
     the real writer. Returns (key_cache5d, value_cache5d, block_table,
     per_seq_kv) where per_seq_kv[s] = (K[sl, H_kv, D], V[sl, H_kv, D])
-    raw fp16 inputs for the reference.
+    raw fp16 inputs for the reference; raw=True prepends the cache itself.
 
     layout="dense": contiguous [2, nb, ...] (dense-model allocation).
     layout="interleaved": [nb, 2, ...] contiguous permuted to [2, nb, ...]
@@ -110,6 +110,8 @@ def _fill_cache(seq_lens, H_kv, D, bs, seed, layout="dense"):
                                        slot_mapping, "auto", ones, ones)
 
     value_cache5 = _reinterpret_v_to_5d(key_cache, value_cache, D)
+    if raw:
+        return kv_cache, key_cache, value_cache5, block_table.cuda(), per_seq_kv
     return key_cache, value_cache5, block_table.cuda(), per_seq_kv
 
 
@@ -376,6 +378,108 @@ def test_decode_empty_rows_are_zero():
     assert (out[1] == 0).all()
 
 
+# Spec-decode verify rows and short extends through the decode kernel: with
+# cu_query_lens, request s owns queries cu[s]..cu[s+1]-1 at its last
+# positions (causal). A zero-length padded request and tokens past cu[-1]
+# (graph padding) must come out as zeros.
+@pytest.mark.parametrize("D,H_q,H_kv,bs", [(256, 24, 4, 784), (128, 16, 4, 16)])
+@pytest.mark.parametrize("window", [0, 50])
+def test_decode_multi_token_queries(D, H_q, H_kv, bs, window):
+    seq_lens_l, q_lens = [700, 1000, 33, 3, 2600, 0], [1, 3, 2, 3, 4, 0]
+    kc, vc, bt, per_seq_kv = _fill_cache(seq_lens_l, H_kv, D, bs, seed=13)
+    cu_l = [0]
+    for n in q_lens:
+        cu_l.append(cu_l[-1] + n)
+    torch.manual_seed(13)
+    Q = torch.randn(cu_l[-1] + 2, H_q, D, dtype=torch.float16, device="cuda")
+    cu = torch.tensor(cu_l, dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor(seq_lens_l, dtype=torch.int32, device="cuda")
+    out = fa.fa_rdna2_decode_paged(Q, kc, vc, bt, seq_lens, bs, 16, window,
+                                   cu_query_lens=cu)
+    ref = _ref_attention(Q, per_seq_kv, cu_l, H_kv, causal=True,
+                         sliding_window=window)
+    err = _max_rel_err(out, ref)
+    assert err < 5e-3, f"multi-token decode D={D}: max_rel_err={err}"
+    assert (out[cu_l[-1]:] == 0).all()
+
+
+def _common_metadata(q_lens, seq_lens, block_table, device="cuda"):
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    cu = [0]
+    for n in q_lens:
+        cu.append(cu[-1] + n)
+    return CommonAttentionMetadata(
+        query_start_loc=torch.tensor(cu, dtype=torch.int32, device=device),
+        query_start_loc_cpu=torch.tensor(cu, dtype=torch.int32),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        num_reqs=len(q_lens),
+        num_actual_tokens=cu[-1],
+        max_query_len=max(q_lens),
+        max_seq_len=max(seq_lens),
+        block_table_tensor=block_table,
+        slot_mapping=torch.zeros(cu[-1], dtype=torch.int64, device=device),
+        seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
+    )
+
+
+def _builder(reorder_batch_threshold):
+    from vllm.v1.attention.backends.rdna_attn import (
+        RdnaAttentionMetadataBuilder,
+    )
+
+    builder = RdnaAttentionMetadataBuilder.__new__(
+        RdnaAttentionMetadataBuilder)
+    builder.reorder_batch_threshold = reorder_batch_threshold
+    return builder
+
+
+# Decode-first split: requests up to the reorder threshold (verify rows, short
+# extends) go to the decode kernel, the rest to a prefill kernel whose
+# query_start_loc is rebased to its first token.
+def test_builder_splits_decode_first():
+    cm = _common_metadata([1, 3, 2, 50, 7], [9000, 900, 40, 60, 3000],
+                          torch.zeros(5, 1, dtype=torch.int32), device="cpu")
+    meta = _builder(3).build(0, cm)
+    assert (meta.num_decodes, meta.num_decode_tokens) == (3, 6)
+    assert meta.decode_query_start_loc.tolist() == [0, 1, 4, 6]
+    assert meta.prefill_query_start_loc.tolist() == [0, 50, 57]
+    assert meta.max_prefill_seq_len == 3000
+    # No reorder threshold (split disabled): the whole batch is prefill.
+    meta = _builder(None).build(0, cm)
+    assert meta.num_decode_tokens == 0
+    assert meta.prefill_query_start_loc is cm.query_start_loc
+
+
+# RDNA_ATTN forward on a decode-first batch, split on (threshold 3, i.e. two
+# speculative tokens) and off: a mixed batch (decode, verify, short extend,
+# chunk behind a prefix, fresh prompt) and a verify-only batch.
+@pytest.mark.parametrize("D,H_q,H_kv,bs", [(256, 24, 4, 784), (128, 16, 4, 16)])
+@pytest.mark.parametrize("batch", ["mixed", "verify"])
+@pytest.mark.parametrize("threshold", [None, 3])
+def test_forward_split_decode(D, H_q, H_kv, bs, batch, threshold):
+    from vllm.v1.attention.backends.rdna_attn import RdnaAttentionImpl
+
+    if batch == "mixed":
+        seq_lens_l, q_lens = [900, 1500, 40, 300, 64], [1, 3, 2, 100, 64]
+    else:
+        seq_lens_l, q_lens = [900, 1500, 40, 3000], [3, 3, 3, 3]
+    kv_cache, _, _, bt, per_seq_kv = _fill_cache(seq_lens_l, H_kv, D, bs,
+                                                 seed=21, raw=True)
+    cm = _common_metadata(q_lens, seq_lens_l, bt)
+    meta = _builder(threshold).build(0, cm)
+    impl = RdnaAttentionImpl(H_q, D, D**-0.5, H_kv, None, None, "auto")
+    torch.manual_seed(21)
+    Q = torch.randn(cm.num_actual_tokens, H_q, D, dtype=torch.float16,
+                    device="cuda")
+    out = torch.empty_like(Q)
+    impl.forward(None, Q, None, None, kv_cache.transpose(0, 1), meta, out)
+    cu_l = cm.query_start_loc_cpu.tolist()
+    ref = _ref_attention(Q, per_seq_kv, cu_l, H_kv, causal=True)
+    err = _max_rel_err(out, ref)
+    assert err < 5e-3, f"forward {batch} D={D} thr={threshold}: {err}"
+
+
 def test_metadata_carries_causal():
     """RdnaAttentionMetadata must propagate CommonAttentionMetadata.causal.
 
@@ -441,6 +545,18 @@ if __name__ == "__main__":
                         _run(test_custom_scale_into_out, kernel)))
     results.append(("decode   empty rows",
                     _run(test_decode_empty_rows_are_zero)))
+    for (D, H_q, H_kv, bs) in ((256, 24, 4, 784), (128, 16, 4, 16)):
+        for window in (0, 50):
+            results.append((f"decode   multi-token D={D} window={window}",
+                            _run(test_decode_multi_token_queries, D, H_q,
+                                 H_kv, bs, window)))
+        for batch in ("mixed", "verify"):
+            for threshold in (None, 3):
+                results.append((f"forward  {batch} D={D} thr={threshold}",
+                                _run(test_forward_split_decode, D, H_q, H_kv,
+                                     bs, batch, threshold)))
+    results.append(("builder  decode-first split",
+                    _run(test_builder_splits_decode_first)))
     for name, res in results:
         print(f"{name}: {res}", flush=True)
     if any(r != "PASS" for _, r in results):
