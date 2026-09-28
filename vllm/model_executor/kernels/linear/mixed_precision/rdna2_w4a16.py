@@ -103,6 +103,26 @@ def _rdna2_w4a8_eligible(c: MPLinearLayerConfig) -> bool:
     return True
 
 
+def _rdna2_w4a8_shape_ok(k: int, group_size: int) -> bool:
+    """Pre-call shape/LDS gate for the wired a8_lds_k32_ag config.
+
+    Decided from (k, group) only: dynamo must not see a post-call `is None`
+    test on an op result (it reports "Data-dependent branching"). Mirrors the
+    C++ gates: K must be 32- and group-aligned, and some group-aligned split
+    must bring M_TILE=8 rows of K plus the per-(token, group) scales under the
+    64 KiB LDS cap.
+    """
+    if k % 32 or k % group_size:
+        return False
+    groups = k // group_size
+    for split in range(16, 0, -1):
+        if groups % split:
+            continue
+        kps = k // split
+        return 8 * kps + 8 * (kps // group_size) * 8 <= 64 * 1024
+    return False
+
+
 def _rdna2_w4a8_attempt(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
@@ -390,14 +410,16 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         # zero_offset=1). uint4b8 is GPTQv1; uint4 is AWQ.
         use_v2_format = (c.weight_type == scalar_types.uint4)
 
-        output = None
-        if (kernel_name == "prefill"
-                and current_platform.is_rocm()
-                and on_gfx10x()
-                and _rdna2_w4a8_op_available()
-                and os.environ.get(W4A8_ENV_VAR) == "1"
-                and _rdna2_w4a8_eligible(c)):
-            zero_offset = 0 if use_v2_format else 1
+        w4a8_eligible = (
+            kernel_name == "prefill"
+            and current_platform.is_rocm()
+            and on_gfx10x()
+            and _rdna2_w4a8_op_available()
+            and os.environ.get(W4A8_ENV_VAR) == "1"
+            and _rdna2_w4a8_eligible(c)
+            and _rdna2_w4a8_shape_ok(k, c.group_size)
+        )
+        if w4a8_eligible:
             output = _rdna2_w4a8_attempt(
                 x_2d,
                 w_q,
@@ -405,17 +427,15 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
                 w_s,
                 n,
                 c.group_size,
-                zero_offset,
+                0 if use_v2_format else 1,
             )
-            if output is not None:
-                logger.info_once(
-                    "RDNA2 W4A16: W4A8 sdot4 prefill path active "
-                    "(config_id=%d, group=%d)",
-                    W4A8_DEFAULT_CONFIG_ID,
-                    c.group_size,
-                )
-
-        if output is None:
+            logger.info_once(
+                "RDNA2 W4A16: W4A8 sdot4 prefill path active "
+                "(config_id=%d, group=%d)",
+                W4A8_DEFAULT_CONFIG_ID,
+                c.group_size,
+            )
+        else:
             if kernel_name == "awq_prefill" and hasattr(
                     ops, "awq_gemm_rdna2_prefill"):
                 output = ops.awq_gemm_rdna2_prefill(
