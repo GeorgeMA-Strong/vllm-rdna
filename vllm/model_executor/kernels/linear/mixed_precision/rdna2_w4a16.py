@@ -103,6 +103,7 @@ def _rdna2_w4a8_eligible(c: MPLinearLayerConfig) -> bool:
     return True
 
 
+@torch._dynamo.disable
 def _rdna2_w4a8_attempt(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,

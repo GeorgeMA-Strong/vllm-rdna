@@ -84,8 +84,11 @@ torch::Tensor gptq_gemm_rdna2_prefill(torch::Tensor a, torch::Tensor b_q_weight,
 // [T][K/8][MT][8] tile layout the GEMM reads, with per-(token, group) f32
 // scales and int32 group sums. MT is fixed at 8 (config id 8's M tile).
 int64_t w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
-                         at::Tensor& a_i8, at::Tensor& a_scale,
-                         at::Tensor& a_asum);
+                             at::Tensor& a_i8, at::Tensor& a_scale,
+                             at::Tensor& a_asum);
+int64_t w4a8_act_quant_rdna2_meta(const at::Tensor& x, int64_t group_size,
+                                  at::Tensor& a_i8, at::Tensor& a_scale,
+                                  at::Tensor& a_asum);
 
 // W4A8 GEMM over the SAME packed W4 buffer RDNA2W4A16LinearKernel leaves
 // behind (zero-extended nibbles + gptq_shuffle). config_id 8 (a8_lds_k32_ag,
@@ -93,11 +96,18 @@ int64_t w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
 // zero_offset: 0 for AWQ uint4, 1 for GPTQv1 uint4b8. split_k <= 0 selects
 // via pick_split_k; split_k > 1 zero-fills fp16 out and uses pk CAS atomics.
 int64_t w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
-                    const at::Tensor& qzeros, const at::Tensor& scales,
-                    const at::Tensor& a_scale, const at::Tensor& asum,
-                    at::Tensor& out, int64_t k, int64_t group,
-                    int64_t zero_offset, int64_t config_id,
-                    int64_t split_k);
+                        const at::Tensor& qzeros, const at::Tensor& scales,
+                        const at::Tensor& a_scale, const at::Tensor& asum,
+                        at::Tensor& out, int64_t k, int64_t group,
+                        int64_t zero_offset, int64_t config_id,
+                        int64_t split_k);
+int64_t w4a8_gemm_rdna2_meta(const at::Tensor& a_i8, const at::Tensor& w_packed,
+                             const at::Tensor& qzeros,
+                             const at::Tensor& scales,
+                             const at::Tensor& a_scale,
+                             const at::Tensor& asum, at::Tensor& out,
+                             int64_t k, int64_t group, int64_t zero_offset,
+                             int64_t config_id, int64_t split_k);
 
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,

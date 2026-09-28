@@ -156,6 +156,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "w4a8_act_quant_rdna2(Tensor x, int group_size, Tensor(a!) a_i8, "
       "Tensor(a!) a_scale, Tensor(a!) a_asum) -> int");
   rocm_ops.impl("w4a8_act_quant_rdna2", torch::kCUDA, &w4a8_act_quant_rdna2);
+  rocm_ops.impl("w4a8_act_quant_rdna2", torch::kMeta, &w4a8_act_quant_rdna2_meta);
 
   rocm_ops.def(
       "w4a8_gemm_rdna2(Tensor a_i8, Tensor w_packed, Tensor qzeros, "
@@ -163,6 +164,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int k, int group, int zero_offset, int config_id, int split_k) "
       "-> int");
   rocm_ops.impl("w4a8_gemm_rdna2", torch::kCUDA, &w4a8_gemm_rdna2);
+  rocm_ops.impl("w4a8_gemm_rdna2", torch::kMeta, &w4a8_gemm_rdna2_meta);
 
   // Immortal hipMalloc workspace for GDN/FA eager 16k prefill. Never
   // returns pages to the caching allocator (FULL-graph poison).

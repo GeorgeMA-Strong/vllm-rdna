@@ -315,3 +315,39 @@ int64_t w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
                    out.scalar_type() == at::kFloat};
   return c->launch[gi](p, stream);
 }
+
+// Meta kernels: the V2 model runner profiles and captures with fake tensors, so
+// both ops need a Meta implementation that only reports success. Shapes are
+// validated by the CUDA entries above; nothing here touches data.
+int64_t w4a8_act_quant_rdna2_meta(const at::Tensor& x, int64_t group_size,
+                                  at::Tensor& a_i8, at::Tensor& a_scale,
+                                  at::Tensor& a_asum) {
+  (void)x;
+  (void)group_size;
+  (void)a_i8;
+  (void)a_scale;
+  (void)a_asum;
+  return 0;
+}
+
+int64_t w4a8_gemm_rdna2_meta(const at::Tensor& a_i8, const at::Tensor& w_packed,
+                             const at::Tensor& qzeros,
+                             const at::Tensor& scales,
+                             const at::Tensor& a_scale,
+                             const at::Tensor& asum, at::Tensor& out,
+                             int64_t k, int64_t group, int64_t zero_offset,
+                             int64_t config_id, int64_t split_k) {
+  (void)a_i8;
+  (void)w_packed;
+  (void)qzeros;
+  (void)scales;
+  (void)a_scale;
+  (void)asum;
+  (void)out;
+  (void)k;
+  (void)group;
+  (void)zero_offset;
+  (void)config_id;
+  (void)split_k;
+  return 0;
+}
