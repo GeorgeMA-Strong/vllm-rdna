@@ -25,6 +25,7 @@ import os
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
 )
@@ -34,6 +35,8 @@ from vllm.platforms.rocm import on_gfx10x
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+
+logger = init_logger(__name__)
 
 # W4A8 (int4 weights, int8 activations) prefill GEMM gate. Opt-in: the env
 # var must be exactly "1" for the dispatcher to try the W4A8 path. Default
@@ -404,6 +407,13 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
                 c.group_size,
                 zero_offset,
             )
+            if output is not None:
+                logger.info_once(
+                    "RDNA2 W4A16: W4A8 sdot4 prefill path active "
+                    "(config_id=%d, group=%d)",
+                    W4A8_DEFAULT_CONFIG_ID,
+                    c.group_size,
+                )
 
         if output is None:
             if kernel_name == "awq_prefill" and hasattr(
