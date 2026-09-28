@@ -5,29 +5,29 @@
 //
 // Opt-in drop-in replacement for the dense W4A16 prefill GEMM. Two torch ops:
 //
-//   w4a8_act_quant_rdna2(x, group_size, a_i8, a_scale, a_asum) -> int
+//   w4a8_act_quant_rdna2(x, group_size, a_i8, a_scale, a_asum) -> Tensor
 //     Per-(token, group) int8 quant of the fp16 activations plus per-token
 //     (or per-(token,group), per config) fp32 scales and per-group int32 sums,
-//     written in the tiled layout the GEMM below consumes.
+//     written in the tiled layout the GEMM below consumes. Returns the int8
+//     buffer on success or an empty tensor when ineligible (used by the
+//     standalone test).
 //
-//   w4a8_gemm_rdna2(a_i8, w_packed, qzeros, scales, a_scale, asum, out,
-//                   k, group, zero_offset, config_id, split_k) -> int
-//     Runs launch_gemm<Cfg> for the requested config; split_k <= 0 picks the
-//     group-aligned split with pick_split_k. Weights are the SAME packed buffer
-//     RDNA2W4A16LinearKernel already produces (zero-extended nibbles +
-//     gptq_shuffle); see reference.w4a16_rdna2_weights / exllama_shuffle.
+//   w4a8_gemm_rdna2(a, w_packed, qzeros, scales, b_g_idx, use_v2_format)
+//       -> Tensor
+//     Self-contained: allocates the int8 A, A scales, A group sums and the
+//     output internally, then fires the a8_lds_k32_ag GEMM or falls back to
+//     gptq_gemm_rdna2_prefill when the shape/LDS is not eligible. Weights are
+//     the SAME packed buffer RDNA2W4A16LinearKernel already produces
+//     (zero-extended nibbles + gptq_shuffle).
 //
 // The kernel body lives in the sibling header `w4a8_sdot4_rdna2.cuh`
 // (copied verbatim from the explore-only tree at
 // /tmp/pr9_branch/csrc/rocm/explore/w4a8_sdot4.cuh and renamed so the
 // production C ABI and its header are co-located; the source of truth stays
 // untouched per the "do not modify csrc/rocm/explore/* in place" rule).
-// This TU is the production wrapper: each op returns an int status — 0 on
-// success, a positive hipError_t, or a negative "not eligible" code
-// (kBadShape / kLdsTooBig / ...) so Python can fall back to
-// gptq_gemm_rdna2_prefill when the shape or LDS budget does not fit.
-// The M-vs-N threshold decision for routing stays INSIDE C++ (never branch
-// on x.size(0) in Python — that misroute cost gfx1100 7x decode).
+// This TU is the production wrapper: the gemm entry owns the shape/LDS
+// eligibility and its own internal W4A16 fallback, so Python never branches
+// on a runtime value in the traced forward.
 
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +40,13 @@
 #include <hip/hip_runtime.h>
 
 #include "w4a8_sdot4_rdna2.cuh"
+
+// Forward declaration — defined in csrc/rocm/q_gemm_rdna2_prefill.cu.
+torch::Tensor gptq_gemm_rdna2_prefill(torch::Tensor a, torch::Tensor b_q_weight,
+                                      torch::Tensor b_qzeros,
+                                      torch::Tensor b_scales,
+                                      torch::Tensor b_g_idx,
+                                      bool use_v2_format);
 
 namespace ex = vllm::explore_w4a8;
 
@@ -60,7 +67,9 @@ constexpr int kMaxSplit = 16;
 // 8-row M tile. This is the only A_GROUP tile among the explore sweep and the
 // one the G1/G2 accuracy numbers ("per-(token, G=64)") were measured with.
 constexpr int kDefaultConfigId = 8;  // a8_lds_k32_ag
-constexpr int kDefaultGroup = 64;
+// Prefill-only: decode (M < kW4a8MinRows) keeps the W4A16 arms; the wired
+// W4A8 config is a8_lds_k32_ag (M_TILE 8).
+constexpr int kW4a8MinRows = 33;
 
 bool on_gfx1030() {
   thread_local int cached_dev = -1;
@@ -86,6 +95,22 @@ int group_index(int64_t group_size) {
     default:
       return -1;
   }
+}
+
+// Mirror of pick_split_k's LDS cap: some group-aligned split <= 16 must bring
+// M_TILE=8 rows of K plus the per-(token, group) scales under 64 KiB of LDS.
+bool w4a8_lds_fits(int k, int group_size) {
+  const int groups = k / group_size;
+  for (int split = 16; split >= 1; --split) {
+    if (groups % split) {
+      continue;
+    }
+    const int kps = k / split;
+    if (8 * kps + 8 * (kps / group_size) * 8 <= 64 * 1024) {
+      return true;
+    }
+  }
+  return false;
 }
 
 struct GemmArgs {
@@ -192,7 +217,6 @@ struct ConfigEntry {
     &launch_gemm<W4A8_CFG(th, npt, ks, mt, 128, src, ag)>}},
 
 const ConfigEntry kConfigs[] = {W4A8_EXPLORE_CONFIGS(W4A8_ENTRY)};
-constexpr int kNumConfigs = sizeof(kConfigs) / sizeof(kConfigs[0]);
 
 const ConfigEntry* find_config(int id) {
   for (const ConfigEntry& c : kConfigs) {
@@ -258,75 +282,76 @@ at::Tensor w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
   return rc == 0 ? a_i8 : at::Tensor();
 }
 
-at::Tensor w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
-                    const at::Tensor& qzeros, const at::Tensor& scales,
-                    const at::Tensor& a_scale, const at::Tensor& asum,
-                    at::Tensor& out, int64_t k, int64_t group,
-                    int64_t zero_offset, int64_t config_id, int64_t split_k) {
-  if (!on_gfx1030()) {
-    return at::Tensor();
+at::Tensor w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
+                           torch::Tensor b_qzeros, torch::Tensor b_scales,
+                           torch::Tensor b_g_idx, bool use_v2_format) {
+  TORCH_CHECK(a.is_cuda(), "a must be a CUDA/HIP tensor");
+  TORCH_CHECK(a.dim() == 2, "a must be 2D [M, K]");
+  TORCH_CHECK(a.scalar_type() == at::kHalf,
+              "w4a8_gemm_rdna2 only supports fp16");
+
+  const int size_m = a.size(0);
+  const int size_k = a.size(1);
+  const int size_n = b_q_weight.size(1);
+  const int groups = b_qzeros.size(0);
+  const int group_size = groups > 0 ? size_k / groups : 0;
+  const bool has_g_idx = b_g_idx.numel() > 0;
+
+  // Eligibility gate — mirrors the Python pre-check (m >= kW4a8MinRows,
+  // k % 32 == 0, k % group_size == 0, LDS fits) plus the C++-only checks
+  // (gfx1030, fp16, g_idx-free, group 32/64/128, contiguous rows). The
+  // Python selector is only an optimisation; this entry always returns a
+  // correct [M, N] tensor, falling back to the W4A16 prefill internally.
+  const bool eligible =
+      on_gfx1030() && size_m >= kW4a8MinRows && !has_g_idx &&
+      size_k % 32 == 0 && group_index(group_size) >= 0 &&
+      size_k % group_size == 0 && a.stride(0) % 8 == 0 &&
+      a.stride(0) >= size_k && w4a8_lds_fits(size_k, group_size);
+
+  if (!eligible) {
+    return gptq_gemm_rdna2_prefill(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
+                                   use_v2_format);
   }
-  static_assert(kNumConfigs > 0, "empty W4A8 config table");
-  const int id = config_id > 0 ? static_cast<int>(config_id) : kDefaultConfigId;
-  const int grp = group > 0 ? static_cast<int>(group) : kDefaultGroup;
-  const ConfigEntry* c = find_config(id);
-  const int gi = group_index(grp);
-  if (!c) {
-    return at::Tensor();
-  }
-  if (gi < 0) {
-    return at::Tensor();
-  }
-  const at::cuda::OptionalCUDAGuard guard(out.device());
+
+  const at::cuda::OptionalCUDAGuard guard(a.device());
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  constexpr int kMTile = 8;
+  constexpr bool kPerGroup = true;
+  const int num_tiles = (size_m + kMTile - 1) / kMTile;
+  auto a_i8 = at::empty({num_tiles, size_k / 8, kMTile, 8},
+                        a.options().dtype(at::kChar));
+  auto a_scale = at::empty({num_tiles, groups, kMTile},
+                           a.options().dtype(at::kFloat));
+  auto a_asum = at::empty({num_tiles, groups, kMTile},
+                          a.options().dtype(at::kInt));
+  auto out = at::empty({size_m, size_n}, a.options());
+
+  const int zero_offset = use_v2_format ? 0 : 1;
+
+  if (launch_act_quant<kMTile, kPerGroup>(
+          a.data_ptr(), a.stride(0), a_i8.data_ptr(), a_scale.data_ptr(),
+          a_asum.data_ptr(), size_m, size_k, group_size, stream) != 0) {
+    return gptq_gemm_rdna2_prefill(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
+                                   use_v2_format);
+  }
+
+  const ConfigEntry* c = find_config(kDefaultConfigId);
+  const int gi = group_index(group_size);
   const GemmArgs p{static_cast<const int8_t*>(a_i8.data_ptr()),
-                   static_cast<const uint32_t*>(w_packed.data_ptr()),
-                   static_cast<const uint32_t*>(qzeros.data_ptr()),
-                   static_cast<const ex::f16_t*>(scales.data_ptr()),
+                   static_cast<const uint32_t*>(b_q_weight.data_ptr()),
+                   static_cast<const uint32_t*>(b_qzeros.data_ptr()),
+                   static_cast<const ex::f16_t*>(b_scales.data_ptr()),
                    static_cast<const float*>(a_scale.data_ptr()),
-                   static_cast<const int32_t*>(asum.data_ptr()),
+                   static_cast<const int32_t*>(a_asum.data_ptr()),
                    out.data_ptr(),
-                   static_cast<int>(out.size(0)),
-                   static_cast<int>(out.size(1)),
-                   static_cast<int>(k),
-                   static_cast<int>(zero_offset),
-                   static_cast<int>(split_k),
-                   out.scalar_type() == at::kFloat};
-  return c->launch[gi](p, stream) == 0 ? out : at::Tensor();
-}
+                   size_m, size_n, size_k, zero_offset,
+                   /*split_k=*/1, /*out_f32=*/0};
+  if (c->launch[gi](p, stream) != 0) {
+    return gptq_gemm_rdna2_prefill(a, b_q_weight, b_qzeros, b_scales, b_g_idx,
+                                   use_v2_format);
+  }
 
-// Meta kernels: the V2 model runner profiles and captures with fake tensors, so
-// both ops need a Meta implementation that only reports success. Shapes are
-// validated by the CUDA entries above; nothing here touches data.
-at::Tensor w4a8_act_quant_rdna2_meta(const at::Tensor& x, int64_t group_size,
-                                  at::Tensor& a_i8, at::Tensor& a_scale,
-                                  at::Tensor& a_asum) {
-  (void)x;
-  (void)group_size;
-  (void)a_i8;
-  (void)a_scale;
-  (void)a_asum;
-  return a_i8;
-}
-
-at::Tensor w4a8_gemm_rdna2_meta(const at::Tensor& a_i8, const at::Tensor& w_packed,
-                             const at::Tensor& qzeros,
-                             const at::Tensor& scales,
-                             const at::Tensor& a_scale,
-                             const at::Tensor& asum, at::Tensor& out,
-                             int64_t k, int64_t group, int64_t zero_offset,
-                             int64_t config_id, int64_t split_k) {
-  (void)a_i8;
-  (void)w_packed;
-  (void)qzeros;
-  (void)scales;
-  (void)a_scale;
-  (void)asum;
-  (void)out;
-  (void)k;
-  (void)group;
-  (void)zero_offset;
-  (void)config_id;
-  (void)split_k;
+  TORCH_WARN_ONCE("RDNA2 W4A8 sdot4 path active (config a8_lds_k32_ag)");
   return out;
 }

@@ -149,22 +149,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                 &gptq_gemm_rdna2_prefill);
 
   // W4A8 (int4 weights, int8 activations) prefill GEMM for gfx1030. Opt-in
-  // drop-in for the dense W4A16 prefill path; both return the primary output
-  // tensor, or an empty tensor when the shape/LDS budget is not eligible, so
-  // the dispatcher falls back to gptq_gemm_rdna2_prefill.
+  // drop-in for the dense W4A16 prefill path; the gemm entry returns a
+  // populated [M, N] fp16 tensor whether the W4A8 fast path fired or the
+  // W4A16 prefill fallback ran, so the dispatcher never branches on
+  // shape/LDS at runtime. Fake kernels live in _custom_ops.py (register_fake);
+  // there are no C++ meta stubs.
   rocm_ops.def(
       "w4a8_act_quant_rdna2(Tensor x, int group_size, Tensor(a!) a_i8, "
       "Tensor(a!) a_scale, Tensor(a!) a_asum) -> Tensor");
   rocm_ops.impl("w4a8_act_quant_rdna2", torch::kCUDA, &w4a8_act_quant_rdna2);
-  rocm_ops.impl("w4a8_act_quant_rdna2", torch::kMeta, &w4a8_act_quant_rdna2_meta);
 
   rocm_ops.def(
-      "w4a8_gemm_rdna2(Tensor a_i8, Tensor w_packed, Tensor qzeros, "
-      "Tensor scales, Tensor a_scale, Tensor asum, Tensor(a!) out, "
-      "int k, int group, int zero_offset, int config_id, int split_k) "
-      "-> Tensor");
+      "w4a8_gemm_rdna2(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
   rocm_ops.impl("w4a8_gemm_rdna2", torch::kCUDA, &w4a8_gemm_rdna2);
-  rocm_ops.impl("w4a8_gemm_rdna2", torch::kMeta, &w4a8_gemm_rdna2_meta);
 
   // Immortal hipMalloc workspace for GDN/FA eager 16k prefill. Never
   // returns pages to the caching allocator (FULL-graph poison).

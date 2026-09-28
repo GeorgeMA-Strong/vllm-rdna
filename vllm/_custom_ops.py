@@ -900,6 +900,64 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gptq_gemm_rdna2
         )
 
 
+def w4a8_act_quant_rdna2(
+    x: torch.Tensor,
+    group_size: int,
+    a_i8: torch.Tensor,
+    a_scale: torch.Tensor,
+    a_asum: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.w4a8_act_quant_rdna2(
+        x, group_size, a_i8, a_scale, a_asum
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "w4a8_act_quant_rdna2"
+):
+
+    @register_fake("_rocm_C::w4a8_act_quant_rdna2")
+    def _w4a8_act_quant_rdna2_fake(
+        x: torch.Tensor,
+        group_size: int,
+        a_i8: torch.Tensor,
+        a_scale: torch.Tensor,
+        a_asum: torch.Tensor,
+    ) -> torch.Tensor:
+        return a_i8
+
+
+def w4a8_gemm_rdna2(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_v2_format: bool,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.w4a8_gemm_rdna2(
+        a, b_q_weight, b_qzeros, b_scales, b_g_idx, use_v2_format
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "w4a8_gemm_rdna2"
+):
+
+    @register_fake("_rocm_C::w4a8_gemm_rdna2")
+    def _w4a8_gemm_rdna2_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_qzeros: torch.Tensor,
+        b_scales: torch.Tensor,
+        b_g_idx: torch.Tensor,
+        use_v2_format: bool,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device
+        )
+
+
 def moe_gptq_gemm_rdna2(
     a: torch.Tensor,
     c: torch.Tensor,

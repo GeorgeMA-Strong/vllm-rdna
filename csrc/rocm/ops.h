@@ -75,39 +75,28 @@ torch::Tensor gptq_gemm_rdna2_prefill(torch::Tensor a, torch::Tensor b_q_weight,
                                       bool use_v2_format);
 
 // W4A8 (int4 weights, int8 activations) prefill GEMM for gfx1030. Opt-in
-// drop-in for the dense W4A16 prefill; both return an int status
-// (0 = ok, a positive hipError_t, or a negative "not eligible" code) so
-// Python can fall back to gptq_gemm_rdna2_prefill. Definitions in
-// csrc/rocm/w4a8_sdot4_rdna2.cu.
+// drop-in for the dense W4A16 prefill. The gemm entry is self-contained and
+// returns a populated [M, N] fp16 tensor whether the W4A8 fast path fired or
+// the W4A16 prefill fallback ran (it owns the shape/LDS eligibility and the
+// internal fallback). Definitions in csrc/rocm/w4a8_sdot4_rdna2.cu.
 
 // Per-(token, group) int8 quant of fp16 activations x [M, K] into the
 // [T][K/8][MT][8] tile layout the GEMM reads, with per-(token, group) f32
 // scales and int32 group sums. MT is fixed at 8 (config id 8's M tile).
+// Returns the int8 buffer on success or an empty tensor when ineligible.
 at::Tensor w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
-                             at::Tensor& a_i8, at::Tensor& a_scale,
-                             at::Tensor& a_asum);
-at::Tensor w4a8_act_quant_rdna2_meta(const at::Tensor& x, int64_t group_size,
-                                  at::Tensor& a_i8, at::Tensor& a_scale,
-                                  at::Tensor& a_asum);
+                                at::Tensor& a_i8, at::Tensor& a_scale,
+                                at::Tensor& a_asum);
 
 // W4A8 GEMM over the SAME packed W4 buffer RDNA2W4A16LinearKernel leaves
-// behind (zero-extended nibbles + gptq_shuffle). config_id 8 (a8_lds_k32_ag,
-// GROUP=64) is the recommended default; groups 32 / 64 / 128 supported.
-// zero_offset: 0 for AWQ uint4, 1 for GPTQv1 uint4b8. split_k <= 0 selects
-// via pick_split_k; split_k > 1 zero-fills fp16 out and uses pk CAS atomics.
-at::Tensor w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
-                        const at::Tensor& qzeros, const at::Tensor& scales,
-                        const at::Tensor& a_scale, const at::Tensor& asum,
-                        at::Tensor& out, int64_t k, int64_t group,
-                        int64_t zero_offset, int64_t config_id,
-                        int64_t split_k);
-at::Tensor w4a8_gemm_rdna2_meta(const at::Tensor& a_i8, const at::Tensor& w_packed,
-                             const at::Tensor& qzeros,
-                             const at::Tensor& scales,
-                             const at::Tensor& a_scale,
-                             const at::Tensor& asum, at::Tensor& out,
-                             int64_t k, int64_t group, int64_t zero_offset,
-                             int64_t config_id, int64_t split_k);
+// behind (zero-extended nibbles + gptq_shuffle). Self-contained: allocates
+// the int8 A, A scales, A group sums and the output internally, fires the
+// a8_lds_k32_ag fast path, and falls back to gptq_gemm_rdna2_prefill when
+// the shape/LDS is not eligible. use_v2_format selects zero_offset (0 for
+// AWQ uint4, 1 for GPTQv1 uint4b8).
+at::Tensor w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
+                           torch::Tensor b_qzeros, torch::Tensor b_scales,
+                           torch::Tensor b_g_idx, bool use_v2_format);
 
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,

@@ -25,7 +25,6 @@ import os
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
 )
@@ -36,23 +35,17 @@ from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
-logger = init_logger(__name__)
-
 # W4A8 (int4 weights, int8 activations) prefill GEMM gate. Opt-in: the env
-# var must be exactly "1" for the dispatcher to try the W4A8 path. Default
-# is OFF, so unset (or any value other than "1") preserves the existing
-# gptq_gemm_rdna2_prefill behaviour byte-for-byte.
+# var must be exactly "1" at construction time (read once in
+# process_weights_after_loading) for the dispatcher to try the W4A8 path.
+# Default is OFF, so unset (or any value other than "1") preserves the
+# existing gptq_gemm_rdna2_prefill behaviour byte-for-byte.
 W4A8_ENV_VAR = "VLLM_RDNA2_W4A8_SDOT4"
-# a8_lds_k32_ag: A_GROUP config (per-(token, group) activation scales), MT=8,
-# K_STEP=32. Only A_GROUP config in the explore sweep; the G1/G2 accuracy
-# numbers ("per-(token, G=64)") were measured with it.
-W4A8_DEFAULT_CONFIG_ID = 8
-W4A8_DEFAULT_GROUP_SIZE = 64
-W4A8_DEFAULT_M_TILE = 8  # mirrors the M_TILE of the a8_lds_k32_ag config
-# split_k=1 — the default of the C++ launcher picks a group-aligned split, but
-# split_k>1 accumulates via packed-fp16 CAS atomics which is order-dependent
-# (the doc says: "split-K>1 default is OFF").
-W4A8_DEFAULT_SPLIT_K = 1
+# W4A8 is prefill-only: decode (M < W4A8_MIN_ROWS) keeps the W4A16 arms. The
+# wired config is a8_lds_k32_ag (config_id 8, GROUP 32/64/128, M_TILE 8);
+# those details live in the C++ entry, which owns the shape/LDS decisions and
+# the internal W4A16 fallback.
+W4A8_MIN_ROWS = 33
 
 
 def _awq_prefill_available() -> bool:
@@ -69,111 +62,40 @@ def _awq_prefill_available() -> bool:
         return False
 
 
-def _rdna2_w4a8_op_available() -> bool:
-    """Whether both w4a8_act_quant_rdna2 and w4a8_gemm_rdna2 are built in."""
-    try:
-        torch.ops._rocm_C.w4a8_act_quant_rdna2
-        torch.ops._rocm_C.w4a8_gemm_rdna2
-        return True
-    except AttributeError:
-        return False
+def _w4a8_lds_fits(k: int, group_size: int) -> bool:
+    """Mirror of pick_split_k: some group-aligned split <= 16 fits M_TILE=8
+    rows of K plus the per-(token, group) scales in 64 KiB of LDS.
 
-
-def _rdna2_w4a8_eligible(c: MPLinearLayerConfig) -> bool:
-    """Shape/quant gates; the C++ side enforces the same rules on the wire.
-
-    Mirrors the explore-side ``reference.eligibility`` minus the dense-FFN
-    layer-name filter (the dispatcher doesn't know the layer name and the
-    W4A16 dispatcher has already accepted the layer).
+    Decided from (k, group_size) only: dynamo must not see a data-dependent
+    branch on a runtime value in the traced forward.
     """
-    if c.weight_type not in (scalar_types.uint4, scalar_types.uint4b8):
-        return False
-    if c.act_type != torch.float16:
-        return False
-    if c.group_size not in (32, 64, 128):
-        return False
-    if c.full_weight_shape[0] % c.group_size != 0:
-        return False
-    if c.partition_weight_shape[1] % 8 != 0:
-        return False
-    # Act-order (g_idx) shuffles A on the fly; the W4A8 GEMM expects a
-    # contiguous, g_idx-free A and would read garbage. Fall back.
-    if c.has_g_idx:
-        return False
-    return True
-
-
-def _rdna2_w4a8_shape_ok(k: int, group_size: int) -> bool:
-    """Pre-call shape/LDS gate for the wired a8_lds_k32_ag config.
-
-    Decided from (k, group) only: dynamo must not see a post-call `is None`
-    test on an op result (it reports "Data-dependent branching"). Mirrors the
-    C++ gates: K must be 32- and group-aligned, and some group-aligned split
-    must bring M_TILE=8 rows of K plus the per-(token, group) scales under the
-    64 KiB LDS cap.
-    """
-    if k % 32 or k % group_size:
-        return False
     groups = k // group_size
     for split in range(16, 0, -1):
         if groups % split:
             continue
         kps = k // split
-        return 8 * kps + 8 * (kps // group_size) * 8 <= 64 * 1024
+        if 8 * kps + 8 * (kps // group_size) * 8 <= 64 * 1024:
+            return True
     return False
 
 
-def _rdna2_w4a8_attempt(
-    x_2d: torch.Tensor,
-    w_q: torch.Tensor,
-    w_zp: torch.Tensor,
-    w_s: torch.Tensor,
-    n: int,
-    group_size: int,
-    zero_offset: int,
-) -> torch.Tensor | None:
-    """Run the W4A8 prefill path; return the output tensor or None on fallback.
-
-    Allocates A buffers per call (the prefill M is small, see the doc).
-    Branch-free on purpose: eligibility was decided before the call, and dynamo
-    treats any test on an op result inside the traced forward as data-dependent.
-    The split-K accumulator uses packed-fp16 CAS atomics which are
-    order-dependent; default split_k=1 uses plain stores so we can pass
-    ``torch.empty`` for the output. Callers fall back to
-    ``gptq_gemm_rdna2_prefill`` whenever this returns None.
-    """
-    m, k = x_2d.shape
-    mt = W4A8_DEFAULT_M_TILE
-    num_tiles = (m + mt - 1) // mt
-    k8 = k // 8
-    g = k // group_size
-    device = x_2d.device
-    a_i8 = torch.empty((num_tiles, k8, mt, 8), dtype=torch.int8, device=device)
-    a_scale = torch.empty((num_tiles, g, mt), dtype=torch.float32, device=device)
-    a_asum = torch.empty((num_tiles, g, mt), dtype=torch.int32, device=device)
-    out = torch.empty((m, n), dtype=x_2d.dtype, device=device)
-
-    torch.ops._rocm_C.w4a8_act_quant_rdna2(x_2d, group_size, a_i8, a_scale, a_asum)
-
-    return torch.ops._rocm_C.w4a8_gemm_rdna2(
-        a_i8,
-        w_q,
-        w_zp,
-        w_s,
-        a_scale,
-        a_asum,
-        out,
-        k,
-        group_size,
-        zero_offset,
-        W4A8_DEFAULT_CONFIG_ID,
-        W4A8_DEFAULT_SPLIT_K,
-    )
-
-
 def _rdna2_w4a16_select_kernel(
-    m: int, k: int, n: int, is_awq: bool = False
+    m: int, k: int, n: int, is_awq: bool = False,
+    w4a8: bool = False, group_size: int = 64,
 ) -> str:
+    # Opt-in W4A8 (int4 x int8 sdot4) prefill fast path. Prefill-only:
+    # decode (M < W4A8_MIN_ROWS) keeps the W4A16 arms. Eligibility is decided
+    # from ints only so dynamo keeps the branch out of the traced region; the
+    # C++ entry owns the final shape/LDS decision and falls back to
+    # gptq_gemm_rdna2_prefill internally.
+    if (
+        w4a8
+        and m >= W4A8_MIN_ROWS
+        and k % 32 == 0
+        and k % group_size == 0
+        and _w4a8_lds_fits(k, group_size)
+    ):
+        return "w4a8_prefill"
     # M > 256: exllama is the clear winner for compute-bound GEMMs.
     # AWQ models route to GPTQ prefill (ConfigA for M > 256): the separate
     # AWQ prefill kernel has BLOCK_M=16 (fails on non-aligned chunked-prefill
@@ -375,6 +297,16 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
 
             self._transform_param(layer, self.w_zp_name, transform_w_zp)
 
+        # Resolve the W4A8 opt-in flag ONCE here; never read the env in the
+        # forward. The C++ entry owns the shape/LDS eligibility and its own
+        # internal fallback, so this flag is a pure opt-in (env + ops built).
+        try:
+            torch.ops._rocm_C.w4a8_gemm_rdna2
+            w4a8_ops_built = True
+        except AttributeError:
+            w4a8_ops_built = False
+        self._w4a8 = os.environ.get(W4A8_ENV_VAR) == "1" and w4a8_ops_built
+
     # ----- Forward --------------------------------------------------------
 
     def apply_weights(
@@ -397,7 +329,9 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         k = x_2d.size(1)
         n = c.partition_weight_shape[1]
         is_awq = (c.weight_type == scalar_types.uint4)
-        kernel_name = _rdna2_w4a16_select_kernel(m, k, n, is_awq=is_awq)
+        kernel_name = _rdna2_w4a16_select_kernel(
+            m, k, n, is_awq=is_awq, w4a8=self._w4a8, group_size=c.group_size
+        )
 
         # AWQ stores literal zeros → kernel must NOT add 1 (use_v2_format=True,
         # q_gemm_rdna2.cu:219 picks zero_offset=0). GPTQv1 stores zero-1 →
@@ -405,77 +339,58 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         # zero_offset=1). uint4b8 is GPTQv1; uint4 is AWQ.
         use_v2_format = (c.weight_type == scalar_types.uint4)
 
-        w4a8_eligible = (
-            kernel_name == "prefill"
-            and current_platform.is_rocm()
-            and on_gfx10x()
-            and _rdna2_w4a8_op_available()
-            and os.environ.get(W4A8_ENV_VAR) == "1"
-            and _rdna2_w4a8_eligible(c)
-            and _rdna2_w4a8_shape_ok(k, c.group_size)
-        )
-        if w4a8_eligible:
-            output = _rdna2_w4a8_attempt(
-                x_2d,
-                w_q,
-                w_zp,
-                w_s,
-                n,
-                c.group_size,
-                0 if use_v2_format else 1,
-            )
-            logger.info_once(
-                "RDNA2 W4A16: W4A8 sdot4 prefill path active "
-                "(config_id=%d, group=%d)",
-                W4A8_DEFAULT_CONFIG_ID,
-                c.group_size,
-            )
+        if kernel_name == "w4a8_prefill":
+            # Self-contained: C++ allocates the int8 A + scales + sums, fires
+            # the W4A8 sdot4 fast path, or falls back internally to
+            # gptq_gemm_rdna2_prefill. No post-call test, no env access, no
+            # logging in the traced region.
+            output = ops.w4a8_gemm_rdna2(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+        elif kernel_name == "awq_prefill" and hasattr(
+                ops, "awq_gemm_rdna2_prefill"):
+            output = ops.awq_gemm_rdna2_prefill(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+        elif kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
+            output = ops.gptq_gemm_rdna2_prefill(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+        elif kernel_name == "exllama" and hasattr(ops, "gptq_gemm"):
+            output = ops.gptq_gemm(
+                x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
+                c.weight_type.size_bits)
+        elif kernel_name == "rdna2_decode" and hasattr(
+                ops, "gptq_gemm_rdna2"):
+            if os.environ.get("VLLM_W4A16_PTR_DEBUG"):
+                with open(f"/tmp/w4a16_ptrs_{torch.cuda.current_device()}.log", "a") as f:
+                    xv = x_2d[0, :4].tolist()
+                    f.write(
+                        f"decode m={m} k={k} n={n} capt={torch.cuda.is_current_stream_capturing()} "
+                        f"x={x_2d.data_ptr():#x} xv={xv} shape={tuple(x_2d.shape)} stride={tuple(x_2d.stride())} "
+                        f"wq={w_q.data_ptr():#x} wg={w_g_idx.data_ptr():#x} sz={w_g_idx.numel() if w_g_idx.numel() else 0}\n")
+            output = ops.gptq_gemm_rdna2(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+            if os.environ.get("VLLM_W4A16_PTR_DEBUG"):
+                with open("/tmp/w4a16_ptrs.log", "a") as f:
+                    vals = output[0, :4].tolist()
+                    f.write(f"decode out={output.data_ptr():#x} vals={vals}\n")
         else:
-            if kernel_name == "awq_prefill" and hasattr(
-                    ops, "awq_gemm_rdna2_prefill"):
+            if hasattr(ops, "awq_gemm_rdna2_prefill") and use_v2_format:
                 output = ops.awq_gemm_rdna2_prefill(
                     x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-            elif kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
+            elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
                 output = ops.gptq_gemm_rdna2_prefill(
                     x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-            elif kernel_name == "exllama" and hasattr(ops, "gptq_gemm"):
+            elif hasattr(ops, "gptq_gemm"):
                 output = ops.gptq_gemm(
                     x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
                     c.weight_type.size_bits)
-            elif kernel_name == "rdna2_decode" and hasattr(
-                    ops, "gptq_gemm_rdna2"):
-                if os.environ.get("VLLM_W4A16_PTR_DEBUG"):
-                    with open(f"/tmp/w4a16_ptrs_{torch.cuda.current_device()}.log", "a") as f:
-                        xv = x_2d[0, :4].tolist()
-                        f.write(
-                            f"decode m={m} k={k} n={n} capt={torch.cuda.is_current_stream_capturing()} "
-                            f"x={x_2d.data_ptr():#x} xv={xv} shape={tuple(x_2d.shape)} stride={tuple(x_2d.stride())} "
-                            f"wq={w_q.data_ptr():#x} wg={w_g_idx.data_ptr():#x} sz={w_g_idx.numel() if w_g_idx.numel() else 0}\n")
+            elif hasattr(ops, "gptq_gemm_rdna2"):
                 output = ops.gptq_gemm_rdna2(
                     x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-                if os.environ.get("VLLM_W4A16_PTR_DEBUG"):
-                    with open("/tmp/w4a16_ptrs.log", "a") as f:
-                        vals = output[0, :4].tolist()
-                        f.write(f"decode out={output.data_ptr():#x} vals={vals}\n")
             else:
-                if hasattr(ops, "awq_gemm_rdna2_prefill") and use_v2_format:
-                    output = ops.awq_gemm_rdna2_prefill(
-                        x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-                elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
-                    output = ops.gptq_gemm_rdna2_prefill(
-                        x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-                elif hasattr(ops, "gptq_gemm"):
-                    output = ops.gptq_gemm(
-                        x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
-                        c.weight_type.size_bits)
-                elif hasattr(ops, "gptq_gemm_rdna2"):
-                    output = ops.gptq_gemm_rdna2(
-                        x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-                else:
-                    raise RuntimeError(
-                        f"RDNA2 W4A16 dispatcher: kernel_name={kernel_name!r} but "
-                        "neither gptq_gemm nor gptq_gemm_rdna2 ops are "
-                        "available; rebuild the C++ extension")
+                raise RuntimeError(
+                    f"RDNA2 W4A16 dispatcher: kernel_name={kernel_name!r} but "
+                    "neither gptq_gemm nor gptq_gemm_rdna2 ops are "
+                    "available; rebuild the C++ extension")
 
         if bias is not None:
             output.add_(bias)

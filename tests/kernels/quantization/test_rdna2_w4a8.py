@@ -324,7 +324,7 @@ def test_w4a8_act_quant_rejects_bad_group_size():
 def test_w4a8_gemm_matches_w4a16_prefill(group_size, default_vllm_config):
     _ensure_tp_group()
     set_random_seed(0)
-    M, K, N = 16, 512, 256
+    M, K, N = 64, 512, 256
     G = K // group_size
     assert K % group_size == 0 and K % 8 == 0 and N % 8 == 0
 
@@ -359,32 +359,12 @@ def test_w4a8_gemm_matches_w4a16_prefill(group_size, default_vllm_config):
     w_zp = layer.qzeros.data.contiguous()
     w_s = layer.scales.data.contiguous()
 
-    num_tiles = (M + MTILE - 1) // MTILE
-    a_i8 = torch.empty((num_tiles, K // 8, MTILE, 8), dtype=torch.int8, device=device)
-    a_scale = torch.empty((num_tiles, G, MTILE), dtype=torch.float32, device=device)
-    a_asum = torch.empty((num_tiles, G, MTILE), dtype=torch.int32, device=device)
-    out = torch.empty((M, N), dtype=torch.float16, device=device)
-
-    assert torch.ops._rocm_C.w4a8_act_quant_rdna2(
-        x_mk, group_size, a_i8, a_scale, a_asum
-    ).numel() > 0
-    # zero_offset=1 for GPTQv1 (use_v2_format=False);
-    # config_id=8 (a8_lds_k32_ag); split_k=1.
-    gemm_ret = torch.ops._rocm_C.w4a8_gemm_rdna2(
-        a_i8,
-        w_q,
-        w_zp,
-        w_s,
-        a_scale,
-        a_asum,
-        out,
-        K,
-        group_size,
-        1,
-        8,
-        1,
-    )
-    assert gemm_ret.numel() > 0, "w4a8_gemm returned an empty (ineligible) tensor"
+    # Fused entry: self-contained (allocates the int8 A + scales + sums
+    # internally), runs act_quant + the W4A8 sdot4 GEMM, and returns a
+    # populated [M, N] fp16 tensor. use_v2_format=False -> GPTQv1 zero_offset=1.
+    g_idx = torch.empty(0, dtype=torch.int32, device=device)
+    out = torch.ops._rocm_C.w4a8_gemm_rdna2(x_mk, w_q, w_zp, w_s, g_idx, False)
+    assert out.numel() > 0, "w4a8_gemm returned an empty (ineligible) tensor"
 
     ref = _w4a16_reference(x_mk, q_int4_kn, scales_gn, zeros_gn, group_size)
     rel_l2 = (out.to(torch.float32) - ref.to(torch.float32)).norm() / ref.to(
@@ -404,7 +384,7 @@ def test_w4a8_dispatcher_uses_w4a16_when_env_var_unset(
     monkeypatch.delenv("VLLM_RDNA2_W4A8_SDOT4", raising=False)
     _ensure_tp_group()
     set_random_seed(0)
-    M, K, N, group_size = 16, 512, 256, 64
+    M, K, N, group_size = 64, 512, 256, 64
     G = K // group_size
 
     x_mk = (0.25 * torch.randn((M, K), device=device, dtype=torch.float32)).to(
@@ -435,8 +415,9 @@ def test_w4a8_dispatcher_uses_w4a16_when_env_var_unset(
     )
     kernel.process_weights_after_loading(layer)
     out = kernel.apply_weights(layer, x_mk)
-    # The M=16, K=512, N=256 shape routes to "prefill" via
-    # _rdna2_w4a16_select_kernel (M<=32, K<4096).
+    # The M=64, K=512, N=256 shape is W4A8-eligible (M >= W4A8_MIN_ROWS), but
+    # with the env var unset self._w4a8 is False so the selector still returns
+    # "prefill" and the dispatcher takes the W4A16 path.
     expected = torch.ops._rocm_C.gptq_gemm_rdna2_prefill(
         x_mk,
         layer.qweight.data,
@@ -445,4 +426,76 @@ def test_w4a8_dispatcher_uses_w4a16_when_env_var_unset(
         torch.empty(0, device=device, dtype=torch.int32),
         False,  # use_v2_format=False -> GPTQv1
     )
-    assert torch.allclose(out, expected)
+    # gptq_gemm_rdna2_prefill uses split-K CAS atomics, which are
+    # order-dependent — the dispatcher path and a direct call can disagree
+    # by a few fp16 ULPs. Compare with rel-L2 < 0.01 (well below the ~0.7%
+    # W4A8 quantization error).
+    rel_l2 = (out.to(torch.float32) - expected.to(torch.float32)).norm() / expected.to(
+        torch.float32
+    ).norm()
+    assert rel_l2 < 0.01, f"rel-L2 {rel_l2:.4f} >= 0.01"
+
+
+@gfx1030_w4a8
+def test_w4a8_fused_entry_env_on_off(monkeypatch, default_vllm_config):
+    """Fused-entry A/B: VLLM_RDNA2_W4A8_SDOT4 on vs off.
+
+    For an eligible shape (M >= W4A8_MIN_ROWS, K % 32 == 0, K % group == 0,
+    LDS fits) the env-on dispatch routes to the W4A8 sdot4 fast path and its
+    output is close to, but not bit-identical with, the W4A16 prefill
+    (rel-L2 < 0.1). For an ineligible shape (M < W4A8_MIN_ROWS, decode) the
+    selector returns "prefill" regardless of the flag, so env on == env off
+    byte-for-byte.
+    """
+    _ensure_tp_group()
+    set_random_seed(0)
+    K, N, group_size = 512, 256, 64
+    G = K // group_size
+    config = MPLinearLayerConfig(
+        full_weight_shape=(K, N),
+        partition_weight_shape=(K, N),
+        weight_type=WEIGHT_TYPE,
+        act_type=torch.float16,
+        group_size=group_size,
+        zero_points=True,
+        has_g_idx=False,
+    )
+
+    for M, eligible in ((64, True), (16, False)):
+        x_mk = (0.25 * torch.randn((M, K), device=device, dtype=torch.float32)).to(
+            torch.float16
+        )
+        q_int4_kn = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
+        scales_gn = (
+            0.05 * torch.rand((G, N), device=device, dtype=torch.float32) + 0.01
+        ).to(torch.float16)
+        zeros_gn = torch.randint(0, 16, (G, N), device=device, dtype=torch.int32)
+
+        def _run(env_on: bool) -> torch.Tensor:
+            if env_on:
+                monkeypatch.setenv("VLLM_RDNA2_W4A8_SDOT4", "1")
+            else:
+                monkeypatch.delenv("VLLM_RDNA2_W4A8_SDOT4", raising=False)
+            layer = _build_layer(q_int4_kn, scales_gn, zeros_gn)
+            kernel = RDNA2W4A16LinearKernel(
+                config,
+                w_q_param_name="qweight",
+                w_s_param_name="scales",
+                w_zp_param_name="qzeros",
+                w_gidx_param_name=None,
+            )
+            kernel.process_weights_after_loading(layer)
+            return kernel.apply_weights(layer, x_mk)
+
+        out_off = _run(env_on=False)
+        out_on = _run(env_on=True)
+
+        if eligible:
+            ref = out_off.to(torch.float32)
+            rel_l2 = (out_on.to(torch.float32) - ref).norm() / ref.norm()
+            assert rel_l2 < 0.1, f"eligible shape: rel-L2 {rel_l2:.4f} >= 0.1"
+            assert rel_l2 > 1e-6, "eligible shape: W4A8 fast path did not fire"
+        else:
+            assert torch.equal(out_on, out_off), (
+                "ineligible shape must be byte-identical with env on/off"
+            )
