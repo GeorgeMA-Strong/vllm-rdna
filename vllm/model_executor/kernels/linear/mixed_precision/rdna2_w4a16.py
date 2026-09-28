@@ -420,21 +420,49 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
                     ops, "awq_gemm_rdna2_prefill"):
                 output = ops.awq_gemm_rdna2_prefill(
                     x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-            elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
+            elif kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
                 output = ops.gptq_gemm_rdna2_prefill(
                     x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
-            elif hasattr(ops, "gptq_gemm"):
+            elif kernel_name == "exllama" and hasattr(ops, "gptq_gemm"):
                 output = ops.gptq_gemm(
                     x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
                     c.weight_type.size_bits)
-            elif hasattr(ops, "gptq_gemm_rdna2"):
+            elif kernel_name == "rdna2_decode" and hasattr(
+                    ops, "gptq_gemm_rdna2"):
+                import os
+                if os.environ.get("VLLM_W4A16_PTR_DEBUG"):
+                    with open(f"/tmp/w4a16_ptrs_{torch.cuda.current_device()}.log", "a") as f:
+                        xv = x_2d[0, :4].tolist()
+                        f.write(
+                            f"decode m={m} k={k} n={n} capt={torch.cuda.is_current_stream_capturing()} "
+                            f"x={x_2d.data_ptr():#x} xv={xv} shape={tuple(x_2d.shape)} stride={tuple(x_2d.stride())} "
+                            f"wq={w_q.data_ptr():#x} wg={w_g_idx.data_ptr():#x} sz={w_g_idx.numel() if w_g_idx.numel() else 0}\n")
                 output = ops.gptq_gemm_rdna2(
                     x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                import os
+                if os.environ.get("VLLM_W4A16_PTR_DEBUG"):
+                    with open("/tmp/w4a16_ptrs.log", "a") as f:
+                        vals = output[0, :4].tolist()
+                        f.write(f"decode out={output.data_ptr():#x} vals={vals}\n")
             else:
-                raise RuntimeError(
-                    f"RDNA2 W4A16 dispatcher: kernel_name={kernel_name!r} but "
-                    "neither gptq_gemm nor gptq_gemm_rdna2 ops are "
-                    "available; rebuild the C++ extension")
+                if hasattr(ops, "awq_gemm_rdna2_prefill") and use_v2_format:
+                    output = ops.awq_gemm_rdna2_prefill(
+                        x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
+                    output = ops.gptq_gemm_rdna2_prefill(
+                        x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                elif hasattr(ops, "gptq_gemm"):
+                    output = ops.gptq_gemm(
+                        x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
+                        c.weight_type.size_bits)
+                elif hasattr(ops, "gptq_gemm_rdna2"):
+                    output = ops.gptq_gemm_rdna2(
+                        x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+                else:
+                    raise RuntimeError(
+                        f"RDNA2 W4A16 dispatcher: kernel_name={kernel_name!r} but "
+                        "neither gptq_gemm nor gptq_gemm_rdna2 ops are "
+                        "available; rebuild the C++ extension")
 
         if bias is not None:
             output.add_(bias)
