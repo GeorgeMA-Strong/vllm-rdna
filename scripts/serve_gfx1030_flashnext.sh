@@ -51,6 +51,13 @@ export VLLM_FORCE_CUSTOM_ALL_REDUCE="${VLLM_FORCE_CUSTOM_ALL_REDUCE:-0}"
 export VLLM_RDNA_AR="${VLLM_RDNA_AR:-1}"
 export VLLM_RDNA_AR_MAX_KB="${VLLM_RDNA_AR_MAX_KB:-64}"
 export VLLM_RDNA_AR_ONESHOT_KB="${VLLM_RDNA_AR_ONESHOT_KB:-64}"
+# FA-RDNA2 = the fastest validated HIP attention path; set to 0 (or pass
+# --attention-backend) to fall back to the Triton backend.
+export VLLM_USE_RDNA2_FA="${VLLM_USE_RDNA2_FA:-1}"
+# The venv may carry editable installs for other trees; pin this script's
+# own tree first so the served code matches the launcher.
+export PYTHONPATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)${PYTHONPATH:+:$PYTHONPATH}"
+export VLLM_FA_RDNA2_GQA_DECODE="${VLLM_FA_RDNA2_GQA_DECODE:-1}"
 export VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_USE_AOT_COMPILE=0
 export VLLM_DISABLE_COMPILE_CACHE=1
