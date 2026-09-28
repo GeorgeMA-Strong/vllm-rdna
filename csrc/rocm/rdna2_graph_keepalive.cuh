@@ -73,8 +73,10 @@ struct Rdna2PersistBuf {
 };
 
 // 1D numel persist. Prefix view stays contiguous. Capture slot is frozen
-// after graph capture; eager 16k grows a different tensor.
-inline torch::Tensor rdna2_persist_zeros(Rdna2PersistBuf& buf,
+// after graph capture; eager 16k grows a different tensor. The contents are
+// whatever the previous user left: only for buffers the caller overwrites in
+// full before reading (see rdna2_persist_zeros otherwise).
+inline torch::Tensor rdna2_persist_empty(Rdna2PersistBuf& buf,
                                          at::IntArrayRef shape,
                                          const torch::TensorOptions& opts) {
   int64_t need = 1;
@@ -130,6 +132,14 @@ inline torch::Tensor rdna2_persist_zeros(Rdna2PersistBuf& buf,
   }
   auto view = slot.reshape(-1).narrow(0, 0, need).view(shape);
   TORCH_CHECK(view.is_contiguous(), "rdna2 persist view must be contiguous");
+  return view;
+}
+
+// rdna2_persist_empty, zero-filled on every call.
+inline torch::Tensor rdna2_persist_zeros(Rdna2PersistBuf& buf,
+                                         at::IntArrayRef shape,
+                                         const torch::TensorOptions& opts) {
+  auto view = rdna2_persist_empty(buf, shape, opts);
   view.zero_();
   return view;
 }

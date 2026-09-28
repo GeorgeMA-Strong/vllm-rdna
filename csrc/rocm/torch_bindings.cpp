@@ -154,12 +154,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("rdna2_immortal_zeros", torch::kCUDA,
                 &rdna2_immortal_zeros_from_ref);
 
-  // FA-RDNA2: Flash-Attention v2 hand-port for AMD RDNA2 (gfx1030).
-  // Dispatched via a fast path in RocmAttentionImpl.forward().
+  // FA-RDNA2: Flash-Attention v2 hand-port for AMD RDNA2 (gfx1030), used by
+  // the RDNA_ATTN backend. The fa_rdna2_* ops write into `out`.
   rocm_ops.def(
       "fa_rdna2_decode_paged(Tensor Q, Tensor key_cache, Tensor value_cache, "
       "Tensor block_table, Tensor seq_lens, int block_size, int kv_splits, "
-      "int sliding_window) -> Tensor");
+      "int sliding_window, float scale, Tensor(a!) out) -> ()");
   rocm_ops.impl("fa_rdna2_decode_paged", torch::kCUDA, &fa_rdna2_decode_paged);
 
   // GDN packed single-token decode for AMD RDNA2 (gfx1030). Dispatched
@@ -202,16 +202,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "fa_rdna2_prefill_paged_varlen(Tensor Q, Tensor key_cache, "
       "Tensor value_cache, Tensor block_table, Tensor cu_query_lens, "
-      "Tensor seq_lens, int block_size, int causal, int sliding_window) "
-      "-> Tensor");
+      "Tensor seq_lens, int block_size, int causal, int sliding_window, "
+      "float scale, Tensor(a!) out) -> ()");
   rocm_ops.impl("fa_rdna2_prefill_paged_varlen", torch::kCUDA,
                 &fa_rdna2_prefill_paged_varlen);
 
   rocm_ops.def(
       "fa_rdna2_prefill_paged_varlen_short(Tensor Q, Tensor key_cache, "
       "Tensor value_cache, Tensor block_table, Tensor cu_query_lens, "
-      "Tensor seq_lens, int block_size, int causal, int sliding_window) "
-      "-> Tensor");
+      "Tensor seq_lens, int block_size, int causal, int sliding_window, "
+      "float scale, Tensor(a!) out) -> ()");
   rocm_ops.impl("fa_rdna2_prefill_paged_varlen_short", torch::kCUDA,
                 &fa_rdna2_prefill_paged_varlen_short);
 
@@ -255,7 +255,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "fa_rdna2_prefill_paged_varlen_splitk(Tensor Q, Tensor key_cache, "
       "Tensor value_cache, Tensor block_table, Tensor cu_query_lens, "
       "Tensor seq_lens, int block_size, int causal, int kv_splits, "
-      "int sliding_window) -> Tensor");
+      "int sliding_window, float scale, Tensor(a!) out) -> ()");
   rocm_ops.impl("fa_rdna2_prefill_paged_varlen_splitk", torch::kCUDA,
                 &fa_rdna2_prefill_paged_varlen_splitk);
 
@@ -263,7 +263,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "fa_rdna2_prefill_paged_varlen_gqa(Tensor Q, Tensor key_cache, "
       "Tensor value_cache, Tensor block_table, Tensor cu_query_lens, "
       "Tensor seq_lens, int block_size, int causal, "
-      "int sliding_window) -> Tensor");
+      "int sliding_window, float scale, Tensor(a!) out) -> ()");
   rocm_ops.impl("fa_rdna2_prefill_paged_varlen_gqa", torch::kCUDA,
                 &fa_rdna2_prefill_paged_varlen_gqa);
 
@@ -381,8 +381,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // Quantizes fp16 K/V to int8 with per-(token, head) scales and writes
   // them into the interleaved cache layout the RDNA2 FA decode kernel
   // reads (D bytes data + 4 bytes scale per slot, per kv-int8.md wiki
-  // contract). Wired into vllm/v1/attention/backends/rdna_attn.py for
-  // the INT8_PER_TOKEN_HEAD kv_cache_dtype path.
+  // contract). Not wired up yet: RDNA_ATTN still rejects quantized KV
+  // caches, and fa_rdna2_decode_paged_int8 is not registered.
   rocm_ops.def(
       "reshape_and_cache_int8_rdna2(Tensor key, Tensor value, "
       "Tensor(a!) kv_cache, Tensor slot_mapping) -> ()");

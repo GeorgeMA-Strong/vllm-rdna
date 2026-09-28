@@ -60,6 +60,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <torch/all.h>
@@ -142,6 +143,28 @@ __device__ __forceinline__ int fa_swz_d(int d, int k) {
   return d ^ ((k & 7) << 4);
 }
 
+// vLLM sliding-window semantics (FlashAttention window (w - 1, 0)): query
+// position q attends key position k iff k <= q and q - k < w.
+__device__ __forceinline__ bool fa_masked(int q, int k, int causal,
+                                          int sliding_window) {
+  return (causal && k > q) || (sliding_window > 0 && q - k >= sliding_window);
+}
+
+// Clips the K/V tile walk [lo, hi) (tiles at lo + i * tile) of a CTA whose
+// query rows sit at positions [q_first, q_first + rows) to the tiles that are
+// not masked for every row: past the causal diagonal of the last row, or left
+// of the sliding window of the first row. Kept tiles keep their boundaries,
+// so the result is bit-identical to walking and masking every tile.
+__device__ __forceinline__ void fa_clip_kv_walk(int& lo, int& hi, int q_first,
+                                                int rows, int causal,
+                                                int sliding_window, int tile) {
+  if (causal) hi = min(hi, q_first + rows);
+  if (sliding_window > 0) {
+    const int first = q_first - sliding_window + 1;
+    if (first > lo) lo += (first - lo) / tile * tile;
+  }
+}
+
 // fp8 e4m3fn -> fp16 conversion (software, no fp8 hardware needed on gfx1030)
 // e4m3: [S(1) | E(4) | M(3)], bias=7
 // fp16:  [S(1) | E(5) | M(10)], bias=15
@@ -181,15 +204,10 @@ __device__ __forceinline__ half fa_kv_load(const KV_T* ptr, float scale) {
 
 
 // =====================================================================
-// DECODE STAGE 1: per-CTA partials (split-K)
-// =====================================================================
-
-// =====================================================================
 // DECODE STAGE 1 (PAGED): per-CTA partials, K/V read from paged blocks
 // =====================================================================
 //
-// Mirrors fa_decode_splitk_kernel but reads K/V from a paged cache
-// (vLLM's KV cache layout: [num_blocks, H_kv, D/x, block_size, x]).
+// Reads K/V from vLLM's paged cache ([num_blocks, H_kv, D/x, block_size, x]).
 // Each query token is a separate sequence in the batch with its own
 // block_table and seq_len.
 //
@@ -307,10 +325,16 @@ __global__ __launch_bounds__(128)
   float l_i = 0.0f;
   float o_acc = 0.0f;
 
-  // Split this sequence's KV range across kv_splits CTAs.
-  const int blocks_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int blk_start = split * blocks_per_split;
-  const int blk_end   = min(blk_start + blocks_per_split, seq_len);
+  // Split this sequence's KV range across kv_splits CTAs. Keys left of the
+  // sliding window are never visited, and every split is a whole number of
+  // tiles so each one (not only split 0) starts 8-slot aligned and takes the
+  // vectorized V load.
+  const int kv_lo = sliding_window > 0
+                        ? max(0, seq_len - sliding_window) / BC * BC : 0;
+  const int tokens_per_split =
+      ((seq_len - kv_lo + kv_splits - 1) / kv_splits + BC - 1) / BC * BC;
+  const int blk_start = kv_lo + split * tokens_per_split;
+  const int blk_end   = min(blk_start + tokens_per_split, seq_len);
 
   for (int n = blk_start; n < blk_end; n += BC) {
     const int blk_size = min(BC, blk_end - n);
@@ -562,9 +586,15 @@ __global__ __launch_bounds__(256)
   float l_i = 0.0f;
   float o_acc = 0.0f;
 
-  const int blocks_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int blk_start = split * blocks_per_split;
-  const int blk_end   = min(blk_start + blocks_per_split, seq_len);
+  // Same split layout as the HEAD_DIM = 128 kernel, in BC_256 tiles.
+  const int kv_lo = sliding_window > 0
+                        ? max(0, seq_len - sliding_window) / BC_256 * BC_256
+                        : 0;
+  const int tokens_per_split =
+      ((seq_len - kv_lo + kv_splits - 1) / kv_splits + BC_256 - 1) / BC_256 *
+      BC_256;
+  const int blk_start = kv_lo + split * tokens_per_split;
+  const int blk_end   = min(blk_start + tokens_per_split, seq_len);
 
   for (int n = blk_start; n < blk_end; n += BC_256) {
     const int blk_size = min(BC_256, blk_end - n);
@@ -808,9 +838,15 @@ void fa_decode_paged_splitk_gqa_kernel_256(
     m_i[g] = -INFINITY; l_i[g] = 0.0f; o_acc[g] = 0.0f;
   }
 
-  const int blocks_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int tok_start = split * blocks_per_split;
-  const int tok_end = min(tok_start + blocks_per_split, seq_len);
+  // Same split layout as fa_decode_paged_splitk_kernel_256.
+  const int kv_lo = sliding_window > 0
+                        ? max(0, seq_len - sliding_window) / GQA_BC * GQA_BC
+                        : 0;
+  const int tokens_per_split =
+      ((seq_len - kv_lo + kv_splits - 1) / kv_splits + GQA_BC - 1) / GQA_BC *
+      GQA_BC;
+  const int tok_start = kv_lo + split * tokens_per_split;
+  const int tok_end = min(tok_start + tokens_per_split, seq_len);
   constexpr int NX = 256 / 8;
   constexpr int NSG = GQA_BC / 8;
 
@@ -986,7 +1022,9 @@ __global__ void fa_decode_combine_kernel(
     }
     float den = 0.0f;
     for (int s = 0; s < kv_splits; ++s) {
-      float w = expf(sM[s] - m_global);
+      // Empty splits carry m = -inf. When every split is empty (seq_len 0,
+      // e.g. CUDA-graph padding rows) expf(-inf - -inf) would be NaN.
+      float w = sM[s] == -INFINITY ? 0.0f : expf(sM[s] - m_global);
       sWg[s] = w;
       den += w * sL[s];
     }
@@ -1000,101 +1038,21 @@ __global__ void fa_decode_combine_kernel(
       num += sWg[s] * O_partial[((b * H_q + h_q) * kv_splits + s) * D + t];
     }
     float den = sWg[kv_splits];
-    O[(b * H_q + h_q) * D + t] = __float2half_rn(num / den);
+    O[(b * H_q + h_q) * D + t] = __float2half_rn(den > 0.0f ? num / den : 0.0f);
   }
 }
 
 // =====================================================================
-// PREFILL STAGE 1: Br > 1, no split-K
+// PREFILL (PAGED, VARLEN): multiple sequences per launch
 // =====================================================================
 //
-// Tile sizes for prefill (gfx1030):
-//   Br = 16 (Q rows per CTA — 16 * 128 halves = 4 KB for sQ)
-//   Bc = 64 (K/V block, same as decode)
-//   head_dim = 128
-//   THREADS = 128 (4 warps)
-//
-// One CTA processes (b, h_q, q_block) for one kv_group. All Q rows in
-// the Br block share the same K/V tiles (Q is local to the CTA,
-// K/V are streamed).
-//
-// Memory layout (per CTA):
-//   sQ  [Br x D] fp16          = Br * 128 * 2  = 4 KB
-//   sK  [Bc x D] fp16          = Bc * 128 * 2  = 16 KB
-//   sV  [Bc x D] fp16          = Bc * 128 * 2  = 16 KB
-//   sP  [Bc x Br] fp32         = Bc * Br * 4   = 4 KB (Br=16)
-//   sM  [Br] fp32              = Br * 4        = 64 B
-//   sL  [Br] fp32              = Br * 4        = 64 B
-//   sO  [Br x D] fp32          = Br * D * 4    = 8 KB
-//   sRed [5] fp32              = 20 B
-//   Total smem ≈ 48 KB (fits gfx1030 64 KB per-CU limit with 1 block/CU)
-//
-// Each thread owns one element of sO[br, t] where br = t / D and
-// t_local = t % D. Block reductions operate along the Br dimension
-// (for m, l per row).
-
-// =====================================================================
-// PREFILL (NON-PAGED) for HEAD_DIM=72 (vision ViT encoder, e.g. Qwen3.5/3.6)
-// =====================================================================
-//
-// Cloned from fa_prefill_kernel but specialized for HEAD_DIM=72 (vision
-// encoder in Qwen3.5/3.6 VL models). Key differences vs the HEAD=128
-// variant:
-//   * HEAD_DIM=72 (not a power of 2). 72 is even so fdot2 still works
-//     (d += 2 inner loop). 72 % 32 != 0 so lane-to-lane dot accumulation
-//     pattern is uneven — we still use half2 reads but threads handle
-//     fractional strided indices.
-//   * BC=32 (vs 64 for HEAD=128). Halves sK+sV smem cost. 72 not
-//     divisible by 32, so we still use BC=32 with d += 2 chunking.
-//   * BR=16, THREADS=128 — same as HEAD=128 to keep launch shape.
-//   * NO swizzle: 72 isn't a power of 2 so XOR swizzle bits would alias.
-//     Measure-first; apply if proven ≥5% gain.
-//
-// Smem budget:
-//   sQ: 16*72 halves      = 2.25 KB
-//   sK: 32*72 halves      = 4.50 KB
-//   sV: 32*72 halves      = 4.50 KB
-//   sP: 16*32 floats      = 2.00 KB
-//   sM+sL+sO: 16+16+16*72 floats = 4.75 KB
-//   Total                  ≈ 18.0 KB (well under 64 KB gfx1030 limit)
-//
-
-// =====================================================================
-// PREFILL (PAGED): Br > 1, reads K/V from paged KV cache
-// =====================================================================
-//
-// Mirrors fa_prefill_kernel but reads K/V from vLLM's paged KV cache
-// (5D layout: [num_blocks, H_kv, D/x, block_size, x]). Each query block
-// of BR_PREFILL consecutive query tokens belongs to one sequence; the
-// block_table for that sequence maps KV positions to physical blocks.
-//
-// Supports HEAD_DIM=128 and HEAD_DIM=256. For HEAD_DIM=256 we use
-// BC_256=32 to stay under gfx1030's 64KB shared memory limit.
-//
-// Block grid:
-//   x: query block index (B * num_q_blocks_per_seq)
-//   y: head index (H_q)
-//   z: batch index (B)  — simplified, assumes one block per (b, q_block)
-// =====================================================================
-
-// =====================================================================
-// PREFILL (PAGED, VARLEN): Multiple sequences per launch
-// =====================================================================
-//
-// Extends the paged prefill kernel to handle multiple sequences in
-// one launch. Each query block of BR_PREFILL consecutive tokens may
-// span a different sequence. The CTA uses cu_query_lens to determine
-// which sequence it belongs to, then reads that sequence's seq_lens and
-// block_table slice.
-//
-// Grid:
-//   x: global query block index (ceil(N_q / BR_PREFILL))
-//   y: head index (H_q)
-//   z: 1
-//
-// Per-CTA: linear search cu_query_lens to find seq_idx, then use
-// seq_lens[seq_idx] and block_table[seq_idx * max_blocks + ...].
-// Causal masking uses sequence-local query position.
+// Grid: (max_q_blocks, H_q, num_seqs). CTA (q_block, h_q, seq) handles
+// BR_PREFILL consecutive query rows of one sequence. The queries are the
+// last seq_query_len positions of the sequence (chunked prefill / prefix
+// cache), so row br sits at position
+//   (seq_len - seq_query_len) + q_block * BR_PREFILL + br.
+// K/V tiles stream from the paged cache through the sequence's block_table;
+// tiles no row of the CTA can see are skipped (fa_clip_kv_walk).
 // =====================================================================
 
 template <typename KV_T, bool IS_FP8>
@@ -1194,9 +1152,12 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_kernel_128(
   }
   __syncthreads();
 
-  // Stream over KV blocks for this sequence.
-  for (int n = 0; n < seq_len; n += BC) {
-    const int blk_size = min(BC, seq_len - n);
+  // Stream over the KV tiles this q block can see.
+  const int q_first = (seq_len - seq_query_len) + q_start_in_seq;
+  int kv_lo = 0, kv_hi = seq_len;
+  fa_clip_kv_walk(kv_lo, kv_hi, q_first, br_size, causal, sliding_window, BC);
+  for (int n = kv_lo; n < kv_hi; n += BC) {
+    const int blk_size = min(BC, kv_hi - n);
 
     // Cooperative load sK[BC][D] and sV[BC][D] from paged cache.
     // STORAGE: write at swizzled offset to match the QK^T / PV reads below.
@@ -1234,15 +1195,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_kernel_128(
       const int k = idx % BC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        // Causal mask uses sequence-local query position.
-        // Sliding window: k_global must be >= q_local - sliding_window.
-        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
-        const int k_global = n + k;
-        const bool masked_causal = causal && (k_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (k_global < q_local - sliding_window);
-        const bool masked = masked_causal || masked_window;
-        if (!masked) {
+        if (!fa_masked(q_first + br, n + k, causal, sliding_window)) {
           const half* sQ_row = sQ + br * 128;
           const half* sK_row = sK + k * 128;
           #pragma unroll
@@ -1443,9 +1396,12 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_128_sho
   }
   __syncthreads();
 
-  // Stream over KV blocks for this sequence.
-  for (int n = 0; n < seq_len; n += BC) {
-    const int blk_size = min(BC, seq_len - n);
+  // Stream over the KV tiles this q block can see.
+  const int q_first = (seq_len - seq_query_len) + q_start_in_seq;
+  int kv_lo = 0, kv_hi = seq_len;
+  fa_clip_kv_walk(kv_lo, kv_hi, q_first, br_size, causal, sliding_window, BC);
+  for (int n = kv_lo; n < kv_hi; n += BC) {
+    const int blk_size = min(BC, kv_hi - n);
 
     // Vectorized half2 K/V loads. Two consecutive d values share the same
     // d_sub when x_dim >= 2, so we can load 4 contiguous bytes per thread.
@@ -1490,13 +1446,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_128_sho
       const int k = idx % BC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
-        const int k_global = n + k;
-        const bool masked_causal = causal && (k_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (k_global < q_local - sliding_window);
-        const bool masked = masked_causal || masked_window;
-        if (!masked) {
+        if (!fa_masked(q_first + br, n + k, causal, sliding_window)) {
           const half* sQ_row = sQ + br * HEAD_DIM;
           const half* sK_row = sK + k * HEAD_DIM;
           #pragma unroll
@@ -1683,7 +1633,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
     return;
   }
 
-  // sK/sV rows padded to 264 halfs so the vectorized K store (one 16B
+  // sK/sV rows padded to 264 halves so the vectorized K store (one 16B
   // write per lane across consecutive n_local) does not collapse onto a
   // single smem bank quad.
   constexpr int DSK = 256 + 8;
@@ -1722,8 +1672,13 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
   }
   __syncthreads();
 
-  for (int n = 0; n < seq_len; n += BC_256) {
-    const int blk_size = min(BC_256, seq_len - n);
+  // Stream over the KV tiles this q block can see.
+  const int q_first = (seq_len - seq_query_len) + q_start_in_seq;
+  int kv_lo = 0, kv_hi = seq_len;
+  fa_clip_kv_walk(kv_lo, kv_hi, q_first, br_size, causal, sliding_window,
+                  BC_256);
+  for (int n = kv_lo; n < kv_hi; n += BC_256) {
+    const int blk_size = min(BC_256, kv_hi - n);
 
     // Page mapping once per KV block: kills the per-element div/mod and
     // block_table re-reads.
@@ -1819,13 +1774,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
       const int k = idx % BC_256;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
-        const int k_global = n + k;
-        const bool masked_causal = causal && (k_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (k_global < q_local - sliding_window);
-        const bool masked = masked_causal || masked_window;
-        if (!masked) {
+        if (!fa_masked(q_first + br, n + k, causal, sliding_window)) {
           const half* sQ_row = sQ + br * 256;
           const half* sK_row = sK + k * DSK;
           #pragma unroll
@@ -1979,10 +1928,14 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int br_size = min(BR_PREFILL, seq_query_len - q_start_in_seq);
   const int* seq_block_table = block_table + seq_idx * max_blocks;
 
-  // Split the KV range [0, seq_len) into kv_splits chunks.
+  // Split the KV range [0, seq_len) into kv_splits chunks, then drop the
+  // tiles this q block cannot see.
   const int kv_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int kv_start = split_idx * kv_per_split;
-  const int kv_end = min(kv_start + kv_per_split, seq_len);
+  const int q_first = (seq_len - seq_query_len) + q_start_in_seq;
+  int kv_start = split_idx * kv_per_split;
+  int kv_end = min(kv_start + kv_per_split, seq_len);
+  fa_clip_kv_walk(kv_start, kv_end, q_first, br_size, causal, sliding_window,
+                  BC);
   if (kv_start >= kv_end) {
     // Empty split: write zero partials.
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
@@ -2065,13 +2018,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
-        const int k_global = n + k;
-        const bool masked_causal = causal && (k_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (k_global < q_local - sliding_window);
-        const bool masked = masked_causal || masked_window;
-        if (!masked) {
+        if (!fa_masked(q_first + br, n + k, causal, sliding_window)) {
           const half* sQ_row = sQ + br * 128;
           const half* sK_row = sK + k * 128;
           #pragma unroll
@@ -2273,9 +2220,14 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int br_size = min(BR_PREFILL, seq_query_len - q_start_in_seq);
   const int* seq_block_table = block_table + seq_idx * max_blocks;
 
+  // Split the KV range [0, seq_len) into kv_splits chunks, then drop the
+  // tiles this q block cannot see.
   const int kv_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int kv_start = split_idx * kv_per_split;
-  const int kv_end = min(kv_start + kv_per_split, seq_len);
+  const int q_first = (seq_len - seq_query_len) + q_start_in_seq;
+  int kv_start = split_idx * kv_per_split;
+  int kv_end = min(kv_start + kv_per_split, seq_len);
+  fa_clip_kv_walk(kv_start, kv_end, q_first, br_size, causal, sliding_window,
+                  BC_256);
   if (kv_start >= kv_end) {
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
     for (int br = 0; br < br_size; ++br) {
@@ -2291,7 +2243,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int stride_qo_tok = H_q * 256;
   const int stride_qo_h = 256;
 
-  // sK/sV rows padded to 264 halfs so the vectorized K store (one 16B
+  // sK/sV rows padded to 264 halves so the vectorized K store (one 16B
   // write per lane across consecutive n_local) does not collapse onto a
   // single smem bank quad.
   constexpr int DSK = 256 + 8;
@@ -2426,13 +2378,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC_256;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
-        const int k_global = n + k;
-        const bool masked_causal = causal && (k_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (k_global < q_local - sliding_window);
-        const bool masked = masked_causal || masked_window;
-        if (!masked) {
+        if (!fa_masked(q_first + br, n + k, causal, sliding_window)) {
           const half* sQ_row = sQ + br * 256;
           const half* sK_row = sK + k * DSK;
           #pragma unroll
@@ -2662,10 +2608,14 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int br_size = min(BR_PREFILL_LOC, seq_query_len - q_start_in_seq);
   const int* seq_block_table = block_table + seq_idx * max_blocks;
 
-  // Split the KV range [0, seq_len) into kv_splits chunks.
+  // Split the KV range [0, seq_len) into kv_splits chunks, then drop the
+  // tiles this q block cannot see.
   const int kv_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int kv_start = split_idx * kv_per_split;
-  const int kv_end = min(kv_start + kv_per_split, seq_len);
+  const int q_first = (seq_len - seq_query_len) + q_start_in_seq;
+  int kv_start = split_idx * kv_per_split;
+  int kv_end = min(kv_start + kv_per_split, seq_len);
+  fa_clip_kv_walk(kv_start, kv_end, q_first, br_size, causal, sliding_window,
+                  BC_LOC);
   if (kv_start >= kv_end) {
     // Empty split: write zero partials.
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
@@ -2766,13 +2716,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC_LOC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
-        const int n_global = n + k;
-        const bool masked_causal = causal && (n_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (n_global < q_local - sliding_window);
-        const bool masked = masked_causal || masked_window;
-        if (!masked) {
+        if (!fa_masked(q_first + br, n + k, causal, sliding_window)) {
           const float k_s = sKscales[k];
           const half* sQ_row = sQ + br * HEAD_DIM;
           const int8_t* sK_row = sK + k * HEAD_DIM;
@@ -2925,9 +2869,14 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int br_size = min(BR_PREFILL_LOC, seq_query_len - q_start_in_seq);
   const int* seq_block_table = block_table + seq_idx * max_blocks;
 
+  // Split the KV range [0, seq_len) into kv_splits chunks, then drop the
+  // tiles this q block cannot see.
   const int kv_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int kv_start = split_idx * kv_per_split;
-  const int kv_end = min(kv_start + kv_per_split, seq_len);
+  const int q_first = (seq_len - seq_query_len) + q_start_in_seq;
+  int kv_start = split_idx * kv_per_split;
+  int kv_end = min(kv_start + kv_per_split, seq_len);
+  fa_clip_kv_walk(kv_start, kv_end, q_first, br_size, causal, sliding_window,
+                  BC_LOC);
   if (kv_start >= kv_end) {
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
     for (int br = 0; br < br_size; ++br) {
@@ -3018,13 +2967,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC_LOC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
-        const int n_global = n + k;
-        const bool masked_causal = causal && (n_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (n_global < q_local - sliding_window);
-        const bool masked = masked_causal || masked_window;
-        if (!masked) {
+        if (!fa_masked(q_first + br, n + k, causal, sliding_window)) {
           const float k_s = sKscales[k];
           const half* sQ_row = sQ + br * HEAD_DIM;
           const int8_t* sK_row = sK + k * HEAD_DIM;
@@ -3130,6 +3073,24 @@ Rdna2PersistBuf g_dec_O, g_dec_Op, g_dec_Mp, g_dec_Lp;
 Rdna2PersistBuf g_pref_O, g_pref_Op, g_pref_Mp, g_pref_Lp;
 }  // namespace
 
+// Opt-in switch for fa_decode_paged_splitk_gqa_kernel_256 (read once).
+static bool fa_gqa_decode_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("VLLM_FA_RDNA2_GQA_DECODE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return enabled;
+}
+
+// The fp16 entry points write the attention output straight into the
+// caller's buffer: no staging tensor and no copy kernel afterwards.
+static void fa_check_io(const torch::Tensor& Q, const torch::Tensor& out) {
+  TORCH_CHECK(Q.is_contiguous(), "Q must be contiguous [num_tokens, H_q, D]");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kHalf &&
+                  out.is_contiguous() && out.sizes() == Q.sizes(),
+              "out must be a contiguous fp16 tensor shaped like Q");
+}
+
 // =====================================================================
 // PAGED DECODE HOST WRAPPER
 // =====================================================================
@@ -3141,7 +3102,7 @@ Rdna2PersistBuf g_pref_O, g_pref_Op, g_pref_Mp, g_pref_Lp;
 //   seq_lens:    [num_tokens] (int32) — KV length per query token
 //
 // Output: O [num_tokens, H_q, D] fp16
- torch::Tensor fa_rdna2_decode_paged(
+void fa_rdna2_decode_paged(
     torch::Tensor Q,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -3149,7 +3110,9 @@ Rdna2PersistBuf g_pref_O, g_pref_Op, g_pref_Mp, g_pref_Lp;
     torch::Tensor seq_lens,
     int64_t block_size,
     int64_t kv_splits,
-    int64_t sliding_window) {
+    int64_t sliding_window,
+    double scale,
+    torch::Tensor out) {
   TORCH_CHECK(Q.is_cuda() && key_cache.is_cuda() && value_cache.is_cuda(),
               "Q/key_cache/value_cache must be on HIP device");
   TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
@@ -3169,6 +3132,7 @@ Rdna2PersistBuf g_pref_O, g_pref_Op, g_pref_Mp, g_pref_Lp;
               "D/x * x must equal D");
   TORCH_CHECK(kv_splits >= 1 && kv_splits <= MAX_SPLITS,
               "kv_splits must be in [1, 16]");
+  fa_check_io(Q, out);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -3183,22 +3147,17 @@ Rdna2PersistBuf g_pref_O, g_pref_Op, g_pref_Mp, g_pref_Lp;
   const int x_dim = key_cache.size(4);
   TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv");
   const int kv_group_num = H_q / H_kv;
-  const float scale = 1.0f / sqrtf((float)D);
 
   auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-  auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
 
-  auto O_partial = rdna2_persist_zeros(
+  auto O_partial = rdna2_persist_empty(
       g_dec_Op, {num_tokens, H_q, (int)kv_splits, D}, float_opts);
-  auto M_partial = rdna2_persist_zeros(
+  auto M_partial = rdna2_persist_empty(
       g_dec_Mp, {num_tokens, H_q, (int)kv_splits}, float_opts);
-  auto L_partial = rdna2_persist_zeros(
+  auto L_partial = rdna2_persist_empty(
       g_dec_Lp, {num_tokens, H_q, (int)kv_splits}, float_opts);
-  auto O = rdna2_persist_zeros(g_dec_O, {num_tokens, H_q, D}, half_opts);
 
   dim3 grid1(num_tokens, H_q, (int)kv_splits);
-  const float reduction_bytes = (float)((D + D + D) * sizeof(float) + D * sizeof(float) * 2 + D * sizeof(float));
-  (void)reduction_bytes;
 
   if (D == 128) {
     constexpr int HEAD_DIM = 128;
@@ -3237,14 +3196,15 @@ Rdna2PersistBuf g_pref_O, g_pref_Op, g_pref_Mp, g_pref_Lp;
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
         0.0f, 0.0f,
         nullptr, nullptr);
-  } else if (false && (int64_t)num_tokens * H_kv >= 4 && x_dim == 8
+  } else if (fa_gqa_decode_enabled() && (int64_t)num_tokens * H_kv >= 4
+             && x_dim == 8
              && kv_group_num > 1 && kv_group_num <= GQA_MAX_G
              && (block_size & 7) == 0
              && key_cache.stride(4) == 1 && value_cache.stride(3) == 1) {
-    // Disabled 2026-09-09: gate is num_tokens*H_kv>=4, so mixed 16k
-    // n_dec=1 uses per-head kernel_256 (coherent) and n_dec>=2 uses
-    // this GQA kernel (Parisduct from the first decode token). FULL
-    // capture sizes 1-16 stay on the per-head path.
+    // Off by default since 2026-09-09: with this gate, mixed 16k n_dec=1
+    // used the per-head kernel_256 (coherent) while n_dec>=2 used this GQA
+    // kernel and produced garbage from the first decode token. Opt back in
+    // with VLLM_FA_RDNA2_GQA_DECODE=1 to re-validate it.
     // GQA decode: one CTA per (token, kv-head, split) for the whole group.
     // Requires G = H_q/H_kv in (1, GQA_MAX_G]; G==1 is the per-head kernel.
     dim3 grid_gqa(num_tokens, H_kv, (int)kv_splits);
@@ -3331,13 +3291,11 @@ Rdna2PersistBuf g_pref_O, g_pref_Op, g_pref_Mp, g_pref_Lp;
       (const float*)O_partial.data_ptr(),
       (const float*)M_partial.data_ptr(),
       (const float*)L_partial.data_ptr(),
-      (half*)O.data_ptr(),
+      (half*)out.data_ptr(),
       num_tokens, H_q, (int)kv_splits, D);
   hipError_t err2 = hipGetLastError();
   TORCH_CHECK(err2 == hipSuccess, "fa_rdna2 paged combine launch failed: ",
               hipGetErrorString(err2));
-
-  return O;
 }
 
 
@@ -3528,7 +3486,7 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
 //
 // Supports HEAD_DIM=128 and HEAD_DIM=256.
 //
-torch::Tensor fa_rdna2_prefill_paged_varlen(
+void fa_rdna2_prefill_paged_varlen(
     torch::Tensor Q,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -3537,7 +3495,9 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
     torch::Tensor seq_lens,
     int64_t block_size,
     int64_t causal,
-    int64_t sliding_window) {
+    int64_t sliding_window,
+    double scale,
+    torch::Tensor out) {
   TORCH_CHECK(Q.is_cuda() && key_cache.is_cuda() && value_cache.is_cuda(),
               "Q/key_cache/value_cache must be on HIP device");
   TORCH_CHECK(block_table.is_cuda() && cu_query_lens.is_cuda() && seq_lens.is_cuda(),
@@ -3556,6 +3516,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
   TORCH_CHECK(key_cache.size(2) * key_cache.size(4) == (int64_t)Q.size(2),
               "D/x * x must equal D");
   TORCH_CHECK(block_table.dim() == 2, "block_table must be [num_seqs, max_blocks]");
+  fa_check_io(Q, out);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -3571,14 +3532,10 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
   const int num_seqs = seq_lens.size(0);
   TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv");
   const int kv_group_num = H_q / H_kv;
-  const float scale = 1.0f / sqrtf((float)D);
   TORCH_CHECK(num_tokens > 0, "num_tokens must be > 0");
   TORCH_CHECK(num_seqs > 0, "num_seqs must be > 0");
   TORCH_CHECK(cu_query_lens.size(0) >= (int64_t)num_seqs + 1,
               "cu_query_lens must be at least [num_seqs+1]");
-
-  auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
-  auto O = rdna2_persist_zeros(g_pref_O, {num_tokens, H_q, D}, half_opts);
 
   // Grid: (max_q_blocks_per_seq, H_q, num_seqs). max_q_blocks_per_seq must
   // be large enough for the longest sequence's query blocks. We compute it
@@ -3624,7 +3581,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
         (int)block_size,
         x_dim,
         num_seqs,
-        (half*)O.data_ptr(),
+        (half*)out.data_ptr(),
         H_q, H_kv, kv_group_num, scale, (int)causal, (int)sliding_window,
         0.0f, 0.0f);
   } else {
@@ -3663,14 +3620,13 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
         (int)block_size,
         x_dim,
         num_seqs,
-        (half*)O.data_ptr(),
+        (half*)out.data_ptr(),
         H_q, H_kv, kv_group_num, scale, (int)causal, (int)sliding_window,
         0.0f, 0.0f);
   }
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "fa_rdna2 paged prefill varlen launch failed: ",
               hipGetErrorString(err));
-  return O;
 }
 
 // =====================================================================
@@ -3830,7 +3786,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_fp8(
 // Uses BR_PREFILL=32, THREADS_PREFILL=256 for better grid utilization
 // at short sequence lengths. Only valid for D=128; for D=256 the caller
 // should use fa_rdna2_prefill_paged_varlen with the >=4096 path.
-torch::Tensor fa_rdna2_prefill_paged_varlen_short(
+void fa_rdna2_prefill_paged_varlen_short(
     torch::Tensor Q,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -3839,7 +3795,9 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_short(
     torch::Tensor seq_lens,
     int64_t block_size,
     int64_t causal,
-    int64_t sliding_window) {
+    int64_t sliding_window,
+    double scale,
+    torch::Tensor out) {
   TORCH_CHECK(Q.is_cuda() && key_cache.is_cuda() && value_cache.is_cuda(),
               "Q/key_cache/value_cache must be on HIP device");
   TORCH_CHECK(block_table.is_cuda() && cu_query_lens.is_cuda() && seq_lens.is_cuda(),
@@ -3854,13 +3812,13 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_short(
   TORCH_CHECK(key_cache.dim() == 5, "key_cache must be 5D");
   TORCH_CHECK(value_cache.dim() == 5, "value_cache must be 5D");
   TORCH_CHECK(Q.size(2) == 128, "D must be 128 for short variant");
+  fa_check_io(Q, out);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
   auto stream = at::cuda::getCurrentCUDAStream();
 
   const int num_tokens = Q.size(0);
   const int H_q = Q.size(1);
-  const int D = (int)Q.size(2);
   const int H_kv = key_cache.size(1);
   const int max_blocks = block_table.size(0) > 1
                              ? (int)block_table.stride(0)
@@ -3869,14 +3827,10 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_short(
   const int num_seqs = seq_lens.size(0);
   TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv");
   const int kv_group_num = H_q / H_kv;
-  const float scale = 1.0f / sqrtf((float)D);
   TORCH_CHECK(num_tokens > 0, "num_tokens must be > 0");
   TORCH_CHECK(num_seqs > 0, "num_seqs must be > 0");
   TORCH_CHECK(cu_query_lens.size(0) >= (int64_t)num_seqs + 1,
               "cu_query_lens must be at least [num_seqs+1]");
-
-  auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
-  auto O = rdna2_persist_zeros(g_pref_O, {num_tokens, H_q, D}, half_opts);
 
   constexpr int BR_PREFILL = 32;
   constexpr int HEAD_DIM = 128;
@@ -3916,19 +3870,18 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_short(
       (int)block_size,
       x_dim,
       num_seqs,
-      (half*)O.data_ptr(),
+      (half*)out.data_ptr(),
       H_q, H_kv, kv_group_num, scale, (int)causal, (int)sliding_window);
 
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "fa_rdna2 paged prefill varlen short launch failed: ",
               hipGetErrorString(err));
-  return O;
 }
 
 // Split-K paged prefill varlen host wrapper.
 // Partitions the KV sequence across kv_splits CTAs, each producing
 // partial O/M/L. A reduction kernel combines them into the final O.
-torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
+void fa_rdna2_prefill_paged_varlen_splitk(
     torch::Tensor Q,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -3938,7 +3891,9 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
     int64_t block_size,
     int64_t causal,
     int64_t kv_splits,
-    int64_t sliding_window) {
+    int64_t sliding_window,
+    double scale,
+    torch::Tensor out) {
   TORCH_CHECK(Q.is_cuda() && key_cache.is_cuda() && value_cache.is_cuda(),
               "Q/key_cache/value_cache must be on HIP device");
   TORCH_CHECK(block_table.is_cuda() && cu_query_lens.is_cuda() && seq_lens.is_cuda(),
@@ -3959,6 +3914,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
   TORCH_CHECK(block_table.dim() == 2, "block_table must be [num_seqs, max_blocks]");
   TORCH_CHECK(kv_splits >= 1 && kv_splits <= MAX_SPLITS,
               "kv_splits must be in [1, 16]");
+  fa_check_io(Q, out);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -3974,26 +3930,23 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
   const int num_seqs = seq_lens.size(0);
   TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv");
   const int kv_group_num = H_q / H_kv;
-  const float scale = 1.0f / sqrtf((float)D);
   TORCH_CHECK(num_tokens > 0, "num_tokens must be > 0");
   TORCH_CHECK(num_seqs > 0, "num_seqs must be > 0");
   TORCH_CHECK(cu_query_lens.size(0) >= (int64_t)num_seqs + 1,
               "cu_query_lens must be at least [num_seqs+1]");
 
-  auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
   auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
-  auto O = rdna2_persist_zeros(g_pref_O, {num_tokens, H_q, D}, half_opts);
   // Partial layout: [N, H_q, kv_splits, D] — each query token owns one
   // slot per (head, kv_split). The splitk kernel indexes
   //   ((token_idx * H_q + h_q) * kv_splits + split) * D + t
   // which matches this layout. (The earlier [N, H_q, BR_PREFILL, kv_splits,
   // D] shape allocated BR_PREFILL extra rows per token, wasting
   // BR_PREFILL x memory and OOM-ing at 16k prefill with cudagraphs.)
-  auto O_partial = rdna2_persist_zeros(
+  auto O_partial = rdna2_persist_empty(
       g_pref_Op, {num_tokens, H_q, (int)kv_splits, D}, float_opts);
-  auto M_partial = rdna2_persist_zeros(
+  auto M_partial = rdna2_persist_empty(
       g_pref_Mp, {num_tokens, H_q, (int)kv_splits}, float_opts);
-  auto L_partial = rdna2_persist_zeros(
+  auto L_partial = rdna2_persist_empty(
       g_pref_Lp, {num_tokens, H_q, (int)kv_splits}, float_opts);
 
   const int max_q_blocks = (num_tokens + BR_PREFILL - 1)
@@ -4046,7 +3999,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
         (const float*)O_partial.data_ptr(),
         (const float*)M_partial.data_ptr(),
         (const float*)L_partial.data_ptr(),
-        (half*)O.data_ptr(),
+        (half*)out.data_ptr(),
         max_q_blocks, H_q, (int)kv_splits,
         H_q * HEAD_DIM, HEAD_DIM, num_tokens);
   } else {
@@ -4096,14 +4049,13 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
         (const float*)O_partial.data_ptr(),
         (const float*)M_partial.data_ptr(),
         (const float*)L_partial.data_ptr(),
-        (half*)O.data_ptr(),
+        (half*)out.data_ptr(),
         max_q_blocks, H_q, (int)kv_splits,
         H_q * HEAD_DIM, HEAD_DIM, num_tokens);
   }
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "fa_rdna2 paged prefill varlen splitk launch failed: ",
               hipGetErrorString(err));
-  return O;
 }
 
 
@@ -4164,8 +4116,17 @@ void fa_prefill_paged_varlen_gqa_kernel_256(
   const int q_start_in_seq = q_block * BR;
   const int seq_len = seq_lens[seq_idx];
 
-  if (seq_len <= 0 || q_start_in_seq >= seq_query_len) return;
+  if (q_start_in_seq >= seq_query_len) return;
   const int br_size = min(BR, seq_query_len - q_start_in_seq);
+  if (seq_len <= 0) {
+    for (int i = t; i < HEADS * br_size * 256; i += THREADS) {
+      const int qh_i = i / (br_size * 256);
+      const int qr = (i / 256) % br_size;
+      const int gt = seq_query_start + q_start_in_seq + qr;
+      O[(gt * H_q + q_head_start + qh_i) * 256 + i % 256] = __float2half(0.0f);
+    }
+    return;
+  }
   const int q_base_local = (seq_len - seq_query_len) + q_start_in_seq;
   const int* seq_block_table = block_table + seq_idx * max_blocks;
 
@@ -4174,9 +4135,6 @@ void fa_prefill_paged_varlen_gqa_kernel_256(
   half*  sK = sQ + HEADS * BR * 256;
   half*  sV = sK + BC * DSK;
   float* sP = reinterpret_cast<float*>(sV + BC * DSK);
-  float* sM = sP + HEADS * BR * BC;
-  float* sL = sM + HEADS * BR;
-  float* sD = sL + HEADS * BR;
 
   // The output accumulator lives in registers, not shared memory: thread t
   // owns row t/RP and the RDS consecutive output dims at (t % RP) * RDS.
@@ -4190,6 +4148,15 @@ void fa_prefill_paged_varlen_gqa_kernel_256(
   static_assert(RDS % 8 == 0, "register-O strip must be 16-byte loadable");
   const int o_row = t / RP;
   const int o_d0 = (t % RP) * RDS;
+
+  // Thread t also scores key t % BC of row o_row, so the RP lanes that own a
+  // row's O strips hold that row's BC scores: the online softmax runs in
+  // registers with in-group shuffles, and the running max/sum are replicated
+  // across the group (the xor butterfly gives every lane the same value).
+  static_assert(ROWS * BC == THREADS && RP == BC && (BC & (BC - 1)) == 0,
+                "softmax mapping needs one score per thread, BC lanes per row");
+  const int s_k = t % BC;
+  const int s_qr = o_row % BR;
 
   for (int i = t; i < HEADS * BR * 32; i += THREADS) {
     const int qh_i = i / (BR * 32);
@@ -4208,20 +4175,20 @@ void fa_prefill_paged_varlen_gqa_kernel_256(
   }
   __syncthreads();
 
-  if (t < HEADS * BR) {
-    sM[t] = -INFINITY;
-    sL[t] = 0.0f;
-    sD[t] = 0.0f;
-  }
+  float m_run = -INFINITY;
+  float l_run = 0.0f;
   float o_acc[RDS];
   #pragma unroll
   for (int j = 0; j < RDS; ++j) {
     o_acc[j] = 0.0f;
   }
-  __syncthreads();
 
-  for (int n = 0; n < seq_len; n += BC) {
-    const int blk_size = min(BC, seq_len - n);
+  // Stream over the KV tiles this q block can see.
+  int kv_lo = 0, kv_hi = seq_len;
+  fa_clip_kv_walk(kv_lo, kv_hi, q_base_local, br_size, causal, sliding_window,
+                  BC);
+  for (int n = kv_lo; n < kv_hi; n += BC) {
+    const int blk_size = min(BC, kv_hi - n);
 
     __shared__ int s_blk[BC];
     __shared__ int s_slot[BC];
@@ -4315,82 +4282,54 @@ void fa_prefill_paged_varlen_gqa_kernel_256(
     }
     __syncthreads();
 
-    for (int idx = t; idx < HEADS * BR * BC; idx += THREADS) {
-      const int qh_i = idx / (BR * BC);
-      const int rem = idx % (BR * BC);
-      const int qr = rem / BC;
-      const int k = rem % BC;
-      float score = 0.0f;
-      if (qr < br_size && k < blk_size) {
-        const int q_local = q_base_local + qr;
-        const int k_global = n + k;
-        const bool masked_causal = causal && (k_global > q_local);
-        const bool masked_window = (sliding_window > 0)
-                                   && (k_global < q_local - sliding_window);
-        if (!(masked_causal || masked_window)) {
-          const half* sQ_row = sQ + (qh_i * BR + qr) * 256;
-          const half* sK_row = sK + k * DSK;
-          float acc0 = 0.0f;
-          float acc1 = 0.0f;
-          #pragma unroll
-          for (int d = 0; d < 256; d += 8) {
-            const uint4 qv = *reinterpret_cast<const uint4*>(&sQ_row[d]);
-            const uint4 kv = *reinterpret_cast<const uint4*>(&sK_row[d]);
-            const half2* qh = reinterpret_cast<const half2*>(&qv);
-            const half2* kh = reinterpret_cast<const half2*>(&kv);
-            acc0 = fdot2(qh[0], kh[0], acc0);
-            acc1 = fdot2(qh[1], kh[1], acc1);
-            acc0 = fdot2(qh[2], kh[2], acc0);
-            acc1 = fdot2(qh[3], kh[3], acc1);
-          }
-          score = (acc0 + acc1) * scale;
-        } else {
-          score = -INFINITY;
-        }
+    float score = -INFINITY;
+    if (s_qr < br_size && s_k < blk_size &&
+        !fa_masked(q_base_local + s_qr, n + s_k, causal, sliding_window)) {
+      const half* sQ_row = sQ + o_row * 256;
+      const half* sK_row = sK + s_k * DSK;
+      float acc0 = 0.0f;
+      float acc1 = 0.0f;
+      #pragma unroll
+      for (int d = 0; d < 256; d += 8) {
+        const uint4 qv = *reinterpret_cast<const uint4*>(&sQ_row[d]);
+        const uint4 kv = *reinterpret_cast<const uint4*>(&sK_row[d]);
+        const half2* qh = reinterpret_cast<const half2*>(&qv);
+        const half2* kh = reinterpret_cast<const half2*>(&kv);
+        acc0 = fdot2(qh[0], kh[0], acc0);
+        acc1 = fdot2(qh[1], kh[1], acc1);
+        acc0 = fdot2(qh[2], kh[2], acc0);
+        acc1 = fdot2(qh[3], kh[3], acc1);
       }
-      sP[(qh_i * BR + qr) * BC + k] = score;
+      score = (acc0 + acc1) * scale;
     }
-    __syncthreads();
 
-    for (int idx = t; idx < HEADS * BR; idx += THREADS) {
-      const int qr = idx % BR;
-      if (qr < br_size) {
-        const int acc_i = idx;
-        float row_max = -INFINITY;
-        for (int k = 0; k < blk_size; ++k) {
-          row_max = fmaxf(row_max, sP[acc_i * BC + k]);
-        }
-        if (row_max > -INFINITY) {
-          const float m_old = sM[acc_i];
-          const float m_new = fmaxf(m_old, row_max);
-          const float exp_diff = (m_old == -INFINITY) ? 0.0f
-                                                      : expf(m_old - m_new);
-          float sum_p = 0.0f;
-          for (int k = 0; k < blk_size; ++k) {
-            const float e = __expf(sP[acc_i * BC + k] - m_new);
-            sP[acc_i * BC + k] = e;
-            sum_p += e;
-          }
-          sL[acc_i] = exp_diff * sL[acc_i] + sum_p;
-          sM[acc_i] = m_new;
-          sD[acc_i] = exp_diff;
-        } else {
-          for (int k = 0; k < blk_size; ++k) {
-            sP[acc_i * BC + k] = 0.0f;
-          }
-          sD[acc_i] = 1.0f;
-        }
-      }
+    float tile_max = score;
+    #pragma unroll
+    for (int off = BC / 2; off > 0; off >>= 1) {
+      tile_max = fmaxf(tile_max, __shfl_xor(tile_max, off));
     }
-    __syncthreads();
-
-    // Online-softmax rescale, now applied to the register accumulators (was a
-    // full sO sweep over shared memory).
-    const float o_scale = sD[o_row];
+    // A row whose keys are all masked in this tile keeps its state (and
+    // avoids expf(-inf - -inf) = NaN).
+    float p = 0.0f;
+    float o_scale = 1.0f;
+    if (tile_max > -INFINITY) {
+      const float m_new = fmaxf(m_run, tile_max);
+      o_scale = (m_run == -INFINITY) ? 0.0f : expf(m_run - m_new);
+      p = __expf(score - m_new);
+      m_run = m_new;
+    }
+    float p_sum = p;
+    #pragma unroll
+    for (int off = BC / 2; off > 0; off >>= 1) {
+      p_sum += __shfl_xor(p_sum, off);
+    }
+    l_run = o_scale * l_run + p_sum;
+    sP[o_row * BC + s_k] = p;
     #pragma unroll
     for (int j = 0; j < RDS; ++j) {
       o_acc[j] *= o_scale;
     }
+    __syncthreads();
 
     // P·V: the softmax weight sP[row*BC+k] is hoisted out of the dim loop and
     // reused RDS times, and the V strip is fetched with 16-byte loads.
@@ -4421,7 +4360,7 @@ void fa_prefill_paged_varlen_gqa_kernel_256(
   if (o_row % BR < br_size) {
     const int o_qh = o_row / BR;
     const int o_qr = o_row % BR;
-    const float inv_l = 1.0f / sL[o_row];
+    const float inv_l = 1.0f / l_run;
     const int gt = seq_query_start + q_start_in_seq + o_qr;
     half* o_dst = O + (gt * H_q + q_head_start + o_qh) * 256 + o_d0;
     #pragma unroll
@@ -4434,7 +4373,7 @@ void fa_prefill_paged_varlen_gqa_kernel_256(
 
 
 template <int HEADS_PER_CTA, int BR_STEP>
-torch::Tensor fa_rdna2_prefill_paged_varlen_gqa_impl(
+void fa_rdna2_prefill_paged_varlen_gqa_impl(
     torch::Tensor Q,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -4443,7 +4382,9 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_gqa_impl(
     torch::Tensor seq_lens,
     int64_t block_size,
     int64_t causal,
-    int64_t sliding_window) {
+    int64_t sliding_window,
+    double scale,
+    torch::Tensor out) {
   TORCH_CHECK(Q.is_cuda() && key_cache.is_cuda() && value_cache.is_cuda(),
               "Q/key_cache/value_cache must be on HIP device");
   TORCH_CHECK(block_table.is_cuda() && cu_query_lens.is_cuda() && seq_lens.is_cuda(),
@@ -4459,6 +4400,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_gqa_impl(
   TORCH_CHECK(value_cache.dim() == 5, "value_cache must be 5D");
   TORCH_CHECK(Q.size(2) == 256, "GQA kernel requires D=256");
   TORCH_CHECK(block_table.dim() == 2, "block_table must be [num_seqs, max_blocks]");
+  fa_check_io(Q, out);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -4478,10 +4420,6 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_gqa_impl(
               "kv_group_num must be divisible by HEADS_PER_CTA");
   TORCH_CHECK(cu_query_lens.size(0) >= (int64_t)num_seqs + 1,
               "cu_query_lens must be at least [num_seqs+1]");
-  const float scale = 1.0f / sqrtf(256.0f);
-
-  auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
-  auto O = rdna2_persist_zeros(g_pref_O, {num_tokens, H_q, 256}, half_opts);
 
   constexpr int HEAD_DIM = 256;
   constexpr int BC = 16;
@@ -4491,12 +4429,10 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_gqa_impl(
   const int max_q_blocks = (num_tokens + BR_STEP - 1) / BR_STEP;
   dim3 grid(max_q_blocks, H_kv * num_groups, num_seqs);
   dim3 block(THREADS);
-  // sQ + sK + sV + sP + sM + sL + sD. The O accumulator moved to registers,
-  // and the old arithmetic under-counted the sM/sL/sD block by one row-set.
+  // sQ + sK + sV + sP; O and the softmax state live in registers.
   size_t smem = HEADS_PER_CTA * BR_STEP * HEAD_DIM * sizeof(half)
               + BC * DSK * sizeof(half) * 2
-              + HEADS_PER_CTA * BR_STEP * BC * sizeof(float)
-              + HEADS_PER_CTA * BR_STEP * sizeof(float) * 3;
+              + HEADS_PER_CTA * BR_STEP * BC * sizeof(float);
   hipFuncSetAttribute(
       reinterpret_cast<const void*>(
           fa_prefill_paged_varlen_gqa_kernel_256<HEADS_PER_CTA, BR_STEP,
@@ -4516,17 +4452,16 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_gqa_impl(
           (int)value_cache.stride(0), (int)value_cache.stride(1),
           (int)value_cache.stride(2), (int)value_cache.stride(3),
           (int)value_cache.stride(4),
-          max_blocks, (int)block_size, x_dim, num_seqs, (half*)O.data_ptr(),
+          max_blocks, (int)block_size, x_dim, num_seqs, (half*)out.data_ptr(),
           H_q, H_kv, kv_group_num, scale, (int)causal, (int)sliding_window,
           0.0f, 0.0f, nullptr, nullptr);
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "fa_rdna2 GQA prefill launch failed: ",
               hipGetErrorString(err));
-  return O;
 }
 
 
-torch::Tensor fa_rdna2_prefill_paged_varlen_gqa(
+void fa_rdna2_prefill_paged_varlen_gqa(
     torch::Tensor Q,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -4535,10 +4470,12 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_gqa(
     torch::Tensor seq_lens,
     int64_t block_size,
     int64_t causal,
-    int64_t sliding_window) {
-  return fa_rdna2_prefill_paged_varlen_gqa_impl<2, 8>(
+    int64_t sliding_window,
+    double scale,
+    torch::Tensor out) {
+  fa_rdna2_prefill_paged_varlen_gqa_impl<2, 8>(
       Q, key_cache, value_cache, block_table, cu_query_lens, seq_lens,
-      block_size, causal, sliding_window);
+      block_size, causal, sliding_window, scale, out);
 }
 
 

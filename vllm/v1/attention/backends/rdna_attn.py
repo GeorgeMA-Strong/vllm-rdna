@@ -186,6 +186,13 @@ class RdnaAttentionImpl(AttentionImpl):
             raise NotImplementedError(
                 f"RDNA_ATTN: head_size={head_size} not in "
                 f"{_SUPPORTED_HEAD_SIZES}")
+        # The FA-RDNA2 kernels have no soft-cap or ALiBi term; fail instead
+        # of silently computing plain softmax attention.
+        if logits_soft_cap:
+            raise NotImplementedError(
+                "RDNA_ATTN: logits_soft_cap is not supported")
+        if alibi_slopes is not None:
+            raise NotImplementedError("RDNA_ATTN: ALiBi is not supported")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -195,10 +202,6 @@ class RdnaAttentionImpl(AttentionImpl):
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.sinks = sinks
-        self._alibi = (
-            torch.tensor(alibi_slopes, dtype=torch.float32)
-            if alibi_slopes is not None else None
-        )
         if sliding_window is None:
             self.sliding_window = (-1, -1)
         else:
@@ -280,6 +283,13 @@ class RdnaAttentionImpl(AttentionImpl):
         sliding_window = (self.sliding_window[0] + 1
                           if self.sliding_window[0] >= 0 else 0)
         paged_block_size = key_cache.shape[3]
+        # The kernels index Q as a dense [N, H_q, D] tensor; models without
+        # q-norm hand over a strided view into the fused qkv projection.
+        q = query[:num_actual_tokens].contiguous()
+        # The kernels write straight into the layer output (no copy kernel).
+        out = output[:num_actual_tokens].view(
+            num_actual_tokens, self.num_heads, self.head_size)
+        dst = out if out.is_contiguous() else None
 
         if max_seqlen_q <= 1:
             # hippihx V1 (VLLM_HIPPIHX=1): writes straight into `output`
@@ -305,7 +315,7 @@ class RdnaAttentionImpl(AttentionImpl):
             # few (B*H_q) so more splits = more occupancy, and the
             # combine stage costs <10 us.
             out_paged = fa.fa_rdna2_decode_paged(
-                query[:num_actual_tokens],
+                q,
                 key_cache,
                 value_cache,
                 block_table,
@@ -313,6 +323,8 @@ class RdnaAttentionImpl(AttentionImpl):
                 paged_block_size,
                 kv_splits=16,
                 sliding_window=sliding_window,
+                scale=self.scale,
+                out=dst,
             )
         else:
             _num_seqs = seqused_k.size(0)
@@ -344,7 +356,7 @@ class RdnaAttentionImpl(AttentionImpl):
                     "RDNA_ATTN: non-causal prefill not supported")
             if max_seqlen_k < 4096 and self.head_size == 128:
                 out_paged = fa.fa_rdna2_prefill_paged_varlen_short(
-                    query[:num_actual_tokens],
+                    q,
                     key_cache,
                     value_cache,
                     block_table,
@@ -353,6 +365,8 @@ class RdnaAttentionImpl(AttentionImpl):
                     paged_block_size,
                     causal=True,
                     sliding_window=sliding_window,
+                    scale=self.scale,
+                    out=dst,
                 )
             elif (self.head_size == 256
                     and self.num_kv_heads
@@ -366,7 +380,7 @@ class RdnaAttentionImpl(AttentionImpl):
                           f"heads={self.num_heads} kv_heads={self.num_kv_heads}",
                           flush=True)
                 out_paged = fa.fa_rdna2_prefill_paged_varlen_gqa(
-                    query[:num_actual_tokens],
+                    q,
                     key_cache,
                     value_cache,
                     block_table,
@@ -375,11 +389,13 @@ class RdnaAttentionImpl(AttentionImpl):
                     paged_block_size,
                     causal=True,
                     sliding_window=sliding_window,
+                    scale=self.scale,
+                    out=dst,
                 )
             elif (_kv_splits >= 2 and _num_seqs <= 4
                     and self.num_heads * _kv_splits >= 64):
                 out_paged = fa.fa_rdna2_prefill_paged_varlen_splitk(
-                    query[:num_actual_tokens],
+                    q,
                     key_cache,
                     value_cache,
                     block_table,
@@ -389,10 +405,12 @@ class RdnaAttentionImpl(AttentionImpl):
                     causal=True,
                     kv_splits=_kv_splits,
                     sliding_window=sliding_window,
+                    scale=self.scale,
+                    out=dst,
                 )
             else:
                 out_paged = fa.fa_rdna2_prefill_paged_varlen(
-                    query[:num_actual_tokens],
+                    q,
                     key_cache,
                     value_cache,
                     block_table,
@@ -401,10 +419,11 @@ class RdnaAttentionImpl(AttentionImpl):
                     paged_block_size,
                     causal=True,
                     sliding_window=sliding_window,
+                    scale=self.scale,
+                    out=dst,
                 )
-        output[:num_actual_tokens].view(
-            num_actual_tokens, self.num_heads, self.head_size
-        ).copy_(out_paged)
+        if dst is None:
+            out.copy_(out_paged)
         return output
 
     forward_includes_kv_cache_update: bool = False
