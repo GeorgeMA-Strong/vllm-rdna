@@ -58,6 +58,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SUPPORTED_HEAD_SIZES: tuple[int, ...] = (128, 256)
+# Split decode wins up to this many (query token x head) rows; above it the
+# per-token CTA grid loses to a single prefill launch (measured B=16 H12/2
+# 0.38x, B=8 H12/2 0.80x, vs 1.10-1.21x for B=8 H6/1).
+_SPLIT_DECODE_MAX_ROWS: int = 256
 _SUPPORTED_ARCH_PREFIX: str = "gfx103"
 
 
@@ -390,7 +394,7 @@ class RdnaAttentionImpl(AttentionImpl):
                     "RDNA_ATTN: non-causal prefill not supported")
             nd = attn_metadata.num_decodes
             nd_tok = attn_metadata.num_decode_tokens
-            if nd_tok:
+            if nd_tok and nd_tok * self.num_heads <= _SPLIT_DECODE_MAX_ROWS:
                 # Verify rows and short extends: one split-K CTA group per
                 # query token instead of one prefill CTA walking the whole
                 # KV range per 16-64 query rows.
@@ -407,18 +411,31 @@ class RdnaAttentionImpl(AttentionImpl):
                     out=dst[:nd_tok],
                     cu_query_lens=attn_metadata.decode_query_start_loc,
                 )
-            if nd_tok < num_actual_tokens:
+                if nd_tok < num_actual_tokens:
+                    self._forward_prefill(
+                        q[nd_tok:],
+                        key_cache,
+                        value_cache,
+                        block_table[nd:],
+                        attn_metadata.prefill_query_start_loc,
+                        seqused_k[nd:],
+                        attn_metadata.max_prefill_seq_len,
+                        paged_block_size,
+                        sliding_window,
+                        dst[nd_tok:],
+                    )
+            else:
                 self._forward_prefill(
-                    q[nd_tok:],
+                    q,
                     key_cache,
                     value_cache,
-                    block_table[nd:],
-                    attn_metadata.prefill_query_start_loc,
-                    seqused_k[nd:],
-                    attn_metadata.max_prefill_seq_len,
+                    block_table,
+                    attn_metadata.query_start_loc,
+                    seqused_k,
+                    attn_metadata.max_seq_len,
                     paged_block_size,
                     sliding_window,
-                    dst[nd_tok:],
+                    dst,
                 )
         if dst is not out:
             out.copy_(dst)
