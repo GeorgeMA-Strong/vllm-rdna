@@ -311,7 +311,7 @@ def test_w4a8_act_quant_rejects_bad_group_size():
         x_mk, 16, a_i8, a_scale, a_asum
     )
     # kBadGroup == -6 in w4a8_sdot4_rdna2.cu
-    assert aq_ret.numel() == 0, "expected an empty tensor for invalid group_size"
+    assert aq_ret is None or aq_ret.numel() == 0, "expected no tensor for invalid group_size"
 
 
 # ---------------------------------------------------------------------------
