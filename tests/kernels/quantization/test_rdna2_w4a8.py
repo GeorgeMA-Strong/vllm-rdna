@@ -278,10 +278,10 @@ def test_w4a8_act_quant_matches_numpy(M, group_size):
     a_scale = torch.empty((num_tiles, G, MTILE), dtype=torch.float32, device=device)
     a_asum = torch.empty((num_tiles, G, MTILE), dtype=torch.int32, device=device)
 
-    status = torch.ops._rocm_C.w4a8_act_quant_rdna2(
+    aq_ret = torch.ops._rocm_C.w4a8_act_quant_rdna2(
         x_mk, group_size, a_i8, a_scale, a_asum
     )
-    assert status == 0, f"act_quant returned status={status}"
+    assert aq_ret.numel() > 0, "act_quant returned an empty (ineligible) tensor"
 
     want_a_i8, want_a_scale, want_a_asum = _quant_act_ref(
         x_mk.cpu().numpy().astype(np.float16), group_size, MTILE
@@ -307,7 +307,7 @@ def test_w4a8_act_quant_rejects_bad_group_size():
     a_asum = torch.empty(
         (num_tiles, K // MTILE, MTILE), dtype=torch.int32, device=device
     )
-    status = torch.ops._rocm_C.w4a8_act_quant_rdna2(
+    aq_ret = torch.ops._rocm_C.w4a8_act_quant_rdna2(
         x_mk, 16, a_i8, a_scale, a_asum
     )
     # kBadGroup == -6 in w4a8_sdot4_rdna2.cu
@@ -367,10 +367,10 @@ def test_w4a8_gemm_matches_w4a16_prefill(group_size, default_vllm_config):
 
     assert torch.ops._rocm_C.w4a8_act_quant_rdna2(
         x_mk, group_size, a_i8, a_scale, a_asum
-    ) == 0
+    ).numel() > 0
     # zero_offset=1 for GPTQv1 (use_v2_format=False);
     # config_id=8 (a8_lds_k32_ag); split_k=1.
-    status = torch.ops._rocm_C.w4a8_gemm_rdna2(
+    gemm_ret = torch.ops._rocm_C.w4a8_gemm_rdna2(
         a_i8,
         w_q,
         w_zp,
@@ -384,7 +384,7 @@ def test_w4a8_gemm_matches_w4a16_prefill(group_size, default_vllm_config):
         8,
         1,
     )
-    assert status == 0, f"w4a8_gemm returned status={status}"
+    assert gemm_ret.numel() > 0, "w4a8_gemm returned an empty (ineligible) tensor"
 
     ref = _w4a16_reference(x_mk, q_int4_kn, scales_gn, zeros_gn, group_size)
     rel_l2 = (out.to(torch.float32) - ref.to(torch.float32)).norm() / ref.to(

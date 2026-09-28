@@ -62,28 +62,6 @@ constexpr int kMaxSplit = 16;
 constexpr int kDefaultConfigId = 8;  // a8_lds_k32_ag
 constexpr int kDefaultGroup = 64;
 
-const char* error_str(int code) {
-  switch (code) {
-    case 0:
-      return "ok";
-    case kBadShape:
-      return "bad shape (need N % 8 == 0, K % 32 == 0, K % group == 0)";
-    case kBadConfig:
-      return "unknown config id";
-    case kNotGfx1030:
-      return "current device is not gfx1030";
-    case kLdsTooBig:
-      return "K split does not fit 64 KiB of LDS";
-    case kBadSplit:
-      return "split_k must divide K/group, be <= 16, and be 1 for f32 out";
-    case kBadGroup:
-      return "group size must be 32, 64 or 128";
-    default:
-      return code > 0 ? hipGetErrorString(static_cast<hipError_t>(code))
-                      : "unknown error";
-  }
-}
-
 bool on_gfx1030() {
   thread_local int cached_dev = -1;
   thread_local bool cached_ok = false;
@@ -251,20 +229,20 @@ int launch_act_quant(const void* x, int64_t x_row_stride, void* a, void* a_scale
 // x [M, K] fp16 -> a_i8 [T][K/8][MT][8], a_scale [T][K/G][MT] f32 (per-(token,
 // group) for the A_GROUP config) and a_asum [T][K/G][MT] int32. MT is the M
 // tile of the configured GEMM (a8_lds_k32_ag uses 8). Returns 0 or an error.
-int64_t w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
+at::Tensor w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
                          at::Tensor& a_i8, at::Tensor& a_scale,
                          at::Tensor& a_asum) {
   if (!on_gfx1030()) {
-    return kNotGfx1030;
+    return at::Tensor();
   }
   if (group_index(group_size) < 0) {
-    return kBadGroup;
+    return at::Tensor();
   }
   const int64_t m = x.size(0);
   const int64_t k = x.size(1);
   const int64_t row_stride = x.stride(0);
   if (m <= 0 || k % 32 || k % group_size || row_stride % 8 || row_stride < k) {
-    return kBadShape;
+    return at::Tensor();
   }
   const at::cuda::OptionalCUDAGuard guard(x.device());
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -273,19 +251,20 @@ int64_t w4a8_act_quant_rdna2(const at::Tensor& x, int64_t group_size,
   // one edit, and so Python never branches on M.
   constexpr int kMTile = 8;
   constexpr bool kPerGroup = true;
-  return launch_act_quant<kMTile, kPerGroup>(
+  const int64_t rc = launch_act_quant<kMTile, kPerGroup>(
       x.data_ptr(), row_stride, a_i8.data_ptr(), a_scale.data_ptr(),
       a_asum.data_ptr(), static_cast<int>(m), static_cast<int>(k),
       static_cast<int>(group_size), stream);
+  return rc == 0 ? a_i8 : at::Tensor();
 }
 
-int64_t w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
+at::Tensor w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
                     const at::Tensor& qzeros, const at::Tensor& scales,
                     const at::Tensor& a_scale, const at::Tensor& asum,
                     at::Tensor& out, int64_t k, int64_t group,
                     int64_t zero_offset, int64_t config_id, int64_t split_k) {
   if (!on_gfx1030()) {
-    return kNotGfx1030;
+    return at::Tensor();
   }
   static_assert(kNumConfigs > 0, "empty W4A8 config table");
   const int id = config_id > 0 ? static_cast<int>(config_id) : kDefaultConfigId;
@@ -293,10 +272,10 @@ int64_t w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
   const ConfigEntry* c = find_config(id);
   const int gi = group_index(grp);
   if (!c) {
-    return kBadConfig;
+    return at::Tensor();
   }
   if (gi < 0) {
-    return kBadGroup;
+    return at::Tensor();
   }
   const at::cuda::OptionalCUDAGuard guard(out.device());
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -313,13 +292,13 @@ int64_t w4a8_gemm_rdna2(const at::Tensor& a_i8, const at::Tensor& w_packed,
                    static_cast<int>(zero_offset),
                    static_cast<int>(split_k),
                    out.scalar_type() == at::kFloat};
-  return c->launch[gi](p, stream);
+  return c->launch[gi](p, stream) == 0 ? out : at::Tensor();
 }
 
 // Meta kernels: the V2 model runner profiles and captures with fake tensors, so
 // both ops need a Meta implementation that only reports success. Shapes are
 // validated by the CUDA entries above; nothing here touches data.
-int64_t w4a8_act_quant_rdna2_meta(const at::Tensor& x, int64_t group_size,
+at::Tensor w4a8_act_quant_rdna2_meta(const at::Tensor& x, int64_t group_size,
                                   at::Tensor& a_i8, at::Tensor& a_scale,
                                   at::Tensor& a_asum) {
   (void)x;
@@ -327,10 +306,10 @@ int64_t w4a8_act_quant_rdna2_meta(const at::Tensor& x, int64_t group_size,
   (void)a_i8;
   (void)a_scale;
   (void)a_asum;
-  return 0;
+  return a_i8;
 }
 
-int64_t w4a8_gemm_rdna2_meta(const at::Tensor& a_i8, const at::Tensor& w_packed,
+at::Tensor w4a8_gemm_rdna2_meta(const at::Tensor& a_i8, const at::Tensor& w_packed,
                              const at::Tensor& qzeros,
                              const at::Tensor& scales,
                              const at::Tensor& a_scale,
@@ -349,5 +328,5 @@ int64_t w4a8_gemm_rdna2_meta(const at::Tensor& a_i8, const at::Tensor& w_packed,
   (void)zero_offset;
   (void)config_id;
   (void)split_k;
-  return 0;
+  return out;
 }
