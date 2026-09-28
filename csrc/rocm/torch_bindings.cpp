@@ -148,6 +148,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gptq_gemm_rdna2_prefill", torch::kCUDA,
                 &gptq_gemm_rdna2_prefill);
 
+  // W4A8 (int4 weights, int8 activations) prefill GEMM for gfx1030. Opt-in
+  // drop-in for the dense W4A16 prefill path; both return an int status
+  // (0 = ok, a positive hipError_t, or a negative "not eligible" code) so
+  // the dispatcher can fall back to gptq_gemm_rdna2_prefill.
+  rocm_ops.def(
+      "w4a8_act_quant_rdna2(Tensor x, int group_size, Tensor(a!) a_i8, "
+      "Tensor(a!) a_scale, Tensor(a!) a_asum) -> int");
+  rocm_ops.impl("w4a8_act_quant_rdna2", torch::kCUDA, &w4a8_act_quant_rdna2);
+
+  rocm_ops.def(
+      "w4a8_gemm_rdna2(Tensor a_i8, Tensor w_packed, Tensor qzeros, "
+      "Tensor scales, Tensor a_scale, Tensor asum, Tensor(a!) out, "
+      "int k, int group, int zero_offset, int config_id, int split_k) "
+      "-> int");
+  rocm_ops.impl("w4a8_gemm_rdna2", torch::kCUDA, &w4a8_gemm_rdna2);
+
   // Immortal hipMalloc workspace for GDN/FA eager 16k prefill. Never
   // returns pages to the caching allocator (FULL-graph poison).
   rocm_ops.def("rdna2_immortal_zeros(Tensor ref, int[] size) -> Tensor");
