@@ -90,6 +90,17 @@ else
   capture_sizes=${CG_SIZES:-"[${sizes%,}]"}
 fi
 
+# Kill leftovers (workers + EngineCore + the PLE sidecar) so the next launch
+# does not fail on GPU memory. Scoped to THIS tree's VLLM_CACHE_ROOT: a
+# co-tenant server on other GPUs must never be touched.
+for _sig in TERM KILL; do
+  for _p in $(pgrep -f "entrypoints.cli.main serve|entrypoints.openai.api_server|VLLM::Worker|VLLM::EngineCore|PleOffloadWorker" 2>/dev/null); do
+    [ -r "/proc/$_p/environ" ] || continue
+    tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q "^VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}$" && kill -"$_sig" "$_p" 2>/dev/null
+  done
+  [ "$_sig" = "TERM" ] && sleep 8
+done
+sleep 3
 exec "$runtime/bin/python" -m vllm.entrypoints.openai.api_server \
   --model "$model" --served-model-name flash-next \
   --host 127.0.0.1 --port "$port" \

@@ -70,10 +70,12 @@ export VLLM_USE_BREAKABLE_CUDAGRAPH=1
 # Custom all-reduce is correct under breakable cudagraphs as of 2026-09-16;
 # it beat PYNCCL in all six matrix cells (verified 0/18 with prefix caching).
 # Stock custom all-reduce pulls over PCIe and mis-detects gfx1030 capture.
-# rdna_ar pushes (one-shot or two-shot) and reads the input in place.
+# rdna_ar one-shot reads the input in place and stays <= 64 KiB; above that
+# RCCL is used. Two-shot is NOT boot-safe under PCIe load (wedges warmup).
 export VLLM_FORCE_CUSTOM_ALL_REDUCE="${VLLM_FORCE_CUSTOM_ALL_REDUCE:-0}"
 export VLLM_RDNA_AR=${VLLM_RDNA_AR:-1}
-export VLLM_RDNA_AR_MAX_KB="${VLLM_RDNA_AR_MAX_KB:-20480}"
+export VLLM_RDNA_AR_MAX_KB="${VLLM_RDNA_AR_MAX_KB:-64}"
+export VLLM_RDNA_AR_ONESHOT_KB="${VLLM_RDNA_AR_ONESHOT_KB:-64}"
 # GQA multi-head prefill attention (validated -15.9% cold 16k,
 # -5.8% 16k/1k c=8). Set off to revert to varlen/splitk.
 export VLLM_FA_RDNA2_GQA_MODE="${VLLM_FA_RDNA2_GQA_MODE:-subgroup}"

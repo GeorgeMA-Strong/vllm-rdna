@@ -84,17 +84,17 @@ export ROCM_HOME=/opt/rocm/core-7.14
 export HIP_PATH=/opt/rocm/core-7.14
 export HIP_VISIBLE_DEVICES
 
-# Kill leftovers (workers + EngineCore + the PLE offload sidecar, not just the
-# API server) so the next launch does not fail on GPU memory.
-pkill -f "entrypoints.cli.main serve" 2>/dev/null || true
-pkill -f "VLLM::Worker" 2>/dev/null || true
-pkill -f "VLLM::EngineCore" 2>/dev/null || true
-pkill -f "PleOffloadWorker" 2>/dev/null || true
-sleep 8
-pkill -9 -f "entrypoints.cli.main serve" 2>/dev/null || true
-pkill -9 -f "VLLM::Worker" 2>/dev/null || true
-pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
-pkill -9 -f "PleOffloadWorker" 2>/dev/null || true
+export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cache/vllm}
+# Kill leftovers (workers + EngineCore + the PLE sidecar) so the next launch
+# does not fail on GPU memory. Scoped to THIS tree's VLLM_CACHE_ROOT: a
+# co-tenant server on other GPUs must never be touched.
+for _sig in TERM KILL; do
+  for _p in $(pgrep -f "entrypoints.cli.main serve|entrypoints.openai.api_server|VLLM::Worker|VLLM::EngineCore|PleOffloadWorker" 2>/dev/null); do
+    [ -r "/proc/$_p/environ" ] || continue
+    tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q "^VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}$" && kill -"$_sig" "$_p" 2>/dev/null
+  done
+  [ "$_sig" = "TERM" ] && sleep 8
+done
 sleep 3
 
 cd /tmp
@@ -102,7 +102,8 @@ nohup setsid bash -c "python -m vllm.entrypoints.cli.main serve \"$MODEL\" \
   --served-model-name \"$SERVED_NAME\" \
   --port $PORT --host 0.0.0.0 --tensor-parallel-size $TP \
   ${MAX_MODEL_LEN:+--max-model-len $MAX_MODEL_LEN} --max-num-seqs $MAX_NUM_SEQS \
-  --max-num-batched-tokens 2048 \
+  --max-num-batched-tokens ${MAXBAT:-2048} \
+  --long-prefill-token-threshold ${LPTH:-0} \
   --kv-cache-memory-bytes $KV_CACHE_MEMORY --gpu-memory-utilization $GPU_MEM \
   --dtype float16 --trust-remote-code --enable-prefix-caching \
   --enable-prompt-tokens-details \
