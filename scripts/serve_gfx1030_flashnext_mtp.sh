@@ -18,7 +18,7 @@ source_dir=${VLLM_TREE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 runtime=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.28.0}
 model=${MODEL:-$HOME/hfcache/hub/models--wtdcode--Qwen3.8-Flash-Next-AWQ-W4A16/snapshots/0939125b929543a783ce700c90e36dd1a575c00c}
 port=${PORT:-18096}
-attn=${ATTN:-triton}
+attn=${ATTN:-fa}   # FA-RDNA2 = the fastest validated HIP attention path (ATTN=triton falls back)
 mtp=${MTP:-2}
 tunableop=${TUNABLEOP:-1}
 
@@ -64,6 +64,9 @@ fi
 if [ "$attn" = "fa" ]; then
   export VLLM_USE_RDNA2_FA=1
   attention_backend=RDNA_ATTN
+  # GQA decode kernel: validated (coherent, +speed) with the decode path;
+  # see docs/rdna2/pr28-fa-rdna2-validation-2026-09-28.md.
+  export VLLM_FA_RDNA2_GQA_DECODE="${VLLM_FA_RDNA2_GQA_DECODE:-1}"
   unset FLASH_ATTENTION_TRITON_AMD_ENABLE || true
 else
   export VLLM_USE_RDNA2_FA=0

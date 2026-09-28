@@ -129,11 +129,13 @@ class RdnaAttentionMetadata:
 
 class RdnaAttentionMetadataBuilder(
         AttentionMetadataBuilder[RdnaAttentionMetadata]):
-    # fa_rdna2_decode_paged is single-token-only; MTP-verify batches (ql>1)
-    # must stay on the piecewise path.
+    # MTP-verify batches are uniform (every seq drafts decode_width tokens),
+    # so they can be captured and replayed in FULL graphs. The draft decode
+    # metadata updates in place between speculative steps (skip the rebuild).
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        AttentionCGSupport.UNIFORM_BATCH
     )
+    supports_draft_decode_metadata_update = True
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -162,8 +164,10 @@ class RdnaAttentionMetadataBuilder(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> RdnaAttentionMetadata:
         attn_metadata = self.build(0, common_attn_metadata)
+        # seq_lens=1 keeps capture fast; replay writes the real values.
+        # query_start_loc keeps its capture pattern (uniform decodes are
+        # 1, 2, 4 or 8 * decode_width tokens, so cu is stable per graph).
         attn_metadata.seq_lens.fill_(1)
-        common_attn_metadata.query_start_loc.zero_()
         return attn_metadata
 
 
@@ -328,6 +332,31 @@ class RdnaAttentionImpl(AttentionImpl):
             )
         else:
             _num_seqs = seqused_k.size(0)
+            # Uniform short causal batches (MTP verify, tail chunks): token i
+            # of a sequence with query length L attends to keys
+            # [0, S - (L - 1 - i)), which is exactly a single-token decode.
+            # Per-position decode calls reuse the validated decode kernel
+            # instead of walking the context with a prefill kernel.
+            if (dst is not None and 1 < max_seqlen_q <= 8
+                    and num_actual_tokens == _num_seqs * max_seqlen_q):
+                for _i in range(max_seqlen_q):
+                    _qi = q[_i::max_seqlen_q].contiguous()
+                    _si = (seqused_k - (max_seqlen_q - 1 - _i)).to(torch.int32)
+                    _di = torch.empty_like(_qi)
+                    fa.fa_rdna2_decode_paged(
+                        _qi,
+                        key_cache,
+                        value_cache,
+                        block_table,
+                        _si,
+                        paged_block_size,
+                        kv_splits=16,
+                        sliding_window=sliding_window,
+                        scale=self.scale,
+                        out=_di,
+                    )
+                    out[_i::max_seqlen_q].copy_(_di)
+                return output
             _kv_splits = min(8, (max_seqlen_k + 1023) // 1024)
             if os.environ.get("VLLM_BT_DEBUG", "0") == "1" and max_seqlen_k >= 784:
                 try:
