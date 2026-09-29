@@ -74,6 +74,12 @@ def _w4a8_lds_fits(k: int, group_size: int) -> bool:
         if groups % split:
             continue
         kps = k // split
+        # Mirror compute_split_k: the kernel's K_STEP-wide loop never clamps
+        # the tail, so a split whose k_per_split is not a multiple of 32 would
+        # over-read the split. k % 32 == 0 is part of the gate, so split=1 is
+        # always aligned.
+        if kps % 32:
+            continue
         if 8 * kps + 8 * (kps // group_size) * 8 <= 64 * 1024:
             return True
     return False

@@ -131,6 +131,12 @@ void w4a8_log_shape(int m, int k, int n, int group) {
 
 // Mirror of pick_split_k's LDS cap: some group-aligned split <= 16 must bring
 // M_TILE=8 rows of K plus the per-(token, group) scales under 64 KiB of LDS.
+//
+// The K_STEP-alignment guard mirrors pick_split_k/compute_split_k: the kernel
+// walks K in K_STEP-wide chunks and never clamps the tail to k_per_split, so a
+// split whose k_per_split is not a whole multiple of K_STEP would read past
+// the split. `k % 32 == 0` is part of the eligibility gate, so split=1 is
+// always aligned and the scan still terminates on every eligible shape.
 bool w4a8_lds_fits(int k, int group_size) {
   const int groups = k / group_size;
   for (int split = 16; split >= 1; --split) {
@@ -138,6 +144,9 @@ bool w4a8_lds_fits(int k, int group_size) {
       continue;
     }
     const int kps = k / split;
+    if (kps % 32) {
+      continue;
+    }
     if (8 * kps + 8 * (kps / group_size) * 8 <= 64 * 1024) {
       return true;
     }
@@ -170,7 +179,12 @@ int pick_split_k(int m, int n, int k) {
   int splits[kMaxSplit];
   int count = 0;
   for (int s = 1; s <= kMaxSplit; ++s) {
-    if (groups % s == 0) {
+    // Group-aligned AND K_STEP-aligned: the kernel's K_STEP-wide inner loop
+    // never clamps the tail to k_per_split, so a split with
+    // (k / s) % K_STEP != 0 would over-read the split. `k % 32 == 0` is
+    // checked by the caller, so s=1 is always aligned and the list is
+    // non-empty.
+    if (groups % s == 0 && (k / s) % C::K_STEP == 0) {
       splits[count++] = s;
     }
   }
