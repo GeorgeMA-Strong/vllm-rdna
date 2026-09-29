@@ -16,7 +16,7 @@ sha256 (see `provenance.json`).
   cudagraph capture sizes for MTP-0 `[1,2,4,8]` and MTP-2 `[3,6,12,24]`. The
   decode path was therefore falling back to rocBLAS heuristics for those
   shapes, which dominate c=1 latency.
-* 141 of the 719 rows are new (the M ≤ 8 decode projections for every `(N, K)`
+* 120 of the 719 rows are new (the M ≤ 8 decode projections for every `(N, K)`
   pair already seen at M ≤ 32).
 * 302 rows were dropped: Default entries that reproduce the heuristic, and a
   handful of harvested rows that a fresh measurement found slower than the
@@ -73,11 +73,11 @@ TunableOp lookup enabled for rocBLAS build f30bb442e9b5 (rows: .../tunableop/roc
 ## Measured (4× V620, TP=4, Qwen3.8-Flash-Next-AWQ-W4A16)
 
 See [`bench_results/2026-09-29_tunableop-rows/SUMMARY.md`](../../../bench_results/2026-09-29_tunableop-rows/SUMMARY.md)
-for the per-shape before/after table. The lookup-vs-heuristic A/B is the shipped
-evidence: the missing M ≤ 8 lm_head shapes go from ~2.77 ms (heuristic) to
-~0.90 ms (3.0×) at M=1, 2.7–2.8× for M=2..8, which is the c=1 decode recovery.
-End-to-end cells with these frozen rows are recorded under
-`bench_results/2026-09-29_tunableop-rows/e2e/`.
+for the per-shape before/after table and the full end-to-end cell matrix on
+both the W4A16 and W4A8 arms. In short: the c=1 cells recover on both arms
+(W4A8 1k/512 c=1 41.0 → 42.6 tok/s; 16k/1k c=1 31.3 → 32.5 tok/s) with no
+regression on c=8 and a clean coherence probe (France → Paris, 2+2 → 4) on
+every cell.
 
 ## Caveats
 
