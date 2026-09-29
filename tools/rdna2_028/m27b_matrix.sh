@@ -37,7 +37,7 @@ for p in "The capital of France is" "2 + 2 ="; do
     -d "{\"model\":\"q27d\",\"prompt\":\"$p\",\"max_tokens\":12,\"temperature\":0}" \
     | python3 -c "import sys,json;d=json.load(sys.stdin);print(repr(d['choices'][0]['text']))" 2>/dev/null || echo "(no response)"
 done | tee "$D/coherence.txt"
-cd /tmp
+cd "$D"
 for cell in "1 16384 1024 111" "8 16384 1024 112" "1 1024 512 221" "8 1024 512 222"; do
   set -- $cell
   echo "--- bench c=$1 in=$2 out=$3"

@@ -30,8 +30,11 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn GPU_MAX_HW_QUEUES=2
 export HIP_VISIBLE_DEVICES=${GPUIDS:-0}
 export VLLM_ROCM_USE_AITER=0 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE VLLM_RDNA_FORCE_FP16=1
-export TORCH_BLAS_PREFER_HIPBLASLT=0 PYTORCH_TUNABLEOP_ENABLED=1
-export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0 VLLM_BATCH_INVARIANT=0
+export TORCH_BLAS_PREFER_HIPBLASLT=0 VLLM_BATCH_INVARIANT=0
+# Rows live in the fork; never let TunableOp fall back to its default /tmp name.
+# shellcheck source=tools/rdna2_028/tunableop_env.sh
+source "$T/tools/rdna2_028/tunableop_env.sh"
+configure_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$T/tunableop"
 export VLLM_CACHE_ROOT=$T/cache/vllm
 export TRITON_CACHE_DIR=$T/cache/triton
 export TORCHINDUCTOR_CACHE_DIR=$T/cache/inductor
