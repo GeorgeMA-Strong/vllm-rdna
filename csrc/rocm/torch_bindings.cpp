@@ -293,6 +293,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int output_topk) -> ()");
   rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
 
+  // W4A8 (int4 weights, int8 activations) fused MoE for gfx1030. Drop-in for
+  // moe_gptq_gemm_rdna2 (same args plus the trailing use_v2_format); owns the
+  // shape/LDS eligibility and the internal W4A16 fallback, so the Python
+  // forward never branches on an op result. Fake kernel lives in
+  // _custom_ops.py (register_fake).
+  rocm_ops.def(
+      "moe_w4a8_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "
+      "Tensor(a) b_scales, Tensor b_qzeros, Tensor(a) topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "int output_topk=0, bool use_v2_format=False) -> ()");
+  rocm_ops.impl("moe_w4a8_gemm_rdna2", torch::kCUDA, &moe_w4a8_gemm_rdna2);
+
   // W8A16 (INT8 weight + fp16 act) fused MoE kernel for RDNA2.
   rocm_ops.def(
       "moe_w8a16_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "

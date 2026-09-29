@@ -191,6 +191,21 @@ void moe_gptq_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                          int64_t block_size_m, bool mul_topk_weight,
                          int64_t output_topk);
 
+// W4A8 (int4 weights, int8 activations) fused MoE for gfx1030. Opt-in
+// drop-in for moe_gptq_gemm_rdna2 on the same packed weight layout: quants the
+// whole token batch once, fires the sdot4 MoE kernel, and falls back internally
+// to moe_gptq_gemm_rdna2 on any ineligibility. Same arg list plus the trailing
+// zero-offset selector (use_v2_format: 0 for AWQ uint4, 1 for GPTQv1 uint4b8).
+// Definitions in csrc/rocm/moe_w4a8_rdna2.cu.
+void moe_w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
+                         torch::Tensor b_q_weight, torch::Tensor b_scales,
+                         torch::Tensor b_qzeros, torch::Tensor topk_weights,
+                         torch::Tensor sorted_token_ids,
+                         torch::Tensor expert_ids,
+                         torch::Tensor num_tokens_post_padded, int64_t top_k,
+                         int64_t block_size_m, bool mul_topk_weight,
+                         int64_t output_topk, bool use_v2_format);
+
 // W8A16-FP8 dense linear kernel for AMD RDNA2 (gfx1030).
 // Per-tile FP8 (E4M3) -> fp16 dequant via 256-entry LUT, then v_dot2_f32_f16.
 void gemm_w8a16_fp8_dense(torch::Tensor a, torch::Tensor b_q_weight,
