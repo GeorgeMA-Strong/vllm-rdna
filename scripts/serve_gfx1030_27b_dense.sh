@@ -7,7 +7,7 @@
 # Usage:
 #   MTP=0 bash scripts/serve_gfx1030_27b_dense.sh            # plain decode
 #   MTP=2 bash scripts/serve_gfx1030_27b_dense.sh            # MTP spec decode
-# Env: MTP(0|2), W4A8(0|1), ATTN(fa|triton), TP, PORT, MAXBAT, KV, SEQS,
+# Env: MTP(0|2), W4A8(0|1), RDNA_AR(0|1), ATTN(fa|triton), TP, PORT, MAXBAT, KV, SEQS,
 #      MAXLEN (unset = model default), CG_MODE, CG_SIZES, MODEL, VENV, VLLM_TREE.
 set -euo pipefail
 
@@ -19,6 +19,7 @@ tp=${TP:-4}
 attn=${ATTN:-fa}
 mtp=${MTP:-0}
 w4a8=${W4A8:-1}
+rdna_ar=${RDNA_AR:-1}
 
 export PYTHONPATH=$source_dir
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
@@ -38,7 +39,7 @@ export VLLM_RDNA2_W4A8_SDOT4=$w4a8
 # One-shot up to 64 KiB, RCCL above; the stock custom-AR force flag stays off
 # (it PCI-SERRs this chassis, AGENTS.md 2026-09-24).
 export VLLM_FORCE_CUSTOM_ALL_REDUCE=0
-export VLLM_RDNA_AR=1 VLLM_RDNA_AR_MAX_KB=${VLLM_RDNA_AR_MAX_KB:-64} VLLM_RDNA_AR_ONESHOT_KB=${VLLM_RDNA_AR_ONESHOT_KB:-64} VLLM_RDNA_AR_BLOCKS=0 VLLM_RDNA_AR_PACE=0
+export VLLM_RDNA_AR=$rdna_ar VLLM_RDNA_AR_MAX_KB=${VLLM_RDNA_AR_MAX_KB:-64} VLLM_RDNA_AR_ONESHOT_KB=${VLLM_RDNA_AR_ONESHOT_KB:-64} VLLM_RDNA_AR_BLOCKS=0 VLLM_RDNA_AR_PACE=0
 export HSA_FORCE_FINE_GRAIN_PCIE=1 HSA_ENABLE_SDMA=0 OMP_NUM_THREADS=4
 export TOKENIZERS_PARALLELISM=false PYTHONFAULTHANDLER=1
 export VLLM_CAUSAL_CONV1D_RDNA2_FWD=0 VLLM_CAUSAL_CONV1D_RDNA2_UPDATE=0
