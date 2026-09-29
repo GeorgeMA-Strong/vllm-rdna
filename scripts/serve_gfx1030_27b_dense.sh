@@ -80,6 +80,14 @@ cg_mode=${CG_MODE:-FULL_AND_PIECEWISE}
 maxlen_arg=()
 [ -n "${MAXLEN:-}" ] && maxlen_arg=(--max-model-len "$MAXLEN")
 
+# EAGER=1 skips torch.compile + cudagraphs. The W4A8 fast path lives in the
+# eager model forward, so shapes/acceptance are unaffected; this only trades
+# throughput for a boot that cannot be killed by a mid-compile chassis reset.
+compile_args=(--compilation-config "{\"cudagraph_mode\":\"$cg_mode\",\"cudagraph_capture_sizes\":$capture_sizes,\"compile_ranges_endpoints\":[]}")
+if [ "${EAGER:-0}" = "1" ]; then
+  compile_args=(--enforce-eager)
+fi
+
 # Kill leftovers scoped to THIS tree's cache root so a co-tenant is never touched.
 for _sig in TERM KILL; do
   for _p in $(pgrep -f "entrypoints.cli.main serve|entrypoints.openai.api_server|VLLM::Worker|VLLM::EngineCore|PleOffloadWorker" 2>/dev/null); do
@@ -98,7 +106,7 @@ exec "$runtime/bin/python" -m vllm.entrypoints.cli.main serve \
   --max-num-seqs "${SEQS:-8}" --max-num-batched-tokens "${MAXBAT:-2048}" \
   --kv-cache-memory-bytes "${KV:-8000000000}" \
   --gpu-memory-utilization "${GMEM:-0.9}" \
-  --compilation-config "{\"cudagraph_mode\":\"$cg_mode\",\"cudagraph_capture_sizes\":$capture_sizes,\"compile_ranges_endpoints\":[]}" \
+  "${compile_args[@]}" \
   "${maxlen_arg[@]}" \
   "${spec_args[@]}" \
   --enable-prefix-caching --mamba-cache-mode align \

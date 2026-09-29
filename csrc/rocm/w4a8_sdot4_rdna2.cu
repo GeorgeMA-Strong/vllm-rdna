@@ -31,7 +31,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -95,6 +99,34 @@ int group_index(int64_t group_size) {
     default:
       return -1;
   }
+}
+
+// Env-gated diagnostic: when VLLM_RDNA2_W4A8_DEBUG=1, log each distinct
+// (m, k, n, group) shape that actually fires the W4A8 fast path, once per
+// shape per process. Read the env once (thread-safe) so the traced forward
+// never touches it.
+bool w4a8_debug_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("VLLM_RDNA2_W4A8_DEBUG");
+    return v != nullptr && std::strcmp(v, "1") == 0;
+  }();
+  return enabled;
+}
+
+void w4a8_log_shape(int m, int k, int n, int group) {
+  static std::mutex mu;
+  static std::set<std::tuple<int, int, int, int>> seen;
+  const std::tuple<int, int, int, int> key{m, k, n, group};
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!seen.insert(key).second) {
+      return;
+    }
+  }
+  fprintf(stderr,
+          "[W4A8-DEBUG] fast path fired: m=%d k=%d n=%d group=%d\n", m, k, n,
+          group);
+  fflush(stderr);
 }
 
 // Mirror of pick_split_k's LDS cap: some group-aligned split <= 16 must bring
@@ -353,5 +385,8 @@ at::Tensor w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
   }
 
   TORCH_WARN_ONCE("RDNA2 W4A8 sdot4 path active (config a8_lds_k32_ag)");
+  if (w4a8_debug_enabled()) {
+    w4a8_log_shape(size_m, size_k, size_n, group_size);
+  }
   return out;
 }
