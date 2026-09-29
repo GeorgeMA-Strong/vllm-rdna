@@ -20,7 +20,7 @@ ROCM_SDK_LIB=$V/lib/python3.12/site-packages/_rocm_sdk_libraries/lib
 ROCM_SDK=$V/lib/python3.12/site-packages/_rocm_sdk_core/lib
 export LD_LIBRARY_PATH="$ROCM_SDK_LIB:$ROCM_SDK/host-math/lib:$ROCM_SDK/rocm_sysdeps/lib:$ROCM_SDK/core/lib:$V/lib/python3.12/site-packages/torch/lib"
 
-setsid nohup env MTP=$MTP W4A8=${W4A8:-1} ATTN=fa TP=${TP:-4} PORT=$PORT \
+setsid nohup env MTP=$MTP W4A8=${W4A8:-0} ATTN=fa TP=${TP:-4} PORT=$PORT \
   KV=${KV:-8000000000} SEQS=${SEQS:-8} MAXBAT=${MAXBAT:-2048} \
   CG_MODE=${CG_MODE:-FULL_AND_PIECEWISE} MODEL="$MODEL" \
   bash "$T/scripts/serve_gfx1030_27b_dense.sh" > "$D/serve.log" 2>&1 < /dev/null &

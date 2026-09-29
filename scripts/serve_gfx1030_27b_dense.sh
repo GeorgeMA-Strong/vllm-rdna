@@ -18,7 +18,7 @@ port=${PORT:-18210}
 tp=${TP:-4}
 attn=${ATTN:-fa}
 mtp=${MTP:-0}
-w4a8=${W4A8:-1}
+w4a8=${W4A8:-0}
 rdna_ar=${RDNA_AR:-1}
 
 export PYTHONPATH=$source_dir
