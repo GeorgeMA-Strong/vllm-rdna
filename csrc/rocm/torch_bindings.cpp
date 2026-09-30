@@ -148,6 +148,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gptq_gemm_rdna2_prefill", torch::kCUDA,
                 &gptq_gemm_rdna2_prefill);
 
+  // W4A8 (int4 weights, int8 activations) prefill GEMM for gfx1030. Opt-in
+  // drop-in for the dense W4A16 prefill path; the gemm entry returns a
+  // populated [M, N] fp16 tensor whether the W4A8 fast path fired or the
+  // W4A16 prefill fallback ran, so the dispatcher never branches on
+  // shape/LDS at runtime. Fake kernels live in _custom_ops.py (register_fake);
+  // there are no C++ meta stubs.
+  rocm_ops.def(
+      "w4a8_act_quant_rdna2(Tensor x, int group_size, Tensor(a!) a_i8, "
+      "Tensor(a!) a_scale, Tensor(a!) a_asum) -> Tensor");
+  rocm_ops.impl("w4a8_act_quant_rdna2", torch::kCUDA, &w4a8_act_quant_rdna2);
+
+  rocm_ops.def(
+      "w4a8_gemm_rdna2(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
+  rocm_ops.impl("w4a8_gemm_rdna2", torch::kCUDA, &w4a8_gemm_rdna2);
+
   // Immortal hipMalloc workspace for GDN/FA eager 16k prefill. Never
   // returns pages to the caching allocator (FULL-graph poison).
   rocm_ops.def("rdna2_immortal_zeros(Tensor ref, int[] size) -> Tensor");
@@ -276,6 +292,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int top_k, int block_size_m, bool mul_topk_weight, "
       "int output_topk) -> ()");
   rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
+
+  // W4A8 (int4 weights, int8 activations) fused MoE for gfx1030. Drop-in for
+  // moe_gptq_gemm_rdna2 (same args plus the trailing use_v2_format); owns the
+  // shape/LDS eligibility and the internal W4A16 fallback, so the Python
+  // forward never branches on an op result. Fake kernel lives in
+  // _custom_ops.py (register_fake).
+  rocm_ops.def(
+      "moe_w4a8_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "
+      "Tensor(a) b_scales, Tensor b_qzeros, Tensor(a) topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "int output_topk=0, bool use_v2_format=False) -> ()");
+  rocm_ops.impl("moe_w4a8_gemm_rdna2", torch::kCUDA, &moe_w4a8_gemm_rdna2);
 
   // W8A16 (INT8 weight + fp16 act) fused MoE kernel for RDNA2.
   rocm_ops.def(
