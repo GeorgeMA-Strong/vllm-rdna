@@ -134,11 +134,14 @@ def test_rdna2_w4a16_dispatch_under_vllm_compile(
                 x, w_q, tag
             ),
         )
+    # The registered op is a ROCm/CUDA op; on a GPU box the custom-op arm must
+    # run on the device it was registered for, not on CPU tensors.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     k, n = 4096, 256
-    w_q = torch.zeros(k // 8, n, dtype=torch.int32)
-    w_zp = torch.zeros(k // 128, n // 8, dtype=torch.int32)
-    w_s = torch.ones(k // 128, n, dtype=torch.float16)
-    g_idx = torch.empty(0, dtype=torch.int32)
+    w_q = torch.zeros(k // 8, n, dtype=torch.int32, device=device)
+    w_zp = torch.zeros(k // 128, n // 8, dtype=torch.int32, device=device)
+    w_s = torch.ones(k // 128, n, dtype=torch.float16, device=device)
+    g_idx = torch.empty(0, dtype=torch.int32, device=device)
     gemm = (
         torch.ops.vllm.rdna2_w4a16_gemm if runtime_dispatch else mod._rdna2_w4a16_gemm
     )
@@ -155,13 +158,13 @@ def test_rdna2_w4a16_dispatch_under_vllm_compile(
         options={"guard_filter_fn": lambda guards: [False] * len(guards)},
     )
     torch._dynamo.reset()
-    x = torch.zeros(512, k, dtype=torch.float16)
+    x = torch.zeros(512, k, dtype=torch.float16, device=device)
     torch._dynamo.mark_dynamic(x, 0)
     assert mod._rdna2_w4a16_select_kernel(512, k, n, is_awq=is_awq) == traced_op
     assert mod._rdna2_w4a16_select_kernel(1, k, n, is_awq=is_awq) == "rdna2_decode"
 
     assert compiled(x)[0, 0].item() == _STAND_INS[traced_op][1]
-    decode = compiled(torch.zeros(1, k, dtype=torch.float16))[0, 0].item()
+    decode = compiled(torch.zeros(1, k, dtype=torch.float16, device=device))[0, 0].item()
     assert counter.frame_count == 1
     assert decode == _STAND_INS["rdna2_decode" if runtime_dispatch else traced_op][1]
 

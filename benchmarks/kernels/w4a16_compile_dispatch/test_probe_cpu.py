@@ -13,10 +13,12 @@ GRAPH = """
 # File: rdna2_w4a16.py:291 in apply_weights, code: output = ops.gptq_gemm_rdna2(
 gptq_gemm_rdna2_prefill = torch.ops._rocm_C.gptq_gemm_rdna2_prefill.default(x, w)
 gptq_gemm_rdna2_prefill_1 = torch.ops._rocm_C.gptq_gemm_rdna2_prefill.default(y, w)
+gptq_gemm_rdna2_prefill_2 = vllm__custom_ops_gptq_gemm_rdna2_prefill(z, w)
 gptq_gemm_rdna2 = torch.ops._rocm_C.gptq_gemm_rdna2.default(z, w)
 gptq_gemm = torch.ops._C.gptq_gemm.default(z, w, True, False, 4)
 direct = torch.ops._rocm_C.gptq_gemm_rdna2_prefill_direct.default(z, w)
 rdna2_w4a16_gemm = torch.ops.vllm.rdna2_w4a16_gemm.default(z, w, 6144, True, 4)
+w4a8_gemm_rdna2 = torch.ops._rocm_C.w4a8_gemm_rdna2.default(z, w, False)
 """
 
 
@@ -27,10 +29,11 @@ def test_graph_ops_counts_calls_not_source_comments(tmp_path):
     found = probe.count_graph_ops(tmp_path / "torch_compile_cache")
     assert found == {
         "abc/rank_0_0/backbone/computation_graph.py": {
-            "gptq_gemm_rdna2_prefill": 2,
+            "gptq_gemm_rdna2_prefill": 3,
             "gptq_gemm_rdna2": 1,
             "gptq_gemm": 1,
             "rdna2_w4a16_gemm": 1,
+            "w4a8_gemm_rdna2": 1,
         }
     }
 
@@ -43,12 +46,14 @@ def test_kernel_stats_group_by_launching_op(tmp_path):
         '"vllm::gptq_rdna2_prefill::gemm_dynamic_kernel<A>()",30,9000000,1,1\n'
         '"vllm::gptq_rdna2_prefill::gemm_dynamic_kernel<B>()",5,1000000,1,1\n'
         '"gemm_half_q_half_gptq_4bit_kernel<true, 1>()",2,500000,1,1\n'
+        '"void vllm::explore_w4a8::w4a8_gemm_kernel<C>()",4,400000,1,1\n'
         '"fa_decode_paged_splitk_kernel_256<__half>()",7,700000,1,1\n'
     )
     assert probe.summarize_kernels(stats) == {
         "rdna2_decode": {"calls": 10, "total_ms": 2.0},
         "prefill": {"calls": 35, "total_ms": 10.0},
         "exllama": {"calls": 2, "total_ms": 0.5},
+        "w4a8_prefill": {"calls": 4, "total_ms": 0.4},
     }
 
 

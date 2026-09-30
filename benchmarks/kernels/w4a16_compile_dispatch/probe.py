@@ -31,9 +31,12 @@ from pathlib import Path
 
 import regex as re
 
+from ._layers import _collect_w4a16_layers
+
 W4A16_OP = re.compile(
-    r"torch\.ops\.(?:_rocm_C|_C|vllm)\.(gptq_gemm_rdna2_prefill|gptq_gemm_rdna2"
-    r"|gptq_gemm|awq_gemm_rdna2_prefill|rdna2_w4a16_gemm)\b"
+    r"(?:torch\.ops\.(?:_rocm_C|_C|vllm)\.|vllm__custom_ops_)"
+    r"(gptq_gemm_rdna2_prefill|gptq_gemm_rdna2|gptq_gemm|awq_gemm_rdna2_prefill"
+    r"|rdna2_w4a16_gemm|w4a8_gemm_rdna2|moe_w4a8_gemm_rdna2)\b"
 )
 # Kernel families in rocprofv3 names -> the op that launches them.
 KERNEL_FAMILIES = {
@@ -41,6 +44,7 @@ KERNEL_FAMILIES = {
     "gemm_dynamic_kernel": "prefill",
     "gemm_static_kernel": "prefill",
     "gemm_half_q_half": "exllama",
+    "w4a8_gemm_kernel": "w4a8_prefill",
 }
 M_PROBES = (1, 2, 4, 8, 16, 32, 64, 256, 512, 2048)
 GREEDY_PROMPTS = [
@@ -90,23 +94,6 @@ def summarize_kernels(path: Path) -> dict[str, dict[str, float]]:
     return out
 
 
-def _collect_w4a16_layers(model) -> list[tuple[str, int, int, bool]]:
-    from vllm.model_executor.kernels.linear.mixed_precision.rdna2_w4a16 import (
-        RDNA2W4A16LinearKernel,
-    )
-    from vllm.scalar_type import scalar_types
-
-    layers = []
-    for name, module in model.named_modules():
-        qm = getattr(module, "quant_method", None)
-        for kernel in vars(qm).values() if qm is not None else ():
-            if isinstance(kernel, RDNA2W4A16LinearKernel):
-                k, n = kernel.config.partition_weight_shape
-                is_awq = kernel.config.weight_type == scalar_types.uint4
-                layers.append((name, k, n, is_awq))
-    return layers
-
-
 def _timed(llm, prompts, params, repeat: int) -> tuple[float, int]:
     times, tokens = [], 0
     for _ in range(repeat):
@@ -146,8 +133,10 @@ def cmd_run(args) -> dict:
     expected = {
         m: dict(
             collections.Counter(
-                _rdna2_w4a16_select_kernel(m, k, n, is_awq=awq)
-                for _, k, n, awq in layers
+                _rdna2_w4a16_select_kernel(
+                    m, k, n, is_awq=awq, w4a8=w4a8, group_size=group
+                )
+                for _, k, n, awq, group, w4a8 in layers
             )
         )
         for m in sorted({*M_PROBES, trace_m})
@@ -172,6 +161,7 @@ def cmd_run(args) -> dict:
         "tp": args.tp,
         "enforce_eager": args.enforce_eager,
         "runtime_dispatch": os.environ.get("VLLM_RDNA2_W4A16_RUNTIME_DISPATCH", "0"),
+        "w4a8": os.environ.get("VLLM_RDNA2_W4A8_SDOT4", "0"),
         "compilation_config": None if args.enforce_eager else args.compilation_config,
         "trace_m": trace_m,
         "w4a16_layers_per_rank": len(layers),
@@ -192,10 +182,10 @@ def cmd_compare(args) -> None:
     arms = [(p, json.loads(Path(p).read_text())) for p in args.records]
     ref_texts = arms[0][1]["greedy_texts"]
     print(
-        "| arm | eager | runtime dispatch | ops in compiled graph | greedy == first "
-        "| c=1 tok/s | c=8 tok/s | 2k prefill tok/s |"
+        "| arm | eager | runtime dispatch | w4a8 | ops in compiled graph | greedy == "
+        "first | c=1 tok/s | c=8 tok/s | 2k prefill tok/s |"
     )
-    print("| --- | --- | --- | --- | --- | ---: | ---: | ---: |")
+    print("| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |")
     for path, r in arms:
         ops: collections.Counter = collections.Counter()
         for per_file in r["graph_ops"].values():
@@ -203,6 +193,7 @@ def cmd_compare(args) -> None:
         t = r["timing"]
         print(
             f"| {Path(path).stem} | {r['enforce_eager']} | {r['runtime_dispatch']} "
+            f"| {r.get('w4a8', '-')} "
             f"| {dict(ops) or '-'} | {r['greedy_texts'] == ref_texts} "
             f"| {t['c1_decode']['tok_s']:.1f} | {t['c8_decode']['tok_s']:.1f} "
             f"| {t['prefill_2k']['tok_s']:.0f} |"
