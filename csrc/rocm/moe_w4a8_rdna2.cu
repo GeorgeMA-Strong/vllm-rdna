@@ -25,9 +25,11 @@
 // * A is read direct from global (no LDS cap). Each row is addressed through
 //   its ``[T][K/8][8][8]`` tile as (tile_r = row/8, m_r = row%8); padding rows
 //   clamp to tile 0/row 0 and are skipped by the epilogue.
-// * Epilogue is byte-identical to ``moe_gptq_gemm_rdna2``: router-weight
-//   multiply in fp32, fp32 -> fp16 round-to-nearest, packed fp16 CAS-64
-//   atomic add into the pre-zeroed output, ``output_topk`` row reduce fused.
+// * Epilogue is byte-identical to ``moe_gptq_gemm_rdna2`` (shared helper in
+//   ``moe_accum_rdna2.cuh``): router-weight multiply in fp32, then either the
+//   default fp32 accumulation (native fp32 atomics into a cached scratch +
+//   one fp32 -> fp16 cast) or the opt-in packed fp16 CAS-64 atomic add,
+//   with ``output_topk`` row reduce fused.
 //
 // Weight format matches the W4A16 MoE kernel: [E, K/8, N] uint32 shuffled,
 // [E, groups, N] scales, [E, groups, N/8] packed zeros. ``use_v2_format``
@@ -48,6 +50,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include "moe_accum_rdna2.cuh"
 #include "ops.h"
 #include "q_gemm_rdna2_common.cuh"  // gptq_rdna2::atomic_add_pk4_f16
 #include "w4a8_sdot4_rdna2.cuh"
@@ -72,7 +75,7 @@ constexpr int kChunkBytes = kMTile * 8;         // bytes per 8-K chunk per row
 
 #if defined(__HIP__RDNA2_MOE__) || !defined(__HIP_DEVICE_COMPILE__)
 
-template <int BLOCK_M, int GROUP>
+template <int BLOCK_M, int GROUP, typename C_T>
 __global__ __launch_bounds__(kThreads) void moe_w4a8_gemm_kernel(
     const int8_t* __restrict__ a,          // [T][K/8][8][8] int8 (MT=8)
     const float* __restrict__ a_scale,     // [T][G][8] per-(token, group)
@@ -80,7 +83,7 @@ __global__ __launch_bounds__(kThreads) void moe_w4a8_gemm_kernel(
     const uint32_t* __restrict__ b_q_weight,  // [E, K/8, N] shuffled
     const uint32_t* __restrict__ b_qzeros,    // [E, G, N/8] packed
     const ex::f16_t* __restrict__ b_scales,   // [E, G, N]
-    ex::f16_t* __restrict__ c,             // [M*topk or M, N] fp16 pre-zeroed
+    C_T* __restrict__ c,                   // [M*topk or M, N] accumulator
     const float* __restrict__ topk_weights,
     const int32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_ids,
@@ -242,7 +245,7 @@ __global__ __launch_bounds__(kThreads) void moe_w4a8_gemm_kernel(
   }
 
   // Epilogue: identical shape to moe_gptq_gemm_rdna2 — router weight in fp32,
-  // fp16 RN convert, packed 64-bit CAS atomic add, output_topk row reduce.
+  // then the shared accumulator (fp32 atomics by default, fp16 CAS opt-in).
   #pragma unroll
   for (int m = 0; m < BLOCK_M; ++m) {
     const int32_t token_id = sorted_token_ids[offset_m_base + m];
@@ -259,21 +262,17 @@ __global__ __launch_bounds__(kThreads) void moe_w4a8_gemm_kernel(
     const int64_t out_row = (output_topk > 0)
                                 ? (int64_t)(token_id / output_topk)
                                 : (int64_t)token_id;
-    ex::f16_t* out = c + out_row * size_n + n;
-    const half2 r01 =
-        __halves2half2(__float2half_rn(cf[m][0]), __float2half_rn(cf[m][1]));
-    const half2 r23 =
-        __halves2half2(__float2half_rn(cf[m][2]), __float2half_rn(cf[m][3]));
-    vllm::gptq_rdna2::atomic_add_pk4_f16(reinterpret_cast<half*>(out), r01, r23);
+    C_T* out = c + out_row * size_n + n;
+    vllm::gptq_rdna2::moe_accum_row<C_T>(cf[m], out);
   }
 }
 
 #else  // non-RDNA2 device pass: signature parity, empty body.
 
-template <int BLOCK_M, int GROUP>
+template <int BLOCK_M, int GROUP, typename C_T>
 __global__ __launch_bounds__(kThreads) void moe_w4a8_gemm_kernel(
     const int8_t*, const float*, const int32_t*, const uint32_t*,
-    const uint32_t*, const ex::f16_t*, ex::f16_t*, const float*, const int32_t*,
+    const uint32_t*, const ex::f16_t*, C_T*, const float*, const int32_t*,
     const int32_t*, const int32_t*, int, int, int, int, int, bool, int) {}
 
 #endif  // __HIP__RDNA2_MOE__ || !__HIP_DEVICE_COMPILE__
@@ -383,7 +382,7 @@ struct MoeArgs {
   const uint32_t* w;
   const uint32_t* qzeros;
   const ex::f16_t* scales;
-  ex::f16_t* c;
+  void* c;  // accumulator: fp16 (CAS) or fp32 (scratch) by C_T
   const float* topk_weights;
   const int32_t* sorted_token_ids;
   const int32_t* expert_ids;
@@ -398,46 +397,47 @@ struct MoeArgs {
   int output_topk;
 };
 
-template <int BLOCK_M, int GROUP>
+template <int BLOCK_M, int GROUP, typename C_T>
 int launch_kernel(const MoeArgs& p, hipStream_t stream) {
   dim3 grid(p.num_token_blocks, (p.size_n + mw::kNTile - 1) / mw::kNTile,
             (p.size_k + mw::kKBlock - 1) / mw::kKBlock);
-  mw::moe_w4a8_gemm_kernel<BLOCK_M, GROUP>
+  mw::moe_w4a8_gemm_kernel<BLOCK_M, GROUP, C_T>
       <<<grid, dim3(mw::kThreads), 0, stream>>>(
-          p.a_i8, p.a_scale, p.a_sum, p.w, p.qzeros, p.scales, p.c,
-          p.topk_weights, p.sorted_token_ids, p.expert_ids,
-          p.num_tokens_post_padded, p.size_m, p.size_n, p.size_k,
+          p.a_i8, p.a_scale, p.a_sum, p.w, p.qzeros, p.scales,
+          static_cast<C_T*>(p.c), p.topk_weights, p.sorted_token_ids,
+          p.expert_ids, p.num_tokens_post_padded, p.size_m, p.size_n, p.size_k,
           p.top_k, p.zero_offset, p.mul_topk_weight, p.output_topk);
   const hipError_t e = hipGetLastError();
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return e == hipSuccess ? kOk : kBadLaunch;
 }
 
-template <int BLOCK_M>
+template <int BLOCK_M, typename C_T>
 int dispatch_group(int64_t group_size, const MoeArgs& p, hipStream_t stream) {
   switch (group_size) {
     case 32:
-      return launch_kernel<BLOCK_M, 32>(p, stream);
+      return launch_kernel<BLOCK_M, 32, C_T>(p, stream);
     case 64:
-      return launch_kernel<BLOCK_M, 64>(p, stream);
+      return launch_kernel<BLOCK_M, 64, C_T>(p, stream);
     case 128:
-      return launch_kernel<BLOCK_M, 128>(p, stream);
+      return launch_kernel<BLOCK_M, 128, C_T>(p, stream);
     default:
       return kBadGroup;
   }
 }
 
+template <typename C_T>
 int dispatch_block_m(int64_t block_size_m, int64_t group_size,
                      const MoeArgs& p, hipStream_t stream) {
   switch (block_size_m) {
     case 1:
-      return dispatch_group<1>(group_size, p, stream);
+      return dispatch_group<1, C_T>(group_size, p, stream);
     case 2:
-      return dispatch_group<2>(group_size, p, stream);
+      return dispatch_group<2, C_T>(group_size, p, stream);
     case 4:
-      return dispatch_group<4>(group_size, p, stream);
+      return dispatch_group<4, C_T>(group_size, p, stream);
     case 8:
-      return dispatch_group<8>(group_size, p, stream);
+      return dispatch_group<8, C_T>(group_size, p, stream);
     default:
       return kBadBlockM;
   }
@@ -447,8 +447,8 @@ int dispatch_block_m(int64_t block_size_m, int64_t group_size,
 
 // ---------------------------------------------------------------------------
 // Public entry point. Same argument list as ``moe_gptq_gemm_rdna2`` plus the
-// trailing zero-offset selector. Writes into ``c`` (pre-zeroed, atomic add)
-// and falls back to ``moe_gptq_gemm_rdna2`` on any ineligibility.
+// trailing zero-offset selector and the fp32-accumulation selector. Writes
+// into ``c`` and falls back to ``moe_gptq_gemm_rdna2`` on any ineligibility.
 // ---------------------------------------------------------------------------
 void moe_w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                          torch::Tensor b_q_weight, torch::Tensor b_scales,
@@ -457,11 +457,13 @@ void moe_w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                          torch::Tensor expert_ids,
                          torch::Tensor num_tokens_post_padded, int64_t top_k,
                          int64_t block_size_m, bool mul_topk_weight,
-                         int64_t output_topk, bool use_v2_format) {
+                         int64_t output_topk, bool use_v2_format,
+                         bool fp32_accum) {
   const auto fallback = [&] {
     moe_gptq_gemm_rdna2(a, c, b_q_weight, b_scales, b_qzeros, topk_weights,
                         sorted_token_ids, expert_ids, num_tokens_post_padded,
-                        top_k, block_size_m, mul_topk_weight, output_topk);
+                        top_k, block_size_m, mul_topk_weight, output_topk,
+                        fp32_accum);
   };
 
   if (!a.is_cuda() || !c.is_cuda() || !b_q_weight.is_cuda() ||
@@ -531,7 +533,7 @@ void moe_w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                   reinterpret_cast<const uint32_t*>(b_q_weight.data_ptr()),
                   reinterpret_cast<const uint32_t*>(b_qzeros.data_ptr()),
                   reinterpret_cast<const ex::f16_t*>(b_scales.data_ptr()),
-                  reinterpret_cast<ex::f16_t*>(c.data_ptr()),
+                  c.data_ptr(),
                   topk_weights.numel() > 0 ? topk_weights.data_ptr<float>()
                                            : nullptr,
                   sorted_token_ids.data_ptr<int32_t>(),
@@ -546,7 +548,31 @@ void moe_w4a8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                   mul_topk_weight,
                   static_cast<int>(output_topk)};
 
-  if (dispatch_block_m(block_size_m, group_size, p, stream) != kOk) {
+  if (fp32_accum) {
+    // fp32 accumulation: partials land in the cached fp32 scratch, then one
+    // elementwise cast rounds to fp16. Shared with the W4A16 MoE kernel.
+    if (!c.is_contiguous()) {
+      fallback();
+      return;
+    }
+    MoeArgs p32 = p;
+    float* scratch = moe_fp32_scratch(c.size(0), c.size(1), c.get_device());
+    const hipError_t memset_err = hipMemsetAsync(
+        scratch, 0, static_cast<size_t>(c.numel()) * sizeof(float), stream);
+    if (memset_err != hipSuccess) {
+      fallback();
+      return;
+    }
+    p32.c = scratch;
+    if (dispatch_block_m<float>(block_size_m, group_size, p32, stream) != kOk) {
+      fallback();
+      return;
+    }
+    moe_cast_f32_to_f16(scratch, reinterpret_cast<half*>(c.data_ptr()),
+                        c.numel(), stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else if (dispatch_block_m<ex::f16_t>(block_size_m, group_size, p, stream) !=
+             kOk) {
     fallback();
     return;
   }

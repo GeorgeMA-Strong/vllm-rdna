@@ -290,7 +290,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor sorted_token_ids, Tensor expert_ids, "
       "Tensor num_tokens_post_padded, "
       "int top_k, int block_size_m, bool mul_topk_weight, "
-      "int output_topk) -> ()");
+      "int output_topk, bool fp32_accum=True) -> ()");
   rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
 
   // W4A8 (int4 weights, int8 activations) fused MoE for gfx1030. Drop-in for
@@ -304,7 +304,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor sorted_token_ids, Tensor expert_ids, "
       "Tensor num_tokens_post_padded, "
       "int top_k, int block_size_m, bool mul_topk_weight, "
-      "int output_topk=0, bool use_v2_format=False) -> ()");
+      "int output_topk=0, bool use_v2_format=False, "
+      "bool fp32_accum=True) -> ()");
   rocm_ops.impl("moe_w4a8_gemm_rdna2", torch::kCUDA, &moe_w4a8_gemm_rdna2);
 
   // W8A16 (INT8 weight + fp16 act) fused MoE kernel for RDNA2.
