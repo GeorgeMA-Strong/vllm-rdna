@@ -663,8 +663,8 @@ def test_resident_skinny_decode_reference_and_graph(m, k, n):
 
 
 # ---------------------------------------------------------------------------
-# MoE epilogue fp32 accumulator (default ON, VLLM_RDNA2_MOE_FP32_ACCUM=1).
-# Two distinct contracts:
+# MoE epilogue fp32 accumulator (opt-in, VLLM_RDNA2_MOE_FP32_ACCUM=1; default
+# off = legacy packed-fp16 CAS). Two distinct contracts:
 #   1. run-to-run stable: same inputs in two back-to-back runs produce a
 #      bitwise identical output (no fp16 CAS reordering).
 #   2. fp32 vs CAS: fp32 accumulation and the legacy CAS path both produce
@@ -674,7 +674,7 @@ def test_resident_skinny_decode_reference_and_graph(m, k, n):
 
 
 def _run_moe_for_accum_test(
-    fp32_accum: bool,
+    fp32_accum: bool | None,
     E: int,
     K: int,
     N: int,
@@ -869,3 +869,54 @@ def test_fp32_accum_cudagraph_capture_stable():
     graph.replay()
     torch.testing.assert_close(out_capture, out_replay, atol=2e-2, rtol=5e-2)
     assert torch.isfinite(out_capture).all()
+
+
+@gfx1030_only
+def test_fp32_accum_default_off_byte_identical_to_cas(monkeypatch):
+    """Module default (VLLM_RDNA2_MOE_FP32_ACCUM unset) is the CAS epilogue:
+    the None-default must be byte-identical to an explicit fp32_accum=False.
+
+    A single-K-block shape (K=256, grid.z=1) keeps the CAS order deterministic
+    (one block writes each output element), so the two invocations are bitwise
+    comparable.
+    """
+    monkeypatch.setattr(ops, "_RDNA2_MOE_FP32_ACCUM", False)
+    E, K, N, top_k, group_size, block_size_m, M = 16, 256, 512, 8, 32, 4, 4
+    out_default, _ = _run_moe_for_accum_test(
+        None, E, K, N, M, top_k, group_size, block_size_m,
+        seed=1234, mul_topk_weight=True, output_topk=0,
+    )
+    out_cas, _ = _run_moe_for_accum_test(
+        False, E, K, N, M, top_k, group_size, block_size_m,
+        seed=1234, mul_topk_weight=True, output_topk=0,
+    )
+    assert torch.equal(out_default, out_cas), (
+        "fp32_accum=None (module default off) must be byte-identical to "
+        "explicit fp32_accum=False (CAS)"
+    )
+
+
+@gfx1030_only
+def test_fp32_accum_env_on_enables_fp32_scratch(monkeypatch):
+    """VLLM_RDNA2_MOE_FP32_ACCUM=1 resolves the None-default to the fp32
+    scratch path: on a contention shape (K=2048, grid.z=8) the None-default is
+    run-to-run stable, which the order-dependent CAS epilogue is not. If the
+    None-default resolved to CAS instead, the second run would reorder and the
+    max diff would blow past the fp16-noise budget.
+    """
+    monkeypatch.setattr(ops, "_RDNA2_MOE_FP32_ACCUM", True)
+    E, K, N, top_k, group_size, block_size_m, M = 16, 2048, 512, 8, 32, 4, 4
+    out_a, _ = _run_moe_for_accum_test(
+        None, E, K, N, M, top_k, group_size, block_size_m,
+        seed=1234, mul_topk_weight=True, output_topk=0,
+    )
+    out_b, _ = _run_moe_for_accum_test(
+        None, E, K, N, M, top_k, group_size, block_size_m,
+        seed=1234, mul_topk_weight=True, output_topk=0,
+    )
+    assert torch.isfinite(out_a).all() and torch.isfinite(out_b).all()
+    diff = (out_a.float() - out_b.float()).abs().max().item()
+    assert diff <= 4.0 / 1024.0, (
+        f"None-default with VLLM_RDNA2_MOE_FP32_ACCUM=1 not run-to-run stable "
+        f"(max diff {diff} > 4 fp16 ULPs)"
+    )
