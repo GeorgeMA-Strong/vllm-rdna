@@ -6,7 +6,7 @@
 **Software**: torch 2.12.0+rocm7.14, venv-7.14.0, opengfx1030_vllm-rdna `rdna_extras` @ `6c5ff94ef`
 **Workload**: Qwen3.8-27B-AWQ-INT4, 1k input / 512 max-tokens (model returns 80 tokens before its own stop), c=1 and c=8
 **Stack**: FPP13 (FULL_AND_PIECEWISE greedy-correct) + PIX PYNCCL + custom all-reduce (force) + FA-RDNA2 + AWQ RDNA2 W4A16 + HIP GDN + prefix caching + state arenas
-**rocprofv3 binary**: `/home/chenco_adm/Apps/vllm/venv-7.14.0/bin/rocprofv3` (bundled ROCm 7.14 SDK)
+**rocprofv3 binary**: `<bench-home>/Apps/vllm/venv-7.14.0/bin/rocprofv3` (bundled ROCm 7.14 SDK)
 
 ---
 
@@ -34,7 +34,7 @@ Wrap vLLM serve60 from birth with venv-7.14.0's bundled rocprofv3 in `--run` mod
 
 ```bash
 # Launcher (see opengfx1030_vllm-rdna/docs/profiling/2026-09-10-decode-profile/scripts/)
-exec /home/chenco_adm/Apps/vllm/venv-7.14.0/bin/rocprofv3 \
+exec <bench-home>/Apps/vllm/venv-7.14.0/bin/rocprofv3 \
     --kernel-trace true --rccl-trace true --marker-trace true \
     --output-format csv --output-file "$RUN_DIR/prof" \
     -- env <canonical serve60 env> \

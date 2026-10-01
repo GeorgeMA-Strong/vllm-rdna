@@ -73,7 +73,7 @@ and speculative acceptance. Default dispatch remains unchanged; model results
 for the opt-in follow below.
 
 Raw server evidence:
-`/home/george/v620-experiments/moe-decode-results-20260927/` contains
+`<v620-home>/v620-experiments/moe-decode-results-20260927/` contains
 `build.log`, `dispatch-before.log`, `correctness.log`,
 `correctness-after.log`, and `latency-gpu0.log` through `latency-gpu3.log`.
 
@@ -144,7 +144,7 @@ this dispatch change. It remains opt-in; production promotion is separate.
 After testing, the experimental services were stopped and the unchanged
 `v620-tp4-git.service` was restored. At 19:22 UTC its health check and a
 deterministic `2 + 2` completion passed. The API reported Intel AutoRound at
-`/home/george/v620-vllm/models/intel-autoround` with max length 262,144; the
+`<v620-home>/v620-vllm/models/intel-autoround` with max length 262,144; the
 existing 64 GiB RAM-offload configuration and enabled boot service remain.
 The default runs its original KV-offload checkout, not this performance branch.
 

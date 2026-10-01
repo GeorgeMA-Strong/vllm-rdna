@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/rdna2/check_v620_tuning.py"
-ROWS = ROOT / "tunableop/archive/rocblas-c27e2252cc7a"
+ROWS = ROOT / "tunableop/rocm10-rocblas5.6"
 
 
 class TuningCoverageTests(unittest.TestCase):

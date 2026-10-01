@@ -16,7 +16,7 @@ native modules from that checkout.
 
 The server ran four V620 GPUs with TP4, EP4, MTP2, FP16, CPU PLE, a 4096-token
 batch limit, and the launch options in `tools/rdna2/serve_v620_baseline.sh`.
-The model was `/home/george/v620-vllm/models/intel-autoround`.
+The model was `<v620-home>/v620-vllm/models/intel-autoround`.
 The active fast service was stopped and had zero running or waiting requests
 before the baseline started.
 
@@ -34,7 +34,7 @@ timeout, and disabled thinking. The harness performed its normal warmup.
 These are cold-start diagnostic observations, not performance conclusions. The
 large prefill discrepancy between cases must not be used to rank changes. The full JSON
 result remains on the V620 server at
-`/home/george/v620-experiments/base-16k-f3dd65fa7.json`.
+`<v620-home>/v620-experiments/base-16k-f3dd65fa7.json`.
 
 ## Corrected 16k baseline
 
@@ -60,7 +60,7 @@ regular prose** and **1,464–1,478 tokens/s for coding**. Coding prompt length
 is 7.8% greater. This is a small fixture-dependent gap, not the 44% gap in the
 first cold-start trial. The coding trial with invalid output is excluded from
 the valid measurement range. The full final JSON is on the server at
-`/home/george/v620-experiments/base-16k-f3dd65fa7-fresh-repeats.json`.
+`<v620-home>/v620-experiments/base-16k-f3dd65fa7-fresh-repeats.json`.
 
 ## Resident MoE port on the same 16k suite
 
@@ -85,7 +85,7 @@ harness marked it valid because this server did not report cached-token usage.
 Against the exact-base fresh trials, the bundle improves 16k prefill by about
 33–38%. This comparison does not isolate one of the bundled edits as the sole
 cause. JSON:
-`/home/george/v620-experiments/resident-16k-fea652bcd-fresh-repeats.json`.
+`<v620-home>/v620-experiments/resident-16k-fea652bcd-fresh-repeats.json`.
 
 ## Qualified eight-row MoE prefill tile
 
@@ -108,7 +108,7 @@ regular fixture hit prefix cache and is excluded despite harness validity.
 
 This is about 2.5–3% higher prefill than the preceding resident candidate in
 these 16k runs. The decode trials vary and do not establish a decode gain.
-JSON: `/home/george/v620-experiments/resident-tile8-16k-178f107ad-fresh-repeats.json`.
+JSON: `<v620-home>/v620-experiments/resident-tile8-16k-178f107ad-fresh-repeats.json`.
 
 ## Fused PLE grouped normalization
 
@@ -128,7 +128,7 @@ the first regular repetition reused a deterministic prefix and is excluded.
 
 This is roughly 0.5–0.8% faster prefill than tile8 alone in these 16k trials.
 Decode remains variable and no decode improvement is attributed to PLE.
-JSON: `/home/george/v620-experiments/resident-tile8-ple-16k-dbd999403-fresh-repeats.json`.
+JSON: `<v620-home>/v620-experiments/resident-tile8-ple-16k-dbd999403-fresh-repeats.json`.
 
 ## Served prefix checkpoint replay fixes
 
@@ -149,7 +149,7 @@ the cached first repetition; these later fresh trials were stable. Compared
 with the preceding PLE build, the checkpoint changes cost about 2.5–3.2%
 prefill on these 16k fixtures. This step is for correct prompt reuse; the
 served tuning table is evaluated separately below. JSON:
-`/home/george/v620-experiments/checkpoints-16k-772dac40d-fresh-repeats.json`.
+`<v620-home>/v620-experiments/checkpoints-16k-772dac40d-fresh-repeats.json`.
 
 ## Git-tracked served MoE tuning and launch settings
 
@@ -169,7 +169,7 @@ The tuning table and launcher parity did not materially change 16k prefill
 from the checkpoint-only build in this controlled run. The measured pass logged
 two early Triton JIT events during cached repetition 01; later fresh trials
 were stable. JSON:
-`/home/george/v620-experiments/served-tuning-16k-1e68a8b90-fresh-repeats.json`.
+`<v620-home>/v620-experiments/served-tuning-16k-1e68a8b90-fresh-repeats.json`.
 
 ## Served resident skinny decode
 
@@ -191,7 +191,7 @@ down slightly on prose and up slightly on coding, so these full-model trials
 do not establish a consistent decode benefit. The measured pass logged two
 early Triton JIT events during cached repetition 01; later fresh trials were
 stable. JSON:
-`/home/george/v620-experiments/served-skinny-16k-0821be8d7-fresh-repeats.json`.
+`<v620-home>/v620-experiments/served-skinny-16k-0821be8d7-fresh-repeats.json`.
 
 ## Long-context check after served-source audit
 
@@ -248,7 +248,7 @@ combined build.
 
 Raw server artifacts:
 
-- `/home/george/v620-experiments/git-fast-5e4b5d580-32-128k-20260922.json`
-- `/home/george/v620-experiments/git-fast-5e4b5d580-coding128k-repeat-20260922.json`
-- `/home/george/v620-experiments/git-mamba-retire-375g-coding128-20260923.json`
-- `/home/george/v620-experiments/git-final-mamba-retire-375g-32-128-20260923.json`
+- `<v620-home>/v620-experiments/git-fast-5e4b5d580-32-128k-20260922.json`
+- `<v620-home>/v620-experiments/git-fast-5e4b5d580-coding128k-repeat-20260922.json`
+- `<v620-home>/v620-experiments/git-mamba-retire-375g-coding128-20260923.json`
+- `<v620-home>/v620-experiments/git-final-mamba-retire-375g-32-128-20260923.json`

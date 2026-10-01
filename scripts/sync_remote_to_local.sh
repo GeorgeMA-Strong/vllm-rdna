@@ -1,27 +1,34 @@
 #!/bin/bash
-# SYNC PROTOCOL: capture validated work from .176 build server back to local,
-# commit it, and push to GitHub. Run this AFTER every bench/validate cycle.
+# SYNC PROTOCOL: capture validated work from a remote build/bench box back to a
+# local checkout, commit it, and push to the fork. Run this after every
+# bench/validate cycle.
 #
-# Why this exists: the .176 build server is the place where builds actually run
-# and benchmarks actually validate. Its working tree accumulates uncommitted
-# build edits (generated files, _so binaries, etc.) that should be captured
-# before the next clean rebuild or before someone investigates a regression.
+# Why this exists: the remote build box is where builds actually run and
+# benchmarks actually validate. Its working tree accumulates uncommitted build
+# edits (generated files, _so binaries, etc.) that should be captured before the
+# next clean rebuild or before someone investigates a regression.
+#
+# Required env (there are no baked-in host paths):
+#   LOCAL=<local checkout>     REMOTE=<user@host>     REMOTE_PATH=<remote tree>
+# Optional env:
+#   SSH_KEY=~/.ssh/id_ed25519_ansible   BRANCH=rdna_extras
+#   SYNC_GIT_NAME / SYNC_GIT_EMAIL      identity for the remote mirror commit
 #
 # This script:
-#   1. rsyncs the validated state from .176 back to local
+#   1. rsyncs the validated state from the remote box back to local
 #   2. reports any uncommitted/untracked changes on local
 #   3. prompts to commit if any
-#   4. pushes to origin/rdna_extras
+#   4. pushes to origin/<BRANCH>
 
 set -euo pipefail
 
-LOCAL=/Users/kletorch/Projects/infrastructure/gfx1030_optimized/opengfx1030_vllm-rdna
-REMOTE=chenco_adm@192.168.1.176
-REMOTE_PATH=/home/chenco_adm/opengfx1030_vllm-rdna
-SSH_KEY=~/.ssh/id_ed25519_ansible
-BRANCH=rdna_extras
+LOCAL=${LOCAL:?set LOCAL=/path/to/local/checkout}
+REMOTE=${REMOTE:?set REMOTE=user@host}
+REMOTE_PATH=${REMOTE_PATH:?set REMOTE_PATH=/path/to/remote/tree}
+SSH_KEY=${SSH_KEY:-~/.ssh/id_ed25519_ansible}
+BRANCH=${BRANCH:-rdna_extras}
 
-echo "=== STEP 1: rsync .176 validated state -> local ==="
+echo "=== STEP 1: rsync remote validated state -> local ==="
 rsync -a --update --delete \
   -e "ssh -i $SSH_KEY" \
   --exclude='.git/' --exclude='.deps/' --exclude='build/' --exclude='__pycache__/' \
@@ -45,13 +52,11 @@ if [ "$NEW_UNCOMMITTED" -gt 0 ]; then
   read -r ans
   if [ "$ans" = "yes" ]; then
     git add -A
-    git commit -m "sync: validated state from .176 build server
+    git commit -m "sync: validated state from remote build box
 
 Auto-captured by scripts/sync_remote_to_local.sh. Captures any
 uncommitted build edits, generated files, or working-tree
-modifications that the .176 build server has accumulated since
-the last sync. See journal/2026-09-05-gdn-decode-profiling.md
-for the protocol rationale."
+modifications that the remote build box accumulated since the last sync."
     echo "  committed"
   else
     echo "  aborted"
@@ -62,7 +67,7 @@ else
 fi
 
 echo
-echo "=== STEP 4: compare with origin/rdna_extras ==="
+echo "=== STEP 4: compare with origin/$BRANCH ==="
 git log --oneline origin/$BRANCH..HEAD
 AHEAD=$(git rev-list --count origin/$BRANCH..HEAD)
 echo "  $AHEAD commits ahead of origin"
@@ -73,7 +78,7 @@ if [ "$AHEAD" -gt 0 ]; then
   read -r ans
   if [ "$ans" = "yes" ]; then
     git remote set-url origin https://github.com/opengfx1030/vllm-rdna.git
-    git push origin $BRANCH 2>&1 | tail -5
+    git push origin "$BRANCH" 2>&1 | tail -5
     git remote set-url origin git@github.com:opengfx1030/vllm-rdna.git
   else
     echo "  skipped push"
@@ -81,20 +86,20 @@ if [ "$AHEAD" -gt 0 ]; then
 fi
 
 echo
-echo "=== STEP 5: also commit .176 mirror working tree ==="
-ssh -i $SSH_KEY $REMOTE "cd $REMOTE_PATH && \
-  git config user.email 'kletorch@users.noreply.github.com' && \
-  git config user.name 'kletorch' && \
+echo "=== STEP 5: also commit remote mirror working tree ==="
+ssh -i "$SSH_KEY" "$REMOTE" "cd $REMOTE_PATH && \
+  ${SYNC_GIT_NAME:+git config user.name '$SYNC_GIT_NAME' &&} \
+  ${SYNC_GIT_EMAIL:+git config user.email '$SYNC_GIT_EMAIL' &&} \
   git add -A && \
   if ! git diff --cached --quiet; then \
-    echo 'committing .176 mirror working tree'; \
-    git commit -m 'sync: capture .176 working tree (matches local rdna_extras)'; \
+    echo 'committing remote mirror working tree'; \
+    git commit -m 'sync: capture remote mirror working tree (matches local fork branch)'; \
   else \
-    echo '.176 working tree already clean'; \
+    echo 'remote working tree already clean'; \
   fi" 2>&1 | tail -5
 
 echo
 echo "=== DONE ==="
 echo "  local:    $LOCAL  -> $(git log --oneline -1)"
 echo "  origin:   $(git log --oneline origin/$BRANCH -1)"
-echo "  .176:     $(ssh -i $SSH_KEY $REMOTE 'cd $REMOTE_PATH && git log --oneline -1' 2>&1 | head -1)"
+echo "  remote:   $(ssh -i "$SSH_KEY" "$REMOTE" "cd $REMOTE_PATH && git log --oneline -1" 2>&1 | head -1)"

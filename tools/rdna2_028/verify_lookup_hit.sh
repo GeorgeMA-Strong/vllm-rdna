@@ -2,23 +2,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# STEP 4 lookup-hit proof: prove every row in the frozen CSV is actually
-# consumed by TunableOp (not falling back to Default). Iterates every
-# GemmTunableOp_Half key, runs it once with the rows enabled, and records
-# the solver that the lookup actually returned. A hit = the row's solver;
-# a miss = "Default". Misses would mean a row is dead code in the file.
+# Lookup-hit proof: prove every row in the frozen CSV is actually consumed by
+# TunableOp (not falling back to Default). Iterates every GemmTunableOp_Half
+# key, runs it once with the rows enabled, and records the solver that the
+# lookup actually returned. A hit = the row's solver; a miss = "Default".
+# Misses would mean a row is dead code in the file.
+#
+#   VENV=/path/to/venv            (or activate one so $VIRTUAL_ENV is set)
+#   VLLM_TREE=/path/to/tree       (default: the tree this script lives in)
+#   PROFILE=<profile name>        (default: rocm7.14-rocblas5.5)
+#   ROWS=<profile dir>            (overrides PROFILE)
+#   OUT=<dir>                     (default: <tree>/cache/tunableop-lookup)
+#   DEVICE=<gpu index>            (default: 3)
 set -uo pipefail
 
-V=/home/chenco_adm/Apps/vllm/venv-7.14.0_0.28.0
-T=/home/chenco_adm/vllm-rdna-0.28.0
-ROWS=$T/tunableop/rocblas-f30bb442e9b5
-OUT=/home/chenco_adm/w4a8_runs/tunableop-campaign
+T=${VLLM_TREE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+V=${VENV:-${VIRTUAL_ENV:-}}
+: "${V:?set VENV=/path/to/python-venv (or activate one so \$VIRTUAL_ENV is set)}"
+PROFILE=${TUNABLEOP_PROFILE:-${PROFILE:-rocm7.14-rocblas5.5}}
+ROWS=${ROWS:-$T/tunableop/$PROFILE}
+OUT=${OUT:-$T/cache/tunableop-lookup}
 DEVICE=${DEVICE:-3}
 
 ROCM_SDK_LIB=$V/lib/python3.12/site-packages/_rocm_sdk_libraries/lib
 ROCM_SDK=$V/lib/python3.12/site-packages/_rocm_sdk_core/lib
 export LD_LIBRARY_PATH="$ROCM_SDK_LIB:$ROCM_SDK/host-math/lib:$ROCM_SDK/rocm_sysdeps/lib:$ROCM_SDK/core/lib:$V/lib/python3.12/site-packages/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export HIP_VISIBLE_DEVICES=$DEVICE
+export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0 TORCH_BLAS_PREFER_HIPBLASLT=0
 
 mkdir -p "$OUT"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/lookup_hit.log"; }

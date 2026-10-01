@@ -15,9 +15,9 @@ testing on other RDNA hardware (e.g., Steam Deck's RDNA2 APU).
 | Component | Detail |
 |---|---|
 | GPU | AMD Radeon PRO V620 (gfx1030, 32 GB VRAM, Wave32, V_DOT2) |
-| Test setup | 4× V620 on .176 (chenco_adm@192.168.1.176) |
+| Test setup | 4× V620 on .176 (<bench-host>) |
 | ROCm | 7.14.0 at `/opt/rocm/core-7.14` |
-| Python | 3.12 (venv-7.14.0 at `/home/chenco_adm/Apps/vllm/venv-7.14.0`) |
+| Python | 3.12 (venv-7.14.0 at `<bench-home>/Apps/vllm/venv-7.14.0`) |
 | PyTorch | 2.12.0+rocm7.14.0 |
 | Triton | 3.6.0 ROCm fork |
 
@@ -78,11 +78,11 @@ bash /tmp/start_cg.sh
 
 The script does:
 ```
-source /home/chenco_adm/Apps/vllm/venv-7.14.0/bin/activate
+source <bench-home>/Apps/vllm/venv-7.14.0/bin/activate
 export LD_LIBRARY_PATH=...rocm_sdk_libraries/lib:...rocm_sdk_core/lib/host-math/lib:...
 # All env vars above
 cd /tmp
-python -m vllm.entrypoints.cli.main serve /home/chenco_adm/models/Ornith-1.5-9b-exl3-3bpw \
+python -m vllm.entrypoints.cli.main serve <bench-home>/models/Ornith-1.5-9b-exl3-3bpw \
   --port 18005 --tensor-parallel-size 1 \
   --max-model-len 200000 --max-num-seqs 8 \
   --dtype float16 --gpu-memory-utilization 0.91 \
@@ -94,8 +94,8 @@ The `_rocm_C.abi3.so` is pre-built and ships with the editable install
 in venv-7.14.0. To rebuild after .cu changes:
 
 ```bash
-ssh chenco_adm@192.168.1.176
-cd /home/chenco_adm/opengfx1030_vllm-rdna
+ssh <bench-host>
+cd <bench-home>/opengfx1030_vllm-rdna
 rm -rf build/ .deps/ vllm/*.abi3.so
 /tmp/rebuild_so.sh  # uses CCACHE_DISABLE=1, PYTORCH_ROCM_ARCH=gfx1030, etc.
 ```
@@ -271,7 +271,7 @@ and memory BW differ.
 ## Reproducibility checklist
 
 - [ ] Pull `opengfx1030/vllm-rdna` `rdna_extras` at HEAD `c7053d482`
-- [ ] venv-7.14.0 active (`source /home/chenco_adm/Apps/vllm/venv-7.14.0/bin/activate`)
+- [ ] venv-7.14.0 active (`source <bench-home>/Apps/vllm/venv-7.14.0/bin/activate`)
 - [ ] `_rocm_C.abi3.so` present in `vllm/` (rebuild via `/tmp/rebuild_so.sh` if missing)
 - [ ] All env vars in `/tmp/start_cg.sh` set (no `PYTORCH_CUDA_ALLOC_CONF`)
 - [ ] `.cache/tunableop/tunableop_results.csv` exists for warm GEMM tuning
@@ -286,7 +286,7 @@ and memory BW differ.
 curl -s http://localhost:18005/v1/models | python3 -m json.tool
 
 # ITL stream
-source /home/chenco_adm/Apps/vllm/venv-7.14.0/bin/activate
+source <bench-home>/Apps/vllm/venv-7.14.0/bin/activate
 python /tmp/stream_tokens.py  # expect ITL mean=25.1ms
 
 # Golden probes

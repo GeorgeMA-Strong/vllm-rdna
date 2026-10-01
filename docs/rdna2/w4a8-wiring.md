@@ -124,14 +124,14 @@ W ... RDNA2 W4A8 sdot4 prefill fast path active (config a8_lds_k32_ag)
 ## Build
 
 ```bash
-cd /Users/kletorch/Projects/infrastructure/gfx1030_optimized/vllm-rdna-0.28.0
+cd <local-home>/Projects/infrastructure/gfx1030_optimized/vllm-rdna-0.28.0
 git switch w4a8-wiring
 rsync -avz --exclude='.git/' -e "ssh -i ~/.ssh/id_ed25519_ansible" \
-    ./ chenco_adm@par1-cs25:~/vllm-rdna-0.28.0/
+    ./ <bench-host>:~/vllm-rdna-0.28.0/
 
-ssh chenco_adm@par1-cs25
-source /home/chenco_adm/Apps/vllm/venv-7.14.0_0.28.0/bin/activate
-cd /home/chenco_adm/vllm-rdna-0.28.0
+ssh <bench-host>
+source <bench-home>/Apps/vllm/venv-7.14.0_0.28.0/bin/activate
+cd <bench-home>/vllm-rdna-0.28.0
 export SETUPTOOLS_SCM_PRETEND_VERSION=0.20.1.dev99
 export VLLM_TARGET_DEVICE=rocm
 export PYTORCH_ROCM_ARCH='gfx1030'
@@ -170,7 +170,7 @@ for n in names: print(n)
 ### Pytest (unit, no model)
 
 ```bash
-cd /home/chenco_adm/vllm-rdna-0.28.0
+cd <bench-home>/vllm-rdna-0.28.0
 .venv/bin/python -m pytest tests/kernels/quantization/test_rdna2_w4a8.py -v
 ```
 

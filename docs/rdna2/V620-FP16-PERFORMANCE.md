@@ -151,11 +151,11 @@ See [candidate integration](V620-CANDIDATE.md) for reused commits, exact runtime
 and CPU/native checks, and [FP16 tuning](../../tunableop/README.md) for qualified
 solver rows. The campaign's raw benchmark JSON, generated output, metrics, logs,
 source/native hashes, packages, source archive and replay helpers are preserved
-under `/home/george/v620-vllm-testing/benchmarks/performance-2026-09-13`, with a
+under `<v620-home>/v620-vllm-testing/benchmarks/performance-2026-09-13`, with a
 local copy under the workspace's `review-artifacts/performance-2026-09-13`.
 
-The original installation and boot unit remain under `/home/george/v620-vllm`
-and its saved release under `/home/george/v620-stable-releases`. This draft needs
+The original installation and boot unit remain under `<v620-home>/v620-vllm`
+and its saved release under `<v620-home>/v620-stable-releases`. This draft needs
 human review and further model-quality investigation before stable promotion.
 AI assistance was used for integration, testing and reporting.
 
@@ -276,7 +276,7 @@ benchmarking; passing static coverage does not guarantee optimal performance.
 
 Reproduction artifacts, exact launch arguments, per-rank tuning hashes, raw
 benchmark JSON, metrics and GPU telemetry are saved under
-`/home/george/v620-vllm-testing/cache-prefill-recovery-2026-09-13` and the local
+`<v620-home>/v620-vllm-testing/cache-prefill-recovery-2026-09-13` and the local
 workspace's matching `review-artifacts/cache-prefill-recovery-2026-09-13`.
 The current manual service uses the isolated testing installation on port 8080,
 with model alias `active`, MTP2, FP16 dense weights and CPU BF16 PLE. The original

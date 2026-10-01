@@ -10,9 +10,9 @@ the earlier service is versioned at `tuned-moe/` with identical JSON content.
 ## Required machine assets
 
 - Four Radeon Pro V620 cards with ROCm 10.0 and the existing runtime at
-  `/home/george/v620-experiments/upstream-20260915/v620-vllm-testing/.venv`.
+  `<v620-home>/v620-experiments/upstream-20260915/v620-vllm-testing/.venv`.
 - The Intel AutoRound W4A16 model at
-  `/home/george/v620-vllm/models/intel-autoround`. It retains FP16 dense
+  `<v620-home>/v620-vllm/models/intel-autoround`. It retains FP16 dense
   layers and CPU-offloaded BF16 PLE weights. The relevant local model-file
   SHA-256 values are:
 
@@ -33,10 +33,10 @@ The server gets source only through Git. Run these commands on the V620 host:
 ```bash
 git clone --branch codex/v620-baseline-port-20260922 \
   https://github.com/GeorgeMA-Strong/vllm-rdna.git \
-  /home/george/v620-experiments/baseline-git-20260922
+  <v620-home>/v620-experiments/baseline-git-20260922
 
-root=/home/george/v620-experiments/baseline-git-20260922
-runtime=/home/george/v620-experiments/upstream-20260915/v620-vllm-testing
+root=<v620-home>/v620-experiments/baseline-git-20260922
+runtime=<v620-home>/v620-experiments/upstream-20260915/v620-vllm-testing
 export PATH="$runtime/.venv/bin:/opt/rocm/core-10.0/bin:/opt/rocm/core-10.0/llvm/bin:$PATH"
 sdk="$runtime/.venv/lib/python3.12/site-packages/_rocm_sdk_core"
 export LD_LIBRARY_PATH="$sdk/lib:$sdk/lib/host-math/lib:/opt/rocm/core-10.0/lib"

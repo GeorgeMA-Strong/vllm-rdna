@@ -10,12 +10,19 @@
 #   PHASE=all     tune then measure
 #
 # No /tmp: everything under $WORK. The repo rows are never written here.
+#
+#   VENV=/path/to/venv   (or activate one so $VIRTUAL_ENV is set)
+#   VLLM_TREE=/path/to/tree   (default: the tree this script lives in)
+#   WORK=/path/to/scratch     (default: <tree>/cache/tunableop-rows)
+#   PROFILE=rocm7.14-rocblas5.5   baseline profile to measure against
 set -uo pipefail
 
-V=${VENV:-/home/chenco_adm/Apps/vllm/venv-7.14.0_0.28.0}
-T=${VLLM_TREE:-/home/chenco_adm/vllm-rdna-0.28.0}
-WORK=${WORK:-/home/chenco_adm/w4a8_runs/tunableop-rows}
-ROWS=$T/tunableop/rocblas-f30bb442e9b5
+T=${VLLM_TREE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+V=${VENV:-${VIRTUAL_ENV:-}}
+: "${V:?set VENV=/path/to/python-venv (or activate one so \$VIRTUAL_ENV is set)}"
+WORK=${WORK:-$T/cache/tunableop-rows}
+PROFILE=${TUNABLEOP_PROFILE:-${PROFILE:-rocm7.14-rocblas5.5}}
+ROWS=$T/tunableop/$PROFILE
 SHAPE_SRC=${SHAPE_SRC:-$ROWS/tunableop_results0.csv}
 SCRATCH=$WORK/scratch
 MEAS=$WORK/measure

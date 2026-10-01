@@ -16,14 +16,14 @@ MTP0–4 comparison, selected settings, loading times and quality limitation.
 - That local archive contains source only. A separate, verified server snapshot
   now preserves source, built extensions, environment, Python runtime, tools and
   the boot unit at
-  `/home/george/v620-stable-releases/2026-09-12-before-refresh`.
+  `<v620-home>/v620-stable-releases/2026-09-12-before-refresh`.
 - Local testing: `vllm-rdna-testing`, branch `codex/v620-rdna-refresh`.
 - Clean PR worktree: `vllm-rdna-pr-clean`, branch `codex/v620-pr-clean`.
-- Remote candidate root: `/home/george/v620-vllm-testing`; use `source`,
+- Remote candidate root: `<v620-home>/v620-vllm-testing`; use `source`,
   `.venv`, build outputs, caches, logs, and any test service exclusively there.
-- Protected deployment: `/home/george/v620-vllm/source`, its sibling `.venv`,
+- Protected deployment: `<v620-home>/v620-vllm/source`, its sibling `.venv`,
   `tools/v620-serve-intel-fp16.sh`, and
-  `/home/george/.config/systemd/user/v620-serve-intel.service`.
+  `<v620-home>/.config/systemd/user/v620-serve-intel.service`.
 
 The runtime snapshot was verified before the remote build.
 Keep the original installation at its existing paths; copied virtual environments

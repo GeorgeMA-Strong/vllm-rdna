@@ -12,7 +12,7 @@ Greedy: `tools/probe_greedy_correctness.py` — Paris in first 32, `1+1=` starts
 
 Log TTFT, prefill tok/s, decode tok/s for **1k/512** and **16k/1k** at c=1,4,8. Do **not** run 16k c=8 until 16k c=4 **and** seq-after are green.
 
-Plan: `~/.grok/sessions/%2FUsers%2Fkletorch%2FProjects%2Finfrastructure%2Fgfx1030_optimized/01a081a5-aed9-76a3-a106-d02d65e07297/goal/plan.md`
+Plan: `~/.grok/sessions/<local-home>/Projects/.../01a081a5-aed9-76a3-a106-d02d65e07297/goal/plan.md`
 
 ---
 
@@ -20,13 +20,13 @@ Plan: `~/.grok/sessions/%2FUsers%2Fkletorch%2FProjects%2Finfrastructure%2Fgfx103
 
 | Item | Value |
 |------|--------|
-| Host | `chenco_adm@192.168.1.176` |
+| Host | `<bench-host>` |
 | SSH | `-i ~/.ssh/id_ed25519_ansible` |
 | Local tree | `opengfx1030_vllm-rdna/` branch `rdna_extras` |
-| Remote mirror | `/home/chenco_adm/opengfx1030_vllm-rdna` (rsync, exclude `.git`) |
-| Venv | `/home/chenco_adm/Apps/vllm/venv-7.14.0` (PyTorch 2.12.0+rocm7.14.0) |
+| Remote mirror | `<bench-home>/opengfx1030_vllm-rdna` (rsync, exclude `.git`) |
+| Venv | `<bench-home>/Apps/vllm/venv-7.14.0` (PyTorch 2.12.0+rocm7.14.0) |
 | ROCm SDK | `/opt/rocm/core-7.14` |
-| Model | `/home/chenco_adm/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea` |
+| Model | `<bench-home>/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea` |
 | Serve | `scripts/serve_gfx1030_full.sh` `PORT=18094` `HIP_VISIBLE_DEVICES=0,1` `MAX_MODEL_LEN=32768` `KV_CACHE_MEMORY=6000000000` `MAX_NUM_SEQS=8` `VLLM_ROCM_MIXED_LOG=1` |
 | Logs | `/tmp/gfx1030_truefull_livetail/` on `.176` |
 | Scratch (local evidence) | `/var/folders/nf/tws6rmcx2h5ghlrqnvrbgf6r0000gn/T/grok-goal-12c2c5d0c5aa/implementer` |
@@ -157,7 +157,7 @@ Uncommitted on `rdna_extras` (do not commit unless the user authorizes):
 Python isolation/`seq_lens` is live on the remote tree without rebuild. The **2048-row persist pin is in the header on disk; `_rocm_C.abi3.so` at handover is still serve27** (`71437656` bytes, mtime **Sep 10 10:43**). A rebuild was in flight (`pip install -e .` against venv-7.14.0, `PYTORCH_ROCM_ARCH=gfx1030`). Check:
 
 ```bash
-ls -l /home/chenco_adm/opengfx1030_vllm-rdna/vllm/_rocm_C.abi3.so
+ls -l <bench-home>/opengfx1030_vllm-rdna/vllm/_rocm_C.abi3.so
 # want mtime after 10:43 and size != 71437656 if the 2048-row rebuild landed
 ```
 
@@ -174,11 +174,11 @@ If the in-flight rebuild finished, launch serve28. If it did not, finish it (tou
 cd /tmp
 export VLLM_ROCM_MIXED_LOG=1
 nohup env \
-  MODEL=/home/chenco_adm/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea \
+  MODEL=<bench-home>/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea \
   PORT=18094 HIP_VISIBLE_DEVICES=0,1 \
   MAX_MODEL_LEN=32768 KV_CACHE_MEMORY=6000000000 MAX_NUM_SEQS=8 \
   VLLM_ROCM_MIXED_LOG=1 \
-  /home/chenco_adm/opengfx1030_vllm-rdna/scripts/serve_gfx1030_full.sh \
+  <bench-home>/opengfx1030_vllm-rdna/scripts/serve_gfx1030_full.sh \
   > /tmp/gfx1030_truefull_livetail/serve28.log 2>&1 &
 echo $!
 ```
@@ -197,8 +197,8 @@ If 1k c=8 regresses, the 2048-row pin still grew during mixed — pretouch FA `O
 ## Rebuild env (venv-7.14.0)
 
 ```bash
-source /home/chenco_adm/Apps/vllm/venv-7.14.0/bin/activate
-cd /home/chenco_adm/opengfx1030_vllm-rdna
+source <bench-home>/Apps/vllm/venv-7.14.0/bin/activate
+cd <bench-home>/opengfx1030_vllm-rdna
 export SETUPTOOLS_SCM_PRETEND_VERSION=0.20.1.dev99
 export VLLM_TARGET_DEVICE=rocm VLLM_USE_PRECOMPILED=0
 export PYTORCH_ROCM_ARCH=gfx1030 CMAKE_HIP_ARCHITECTURES=gfx1030 AMDGPU_TARGETS=gfx1030
@@ -227,7 +227,7 @@ rsync -avz \
   --exclude='.cache/' --exclude='.triton/' --exclude='.vllm-cache/' --exclude='.tmp/' \
   -e "ssh -i $HOME/.ssh/id_ed25519_ansible" \
   ./opengfx1030_vllm-rdna/ \
-  chenco_adm@192.168.1.176:/home/chenco_adm/opengfx1030_vllm-rdna/
+  <bench-host>:<bench-home>/opengfx1030_vllm-rdna/
 ```
 
 Do not rsync `.so`. Remote produces it.
@@ -237,10 +237,10 @@ Do not rsync `.so`. Remote produces it.
 ## Bench commands
 
 ```bash
-source /home/chenco_adm/Apps/vllm/venv-7.14.0/bin/activate
+source <bench-home>/Apps/vllm/venv-7.14.0/bin/activate
 export TOKENIZERS_PARALLELISM=false
 cd /tmp
-TOOLS=/home/chenco_adm/opengfx1030_vllm-rdna/tools
+TOOLS=<bench-home>/opengfx1030_vllm-rdna/tools
 URL=http://127.0.0.1:18094
 MODEL=.../snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea
 

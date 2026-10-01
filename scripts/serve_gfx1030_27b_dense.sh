@@ -4,32 +4,29 @@
 # --max-model-len (the model's own context is used), the full HIP stack
 # (FA-RDNA2 attention + RDNA2 W4A16/W4A8 GEMMs), prefix caching, F&P graphs.
 #
+# Shared setup lives in scripts/rdna_launcher_common.sh.
+#
 # Usage:
-#   MTP=0 bash scripts/serve_gfx1030_27b_dense.sh            # plain decode
-#   MTP=2 bash scripts/serve_gfx1030_27b_dense.sh            # MTP spec decode
-# Env: MTP(0|2), W4A8(0|1), RDNA_AR(0|1), ATTN(fa|triton), TP, PORT, MAXBAT, KV, SEQS,
-#      MAXLEN (unset = model default), CG_MODE, CG_SIZES, MODEL, VENV, VLLM_TREE.
+#   MODEL=/path/to/qwen3.8-27b-awq VENV=/path/to/venv \
+#     MTP=0 bash scripts/serve_gfx1030_27b_dense.sh            # plain decode
+#   MODEL=... VENV=... MTP=2 bash scripts/serve_gfx1030_27b_dense.sh
+#
+# Required env: MODEL (checkpoint), VENV (or an activated venv).
+# Optional env: MTP(0|2), W4A8(0|1), RDNA_AR(0|1), ATTN(fa|triton), TP, PORT,
+#   MAXBAT, KV, SEQS, MAXLEN (unset = model default), CG_MODE, CG_SIZES,
+#   GPUIDS, VLLM_TREE.
 set -euo pipefail
 
-source_dir=${VLLM_TREE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-runtime=${VENV:-$HOME/Apps/vllm/venv-7.14.0_0.28.0}
-model=${MODEL:-$HOME/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/63768c10df38c0395e12ef49edac1bd539eaeeea}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rdna_launcher_common.sh"
+rdna_require_model
+rdna_init
+
 port=${PORT:-18210}
 tp=${TP:-4}
 attn=${ATTN:-fa}
 mtp=${MTP:-0}
 w4a8=${W4A8:-0}
 rdna_ar=${RDNA_AR:-1}
-
-export PYTHONPATH=$source_dir
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export HIP_VISIBLE_DEVICES=${GPUIDS:-0,1,2,3}
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export GPU_MAX_HW_QUEUES=2
-
-ROCM_SDK_LIB="$runtime/lib/python3.12/site-packages/_rocm_sdk_libraries/lib"
-ROCM_SDK="$runtime/lib/python3.12/site-packages/_rocm_sdk_core/lib"
-export LD_LIBRARY_PATH="$ROCM_SDK_LIB:$ROCM_SDK/host-math/lib:$ROCM_SDK/rocm_sysdeps/lib:$ROCM_SDK/core/lib:$runtime/lib/python3.12/site-packages/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_RDNA_FUSED_SE=1
@@ -43,49 +40,14 @@ export VLLM_RDNA_AR=$rdna_ar VLLM_RDNA_AR_MAX_KB=${VLLM_RDNA_AR_MAX_KB:-64} VLLM
 export HSA_FORCE_FINE_GRAIN_PCIE=1 HSA_ENABLE_SDMA=0 OMP_NUM_THREADS=4
 export TOKENIZERS_PARALLELISM=false PYTHONFAULTHANDLER=1
 export VLLM_CAUSAL_CONV1D_RDNA2_FWD=0 VLLM_CAUSAL_CONV1D_RDNA2_UPDATE=0
-export VLLM_ENABLE_STARTUP_PLAN=0 VLLM_ROCM_USE_AITER=0 TORCH_BLAS_PREFER_HIPBLASLT=0
-export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$source_dir/cache/vllm}
-export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$source_dir/cache/triton}
-export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$source_dir/cache/inductor}
-export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-$source_dir/cache/extensions}
+export VLLM_ENABLE_STARTUP_PLAN=0
 export VLLM_TUNED_CONFIG_FOLDER=$source_dir/tuned-moe
 
-# TunableOp rows live in the fork (tunableop/rocblas-<libsha>/), selected by the
-# rocBLAS build hash. Set TUNABLEOP=0 to boot without them (lookup off).
-tunableop=${TUNABLEOP:-1}
-source "$source_dir/tools/rdna2_028/tunableop_env.sh"
-if [ "$tunableop" = "1" ]; then
-  configure_mtp_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$source_dir/tunableop"
-else
-  export PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
-  export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
-fi
-
-if [ "$attn" = "fa" ]; then
-  export VLLM_USE_RDNA2_FA=1
-  attention_backend=RDNA_ATTN
-  export VLLM_FA_RDNA2_GQA_DECODE="${VLLM_FA_RDNA2_GQA_DECODE:-1}"
-  unset FLASH_ATTENTION_TRITON_AMD_ENABLE || true
-else
-  export VLLM_USE_RDNA2_FA=0
-  attention_backend=TRITON_ATTN
-  export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-fi
-
-if [ "$mtp" = "0" ]; then
-  spec_args=()
-  capture_sizes=${CG_SIZES:-'[1,2,4,8]'}
-else
-  spec_args=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$mtp,\"use_local_argmax_reduction\":true}")
-  decode_width=$((mtp + 1))
-  sizes=""
-  for mult in 1 2 4 8; do
-    sizes="$sizes$((decode_width * mult)),"
-  done
-  capture_sizes=${CG_SIZES:-"[${sizes%,}]"}
-fi
+rdna_tunableop || exit 1
+rdna_select_attention "$attn"
 
 cg_mode=${CG_MODE:-FULL_AND_PIECEWISE}
+rdna_mtp_args "$mtp"
 maxlen_arg=()
 [ -n "${MAXLEN:-}" ] && maxlen_arg=(--max-model-len "$MAXLEN")
 
@@ -97,17 +59,9 @@ if [ "${EAGER:-0}" = "1" ]; then
   compile_args=(--enforce-eager)
 fi
 
-# Kill leftovers scoped to THIS tree's cache root so a co-tenant is never touched.
-for _sig in TERM KILL; do
-  for _p in $(pgrep -f "entrypoints.cli.main serve|entrypoints.openai.api_server|VLLM::Worker|VLLM::EngineCore|PleOffloadWorker" 2>/dev/null); do
-    [ -r "/proc/$_p/environ" ] || continue
-    tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null | grep -q "^VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}$" && kill -"$_sig" "$_p" 2>/dev/null
-  done
-  [ "$_sig" = "TERM" ] && sleep 8
-done
-sleep 3
-exec "$runtime/bin/python" -m vllm.entrypoints.cli.main serve \
-  --model "$model" --served-model-name q27d \
+rdna_kill_stale
+exec "$VENV/bin/python" -m vllm.entrypoints.cli.main serve \
+  --model "$MODEL" --served-model-name q27d \
   --host 127.0.0.1 --port "$port" \
   --attention-backend "$attention_backend" \
   --tensor-parallel-size "$tp" \

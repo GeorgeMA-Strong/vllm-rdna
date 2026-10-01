@@ -41,9 +41,9 @@ Historical focused tests, reproducible with an installed ROCm vLLM environment:
 
 ## Full launch and environment
 
-Run on the Linux V620 server as george. These are the saved combined deployment paths and require its native resident-MoE build, model files and tuning tables. This focused QSA patch alone is Python-only; the absolute benchmark rates also depend on the other deployment optimizations. The launch below explicitly includes values supplied by systemd, which must not be omitted when running manually.
+Run on a Linux V620 server. These are the saved combined deployment paths and require its native resident-MoE build, model files and tuning tables. Set `V620_ROOT`, `V620_RUNTIME` and `V620_MODEL` to your own copies. This focused QSA patch alone is Python-only; the absolute benchmark rates also depend on the other deployment optimizations. The launch below explicitly includes values supplied by systemd, which must not be omitted when running manually.
 
-Model path: /home/george/v620-vllm/models/intel-autoround. Published validation used original BF16 CPU PLE, not group16 INT4. Exact upstream model/sidecar revision identifiers have not been reverified for this publication; the local directory identifies the measured artifact.
+Model path: `$V620_MODEL` (the measured artifact was an Intel AutoRound export). Published validation used original BF16 CPU PLE, not group16 INT4. Exact upstream model/sidecar revision identifiers have not been reverified for this publication; the local directory identifies the measured artifact.
 
 PyTorch in the saved microbenchmark: 2.13.0+rocm10.0.0. Runtime vLLM version string: 0.26.1rc1.dev0+upstream.3e1a0e1aa; use the source commit above for provenance. TunableOp helper selects qualified rocBLAS c27e2252cc7a lookup tables, overriding initial disabled defaults while keeping live tuning off.
 
@@ -55,11 +55,11 @@ export VLLM_RDNA_MOE_RESIDENT_SKINNY=1
 export VLLM_RDNA_FUSED_SE=1
 export VLLM_GDN_HIP_PREFILL=0
 export VLLM_TRACE_PREFIX_CACHE=1
-export VLLM_TUNED_CONFIG_FOLDER=/home/george/v620-experiments/decode-qsa-20260920/tuned-moe
+export VLLM_TUNED_CONFIG_FOLDER=${V620_ROOT:?set V620_ROOT}/tuned-moe
 #!/usr/bin/env bash
 set -euo pipefail
-root=/home/george/v620-experiments/decode-qsa-20260920
-runtime=/home/george/v620-experiments/upstream-20260915/v620-vllm-testing
+root=${V620_ROOT:?set V620_ROOT to the deployment checkout}
+runtime=${V620_RUNTIME:?set V620_RUNTIME to the rocm10 venv root}
 export PYTHONPATH=$root/source
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_PLE_CPU_OFFLOAD=1 VLLM_USE_V2_MODEL_RUNNER=1
@@ -78,7 +78,7 @@ export LD_LIBRARY_PATH="$sdk/lib:$sdk/lib/host-math/lib:/opt/rocm/core-10.0/lib"
 source "$root/source/tools/rdna2/tunableop_env.sh"
 configure_v620_tunableop "$runtime/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5" "$runtime/tunableop"
 command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
- --model /home/george/v620-vllm/models/intel-autoround --served-model-name active qwen3.8-flash-next
+ --model ${V620_MODEL:?set V620_MODEL} --served-model-name active qwen3.8-flash-next
  --host 0.0.0.0 --port 8080 --tensor-parallel-size 4 --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
  --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
  --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4294967296
@@ -113,13 +113,13 @@ CPU PLE offload: its ROCm CUDA IPC registration can fail with
 Saved harness: llm-context-bench 92286b24065565f4929e78c45f776029480e9939, concurrency one, streaming chat, 1,024 outputs, unique cache salts, 11% input tolerance for tokenizer drift. The historical cold-cache proxy on 8082 must be running and forwarding to 8080 for this exact command.
 
 ```bash
-export PYTHONPATH=/home/george/v620-vllm-testing/context-bench-92286b2/src
-/home/george/v620-vllm-testing/.venv/bin/python -m llm_context_bench \
+export PYTHONPATH=${V620_RUNTIME:?set V620_RUNTIME}/context-bench-92286b2/src
+"${V620_RUNTIME}"/.venv/bin/python -m llm_context_bench \
  --base-url http://127.0.0.1:8082 --model active --engine vllm \
  --profile qsa-live-prefill --suite all --lane performance --sizes 16k 32k 64k 128k \
  --input-size-tolerance-percent 11 --chat-template-kwargs '{"enable_thinking":false}' \
  --timeout 240 --output qsa-live-prefill-results.json \
- --command '/bin/bash /home/george/v620-experiments/decode-qsa-20260920/serve-tp4-checkpoints.sh' \
+ --command "/bin/bash ${V620_ROOT:?}/serve-tp4-checkpoints.sh" \
  --system '4x V620; TP4 EP4 MTP2; Intel INT4 experts; FP16 dense; original CPU BF16 PLE'
 ```
 

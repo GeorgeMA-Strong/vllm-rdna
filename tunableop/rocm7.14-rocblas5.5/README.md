@@ -1,9 +1,10 @@
-# FP16 TunableOp rows — rocblas-f30bb442e9b5
+# FP16 TunableOp rows — profile rocm7.14-rocblas5.5
 
 Build-specific rocBLAS solver rows for the serving stack on 4× V620 (gfx1030),
 captured 2026-09-29 by re-tuning the production Flash-Next shapes with the
-0.28.0 tree. The directory hash is the first 12 hex chars of the `librocblas.so.5`
-sha256 (see `provenance.json`).
+0.28.0 tree. The profile is registered in `../profiles.json`; its
+`lib_sha256` is the `librocblas.so.5` sha256 (see `provenance.json`), and
+`configure_tunableop` matches it against the loaded build.
 
 ## What changed vs the harvested 903-row set
 
@@ -50,10 +51,11 @@ this tree, so the validated EXL3 serving config is MTP=0. Lookup-hit proof:
 
 ## Storage policy (mandatory)
 
-* **One canonical folder per rocBLAS build hash** (`rocblas-<sha256[:12]>/`).
-  This directory is **the** canonical set for the fork's serving build
-  (`5.5.0.cd957402` → `f30bb442e9b5`) and covers Flash-Next, 27B AWQ dense and
-  EXL3 27B. Foreign-build sets live under `../archive/`.
+* **One visible folder per rocBLAS build**, registered by name in
+  `../profiles.json`. This directory (profile `rocm7.14-rocblas5.5`) is **the**
+  canonical set for the fork's serving build (`5.5.0.cd957402` →
+  `f30bb442e9b5`) and covers Flash-Next, 27B AWQ dense and EXL3 27B. The
+  foreign-build table lives in the sibling profile `../rocm10-rocblas5.6/`.
 
 * **Never** store rows in `/tmp` or the run CWD. Both are wiped / vary between
   runs, which silently drops c=1 and small-batch shapes back to rocBLAS
@@ -69,21 +71,28 @@ this tree, so the validated EXL3 serving config is MTP=0. Lookup-hit proof:
 Consumption is a one-liner — source the helper and point it at this build:
 
 ```bash
-source tools/rdna2_028/tunableop_env.sh
-configure_tunableop "$HOME/Apps/vllm/venv-7.14.0_0.28.0/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5" \
-                    "$PWD/tunableop"
+# $VENV = the venv that loads this rocBLAS build; <tree> = this checkout.
+source <tree>/tools/rdna2_028/tunableop_env.sh
+configure_tunableop "$VENV/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5" \
+                    "<tree>/tunableop"
 ```
 
-It selects `tunableop/rocblas-<hash>/` from the loaded rocBLAS build and sets
-a **lookup-only** environment (`PYTORCH_TUNABLEOP_ENABLED=1`, `TUNING=0`,
-`PYTORCH_TUNABLEOP_FILENAME` at the rank files). The launchers
+It auto-selects profile `rocm7.14-rocblas5.5` from the loaded rocBLAS build
+(matching `lib_sha256`) and sets a **lookup-only** environment
+(`PYTORCH_TUNABLEOP_ENABLED=1`, `TUNING=0`, `PYTORCH_TUNABLEOP_FILENAME` at the
+rank files). The launchers
 (`scripts/serve_gfx1030_flashnext_mtp.sh`, `scripts/serve_gfx1030_27b_dense.sh`,
 `scripts/serve_gfx1030_flashnext.sh`, `scripts/serve_gfx1030_full.sh`) already
 do this. A healthy start logs:
 
 ```
-TunableOp lookup enabled for rocBLAS build f30bb442e9b5 (rows: .../tunableop/rocblas-f30bb442e9b5); tuning off ...
+TunableOp profile rocm7.14-rocblas5.5 auto-selected for rocBLAS build f30bb442e9b5.
+TunableOp lookup enabled for profile rocm7.14-rocblas5.5 (rocBLAS f30bb442e9b5; rows: .../tunableop/rocm7.14-rocblas5.5); tuning off ...
 ```
+
+Set `TUNABLEOP_PROFILE=rocm7.14-rocblas5.5` to force this profile explicitly;
+the helper validates its `lib_sha256` against the loaded library and refuses to
+boot on a mismatch (unless `TUNABLEOP_ALLOW_MISMATCH=1`, experiments only).
 
 * `PYTORCH_TUNABLEOP_TUNING=1` re-tunes shapes missing from the table (writes
   into the selected rows path; harvest into this directory when validated).
@@ -111,15 +120,16 @@ End-to-end cells with these frozen rows are recorded under
 ## Regeneration
 
 ```bash
-WORK=/home/chenco_adm/w4a8_runs/tunableop-rows
-bash /home/chenco_adm/vllm-rdna-0.28.0/tools/rdna2_028/tunableop_rows_pipeline.sh all
-python3 /home/chenco_adm/vllm-rdna-0.28.0/tools/rdna2_028/curate_tunableop_rows.py \
-  --current-rows /home/chenco_adm/vllm-rdna-0.28.0/tunableop/rocblas-f30bb442e9b5 \
-  --scratch-rows $WORK/scratch \
-  --heur $WORK/measure/heuristic.json \
-  --cur $WORK/measure/current.json \
-  --new $WORK/measure/new.json \
-  --out $WORK/curated --adopt-margin 0.02 --drop-margin 0.03
+# <tree> = this checkout; WORK = a persistent scratch dir (never /tmp).
+export VLLM_TREE=<tree> VENV=/path/to/venv WORK=$HOME/tunableop-rows
+bash "$VLLM_TREE/tools/rdna2_028/tunableop_rows_pipeline.sh" all
+python3 "$VLLM_TREE/tools/rdna2_028/curate_tunableop_rows.py" \
+  --current-rows "$VLLM_TREE/tunableop/rocm7.14-rocblas5.5" \
+  --scratch-rows "$WORK/scratch" \
+  --heur "$WORK/measure/heuristic.json" \
+  --cur "$WORK/measure/current.json" \
+  --new "$WORK/measure/new.json" \
+  --out "$WORK/curated" --adopt-margin 0.02 --drop-margin 0.03
 ```
 
 The historical leak this directory fixes wrote to `/tmp/tunableop_results{0..3}.csv`

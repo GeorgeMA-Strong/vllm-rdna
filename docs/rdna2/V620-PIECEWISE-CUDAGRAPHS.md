@@ -7,7 +7,7 @@ MTP2, PLE CPU offload, prefix caching, 4x V620 / gfx1030).
 
 Everything below was measured on this box with
 `ROCM_LIB=/opt/rocm/core-10.0/lib TUNEOP=1 PRELOAD=0` and the PR #17 TunableOp
-table, using `/home/wsantos/work/pw-serve.sh` (a copy of
+table, using `<wsantos-home>/work/pw-serve.sh` (a copy of
 `tools/rdna2/serve_v620_baseline.sh` with the compilation config exposed) and
 `pr17-bench.py` (16k prompt, 1024 output tokens).
 
@@ -93,8 +93,8 @@ INFO [cudagraph_utils.py:357] ROCm FULL decode executes piecewise CUDA graphs
 INFO [model_runner.py:984] Graph capturing finished in 3 secs, took 0.46 GiB
 ```
 
-Raw server logs: `/home/wsantos/work/piecewise-c5-full_and_piecewise.log`
-(PIECEWISE) and `/home/wsantos/work/piecewise-d-full_decode_only.log`
+Raw server logs: `<wsantos-home>/work/piecewise-c5-full_and_piecewise.log`
+(PIECEWISE) and `<wsantos-home>/work/piecewise-d-full_decode_only.log`
 (mode-0 FULL baseline).
 
 The speculator captures its own FULL draft-decode graphs. Correctness probes
@@ -131,7 +131,7 @@ tok/s and decode 34.7 vs 72.8 tok/s; coding prefill 2,064.1 vs 2,008.1 and decod
 37.6 vs 81.3. The plain (non-tolerance) PR #17 harness argv produces
 `valid_trials: 0` for both arms — including PR #17's own reference run — so only
 the cold protocol gives a comparable table. Artifacts:
-`/home/wsantos/work/llm-context-bench-results/pr17-rocm10-tuned-cold-16k.json`
+`<wsantos-home>/work/llm-context-bench-results/pr17-rocm10-tuned-cold-16k.json`
 (mode 0) and `...-cold-full_and_piecewise-16k.json` (piecewise).
 
 ## Still open

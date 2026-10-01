@@ -10,9 +10,10 @@ The exact configuration behind the numbers below, in reproduction order.
 - venv built as `venv-7.14.0_0.28.0` (torch 2.12.0+rocm7.14.0, hip 7.14.60850,
   rocblas 5.5.0.cd957402). The shared rows are keyed to `librocblas.so.5`
   sha256 `f30bb442e9b5…`.
-- TunableOp rows: `tunableop/rocblas-f30bb442e9b5/tunableop_results{0..3}.csv`
-  (903 rows/rank, committed to this repo). The launcher's helper selects them by
-  the library hash and enables **lookup-only** TunableOp (`TUNING` stays off).
+- TunableOp rows: `tunableop/rocm7.14-rocblas5.5/tunableop_results{0..3}.csv`
+  (783 rows/rank, committed to this repo). The launcher's helper auto-selects the
+  profile from `tunableop/profiles.json` by the `librocblas.so.5` sha256 and
+  enables **lookup-only** TunableOp (`TUNING` stays off).
 - Model and PLE quant dir as in the launcher defaults (`MODEL`,
   `VLLM_PLE_QUANT_DIR` override).
 

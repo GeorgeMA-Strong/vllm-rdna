@@ -1,14 +1,20 @@
 #!/bin/bash
 # Production serve: breakable FULL_AND_PIECEWISE HIP graphs (FA-RDNA2 + W4A16
 # + HIP KV + HIP GDN). Greedy PASS 3/3 on Qwen3.8-27B-AWQ-INT4, TP=2, 2026-09-09.
-# Usage: MODEL=/path/to/model PORT=18094 HIP_VISIBLE_DEVICES=0,1 ./scripts/serve_gfx1030_full.sh
+# Shared setup lives in scripts/rdna_launcher_common.sh.
+#
+# Required env: MODEL (checkpoint), VENV (or an activated venv).
+# Usage: MODEL=/path/to/model VENV=/path/to/venv PORT=18094 \
+#          HIP_VISIBLE_DEVICES=0,1 ./scripts/serve_gfx1030_full.sh
 set -euo pipefail
-source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rdna_launcher_common.sh"
+rdna_require_model
+rdna_init
+
 PORT="${PORT:-18094}"
 TP="${TP:-2}"
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1}"
-VENV="${VENV:-/home/chenco_adm/Apps/vllm/venv-7.14.0}"
-MODEL="${MODEL:?set MODEL to the checkpoint path}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-200000}"
 if [ "$MAX_MODEL_LEN" -lt 32768 ]; then
   echo "MAX_MODEL_LEN=$MAX_MODEL_LEN is below the 32768 floor; use 200000 in production." >&2
@@ -16,13 +22,6 @@ if [ "$MAX_MODEL_LEN" -lt 32768 ]; then
 fi
 
 source "$VENV/bin/activate"
-ROCM_SDK_LIB="$VENV/lib/python3.12/site-packages/_rocm_sdk_libraries/lib"
-ROCM_SDK="$VENV/lib/python3.12/site-packages/_rocm_sdk_core/lib"
-export LD_LIBRARY_PATH="$ROCM_SDK_LIB:$ROCM_SDK/host-math/lib:$ROCM_SDK/rocm_sysdeps/lib:$ROCM_SDK/core/lib:$VENV/lib/python3.12/site-packages/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export CPATH="/opt/rocm/core-7.14/include:${CPATH:-}"
-export LIBRARY_PATH="/opt/rocm/core-7.14/lib:${LIBRARY_PATH:-}"
-export ROCM_HOME=/opt/rocm/core-7.14
-export HIP_PATH=/opt/rocm/core-7.14
 export HIP_VISIBLE_DEVICES
 
 export VLLM_USE_V2_MODEL_RUNNER=1
@@ -35,24 +34,10 @@ export VLLM_ROCM_NO_MIXED_BATCH="${VLLM_ROCM_NO_MIXED_BATCH:-0}"
 export VLLM_ROCM_SKIP_LIVE_TAIL_HASH="${VLLM_ROCM_SKIP_LIVE_TAIL_HASH:-1}"
 export VLLM_USE_AOT_COMPILE=0
 export VLLM_DISABLE_COMPILE_CACHE=1
-export VLLM_ROCM_USE_AITER=0
-export VLLM_ROCM_USE_AITER_MOE=0
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-export VLLM_RDNA_FORCE_FP16=1
-export TORCH_BLAS_PREFER_HIPBLASLT=0
-# TunableOp rows live in the fork (tunableop/rocblas-<libsha>/); the helper
-# wires a lookup-only env keyed by the rocBLAS build and falls back to
-# ~/.cache/tunableop/ when this build has no rows. Never /tmp or the run CWD.
-# shellcheck source=tools/rdna2_028/tunableop_env.sh
-tunableop=${TUNABLEOP:-1}
-source "$source_dir/tools/rdna2_028/tunableop_env.sh"
-if [ "$tunableop" = "1" ]; then
-  configure_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$source_dir/tunableop"
-else
-  export PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
-  export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
-fi
-export VLLM_BATCH_INVARIANT=0
+
+rdna_tunableop || exit 1
+
 # Mixed 16k skip_compiled hits reserved-unallocated holes next to FULL
 # keepalives. expandable_segments:True is required for that hole (serve26
 # 1k c=8 8/8). False + a 128 MiB persist floor regressed 1k c=8 to 3/8.
@@ -63,8 +48,6 @@ if [ "${VLLM_PLE_CPU_OFFLOAD:-0}" = "1" ]; then
 else
   export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 fi
-export GPU_MAX_HW_QUEUES=2
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-pix}"
 export RCCL_P2P_NET_DISABLE=1
 export RCCL_P2P_BATCH_ENABLE=1
@@ -110,11 +93,8 @@ else
   PREFIX_CACHE_FLAG="--enable-prefix-caching"
 fi
 
-# Run from a persistent, non-repo CWD (never /tmp): avoids /tmp per the storage
-# policy and avoids shadowing the vllm package when CWD is the tree root.
-run_cwd=${RUN_CWD:-$source_dir/cache/run}
-mkdir -p "$run_cwd"
-cd "$run_cwd"
+rdna_kill_stale
+rdna_run_cwd
 # A rank JIT-compiling Triton during the V2 warmup blocks the others in the
 # logits allgather past PyTorch's 600s NCCL timeout; give it room.
 DIST_TIMEOUT="${DIST_TIMEOUT:-1800}"

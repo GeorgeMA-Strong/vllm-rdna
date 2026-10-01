@@ -1,24 +1,21 @@
-# V620 FP16 TunableOp rows
+# V620 FP16 TunableOp profiles
 
 Build-specific, **lookup-only** TunableOp solver rows for the gfx1030 serving
 stack on 4× Radeon PRO V620. They were generated with the matching ROCm wheel
 SDK. They do not quantize weights or activations. Solution IDs must never be
 reused across a different rocBLAS build, even when version strings match.
 
-## Canonical set
+Both shipped row sets are **first-class, named profiles** (nothing is archived):
+one visible folder per rocBLAS build, selected at launch.
 
-`rocblas-f30bb442e9b5/` is **the** canonical set shipped with the fork. It holds
-**783 FP16 rows per rank** (identical on all four ranks) for the fork's serving
-build:
+## Profiles
 
-| | |
-|---|---|
-| venv | `venv-7.14.0_0.28.0` |
-| torch / HIP | `2.12.0+rocm7.14.0` / `7.14.60850` |
-| rocBLAS | `5.5.0.cd957402` |
-| `librocblas.so.5` sha256[:12] | `f30bb442e9b5` |
+| Profile | rocBLAS | ROCm / torch | `librocblas.so.5` sha256[:12] | rows / rank | Status |
+|---|---|---|---:|---:|---|
+| `rocm7.14-rocblas5.5/` | `5.5.0.cd957402` | `7.14.60850` / `2.12.0+rocm7.14.0` | `f30bb442e9b5` | **783** | canonical (serving build, `venv-7.14.0_0.28.0`) |
+| `rocm10-rocblas5.6/` | `5.6.0.8d1ae90e` | `7.15.26333` / `2.13.0+rocm10.0.0` | `c27e2252cc7a` | 70 | **thin, needs its own capture campaign** |
 
-It is the shared set for all three serving families:
+The canonical profile covers all three serving families:
 
 * **Flash-Next** — `Qwen3.8-Flash-Next-AWQ-W4A16`, MTP=0 and MTP=2 (includes the
   M ≤ 8 decode shapes and the M = 16/24/32 MTP-verify shapes).
@@ -26,52 +23,59 @@ It is the shared set for all three serving families:
 * **EXL3 27B** — `Qwen3.8-27B-exl3-3.00bpw` (K = 5120/1536/4352; 0 collisions
   with the Flash-Next K set).
 
-`provenance.json` in that directory records the library hash, package versions,
-the capture/tune/curate campaign, and the lookup-hit proof. See its `README.md`
-for the per-campaign deltas and regeneration recipe.
+Each profile carries a `provenance.json` (library hash, package versions, the
+capture/tune/curate campaign, lookup-hit proof) and a `README.md` (per-campaign
+deltas and regeneration recipe).
 
-## Storage policy (mandatory)
+## Registry and selection
 
-* **One canonical folder per rocBLAS build hash**, named
-  `rocblas-<sha256(librocblas)[:12]>/`. The helper selects the folder that
-  matches the *loaded* build; solver IDs from another hash never validate.
-* **Never** write rows to `/tmp` or the run CWD — both are wiped or vary between
-  runs, which silently drops small-batch shapes back to rocBLAS heuristics.
-* **Per-user fallback:** `$HOME/.cache/tunableop/tunableop_results.csv`. The
-  helper uses it automatically when the loaded build has no rows, and it is where
-  online tuning writes.
-
-Consumption is a one-liner; the helper is lookup-only (`TUNING=0`) and keyed by
-the rocBLAS build:
+`profiles.json` is the registry: `name -> {rocblas, rocm, torch, lib_sha256,
+dir, rows_per_rank, status}`. The helper
+(`tools/rdna2_028/tunableop_env.sh`, mirror `tools/rdna2/tunableop_env.sh`)
+resolves a profile from it:
 
 ```bash
 source <tree>/tools/rdna2_028/tunableop_env.sh
-configure_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "<tree>/tunableop"
+configure_tunableop <librocblas.so.5 path> <tunableop dir> [profile]
 ```
 
-A healthy start logs:
+* **auto (default, omitted/empty `[profile]`)** — pick the profile whose
+  `lib_sha256[:12]` equals `sha256(loaded librocblas.so.5)[:12]`. This is the
+  safe default: solver IDs are build-specific, so the rows must match the build
+  that generated them. A legacy `rocblas-<hash>/` folder is still honoured if
+  no registered profile matches, and the per-user path is the last resort.
+* **explicit (`TUNABLEOP_PROFILE=<name>` or the third argument)** — force a
+  named profile. The helper **validates its `lib_sha256` against the loaded
+  library** and **fails the launch loudly on mismatch**. For experiments only,
+  `TUNABLEOP_ALLOW_MISMATCH=1` downgrades the error to a hard warning and uses
+  the rows anyway. A mismatched set can never run silently.
+
+A healthy auto-selecting start logs:
 
 ```
-TunableOp lookup enabled for rocBLAS build f30bb442e9b5 (rows: <tree>/tunableop/rocblas-f30bb442e9b5); tuning off ...
+TunableOp profile rocm7.14-rocblas5.5 auto-selected for rocBLAS build f30bb442e9b5.
+TunableOp lookup enabled for profile rocm7.14-rocblas5.5 (rocBLAS f30bb442e9b5; rows: <tree>/tunableop/rocm7.14-rocblas5.5); tuning off ...
 ```
 
-All serve launchers under `scripts/` and the in-tree bench/capture drivers that
-start an engine go through this helper (or the `tools/rdna2/` mirror); a launcher
-with a `TUNABLEOP=0` opt-out sets `PYTORCH_TUNABLEOP_ENABLED=0` and writes
-nothing. `PYTORCH_TUNABLEOP_TUNING=1` re-tunes shapes missing from the table
-(writes into the selected rows path; harvest into the canonical directory when
-validated).
+Lookup is read-only by default (`PYTORCH_TUNABLEOP_TUNING=0`).
+`PYTORCH_TUNABLEOP_TUNING=1` re-tunes shapes missing from the table (writes into
+the selected rows path; harvest into the profile directory when validated).
 
-## Archived sets
+## Storage policy (mandatory)
 
-`archive/` holds foreign-build row sets that are **not** the fork's serving set.
-They are preserved (not deleted) because their solution IDs are only valid for
-the exact build that generated them. Currently:
+* **One folder per rocBLAS build**, registered by name in `profiles.json`. The
+  helper selects the folder that matches the *loaded* build; solver IDs from
+  another build never validate.
+* **Never** write rows to `/tmp` or the run CWD — both are wiped or vary between
+  runs, which silently drops small-batch shapes back to rocBLAS heuristics.
+* **Per-user fallback:** `$HOME/.cache/tunableop/tunableop_results.csv`. The
+  helper uses it automatically when the selected build has no rows, and it is
+  where online tuning writes.
 
-* `archive/rocblas-c27e2252cc7a/` — 70 rows from
-  `torch 2.13.0+rocm10.0.0` / rocBLAS `5.6.0.8d1ae90e` (George's V620 test venv).
-  Not usable on `f30bb442e9b5`; see its `README.md` for how to reactivate it if
-  that build is ever served.
+All serve launchers under `scripts/` (through `scripts/rdna_launcher_common.sh`)
+and the in-tree bench/capture drivers go through this helper (or the
+`tools/rdna2/` mirror); a launcher with a `TUNABLEOP=0` opt-out sets
+`PYTORCH_TUNABLEOP_ENABLED=0` and writes nothing.
 
 ## Cache-aligned prefill
 
@@ -91,7 +95,7 @@ chunks. Arbitrary prompt tails, mixed batches, or model/runner changes can still
 introduce other shapes. Re-run the cold-context performance and prefix-reuse
 checks before promoting any later optimization, and retain the previous release's
 source, environment, tuning files and launch command for rollback. A different
-rocBLAS hash requires a separately qualified table.
+rocBLAS hash requires a separately qualified profile.
 
 ## Regenerate for another rocBLAS build
 
@@ -116,4 +120,5 @@ retaining FP16 weights does not imply bit-identical outputs.
 For the current fork pipeline (capture → tune → curate → freeze + lookup-hit
 proof) see `tools/rdna2_028/tunableop_rows_pipeline.sh`,
 `tools/rdna2_028/curate_tunableop_rows.py` and the per-campaign sections in
-`bench_results/`.
+`bench_results/`. Freeze the result into `tunableop/<profile-name>/`, then add
+the profile to `profiles.json`.

@@ -66,7 +66,8 @@ export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
 export VLLM_RDNA_FORCE_FP16=1
 export TORCH_BLAS_PREFER_HIPBLASLT=0
 # TunableOp rows are build-keyed and shared in the fork
-# (tunableop/rocblas-<sha256[:12]>/); never write them to /tmp or the run CWD.
+# (tunableop/<profile-name>/, registered in tunableop/profiles.json); never
+# write them to /tmp or the run CWD.
 # scripts/serve_gfx1030_full.sh wires a lookup-only env via
 # tools/rdna2_028/tunableop_env.sh (configure_tunableop) with a per-user
 # fallback at ~/.cache/tunableop/. If you set the env by hand, also set:
@@ -117,7 +118,7 @@ Startup log must show:
 
 ## Hardware / venv
 
-Same as other gfx1030 recipes: `par1-cs25` (`.84`), venv-7.14.0, PyTorch
-2.12.0+rocm7.14.0, HIP 7.14.60850, 4× Radeon PRO V620. Run `python -m vllm...`
+Same as other gfx1030 recipes: a 4× Radeon PRO V620 (gfx1030) box, a venv with
+PyTorch 2.12.0+rocm7.14.0, HIP 7.14.60850. Run `python -m vllm...`
 from a persistent directory that is not the tree root (e.g. `$HOME`) — never
 `/tmp` (its TunableOp rows and caches are wiped on reboot).
