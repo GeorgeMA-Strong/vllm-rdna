@@ -174,6 +174,9 @@ def _exl3_cmp_fp16(layer, x, buf_out, off, width, out_i) -> None:
     )
 
 
+_CB = {"3inst": 0, "mcg": 1, "mul1": 2}
+
+
 def exl3_codebook_id(prefix: str | None, mul1_marks, mcg_marks,
                     default: int = 0) -> int:
     """Codebook for one module from its prefix and the checkpoint markers.
@@ -488,14 +491,18 @@ class Exl3Config(QuantizationConfig):
         # known-projection names.
         known = {"gate_proj", "up_proj", "down_proj", "out_proj", "q_proj",
                  "k_proj", "v_proj", "o_proj", "gate_up_proj", "qkv_proj",
-                 "in_proj_qkv", "in_proj_z", "in_proj_qkvz", "lm_head"}
+                 "in_proj_qkv", "in_proj_z", "in_proj_qkvz", "lm_head", "fc"}
         pn = prefix.split(".")[-1]
+        # The MTP draft's fc projection is EXL3-quantized (suh/svh/trellis/
+        # mul1), but tensor_storage only enumerates the target model, so fc
+        # is absent from _exl3_suffixes. Accept it explicitly.
+        is_mtp_fc = pn == "fc" and prefix.endswith("mtp.fc")
         if pn not in known:
             import os as _os
             if _os.environ.get("VLLM_EXL3_DEBUG") == "1":
                 print(f"[exl3] UNQUANTIZED prefix={prefix} pn={pn}", flush=True)
             return UnquantizedLinearMethod()
-        if getattr(self, "_exl3_suffixes", None):
+        if getattr(self, "_exl3_suffixes", None) and not is_mtp_fc:
             if not any(s.endswith(pn) for s in self._exl3_suffixes):
                 return UnquantizedLinearMethod()
         head_bits = getattr(self, "head_bits", 6)
@@ -512,7 +519,8 @@ class Exl3Config(QuantizationConfig):
         # The head stays on the trellis GEMM. LogitsProcessor calls
         # quant_method.apply, so a dense fp16 copy of lm_head is not needed.
         return Exl3LinearMethod(
-            bits=None, hadamard=self.hadamard, fold_weight=False)
+            bits=None, hadamard=self.hadamard, fold_weight=False,
+            codebook=self.codebook)
 
 
 class Exl3LinearMethod(LinearMethodBase):
@@ -524,13 +532,14 @@ class Exl3LinearMethod(LinearMethodBase):
     """
 
     def __init__(self, bits: int | None = None, hadamard: str = "both",
-                 fold_weight: bool = False) -> None:
+                 fold_weight: bool = False, codebook: str = "3inst") -> None:
         super().__init__()
         # None until the trellis arrives. 16*K int16s per tile.
         self.bits = bits
         self.hadamard = hadamard
         self.fold_weight = fold_weight
-        self.cb = 0  # 3inst, unless a .mul1/.mcg marker says otherwise
+        self.codebook = codebook
+        self.cb = _CB.get(codebook, 0)
         # VLLM_EXL3_MEMORY_MODE: 'full' = int16 trellis (current/default),
         # 'packed' = uint8 packed (kernel decodes in registers, ~2x trellis
         # VRAM saving). Stub: the dispatcher branch is wired but the packed

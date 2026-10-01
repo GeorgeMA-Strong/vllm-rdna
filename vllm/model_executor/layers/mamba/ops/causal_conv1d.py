@@ -731,6 +731,9 @@ def causal_conv1d_fn(
         and is_channel_last
         and dim % 32 == 0
         and 2 <= width <= 5
+        # HIP fwd requires state_len == width - 1; spec decoding sizes the
+        # conv state as width - 1 + num_spec, so fall back to Triton there.
+        and conv_states.size(2) == width - 1
         and cache_indices is not None
         and block_idx_last_scheduled_token is None
         and hasattr(torch.ops, "_rocm_C")
@@ -1298,6 +1301,9 @@ def causal_conv1d_update(
         and weight.dtype == torch.float16
         and (out.dtype == torch.float16 if out is not None else True)
         and dim % 32 == 0
+        # Same spec-state guard as the fwd dispatch: HIP update requires
+        # state_len == width - 1, so Triton handles the spec-sized state.
+        and conv_state.size(2) == width - 1
         and hasattr(torch.ops, "_rocm_C")
         and hasattr(torch.ops._rocm_C, "causal_conv1d_update_rdna2")
     ):
