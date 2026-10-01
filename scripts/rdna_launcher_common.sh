@@ -54,7 +54,11 @@ rdna_init() {
 
     runtime=${VENV:-${VIRTUAL_ENV:-}}
     [[ -n $runtime ]] || rdna_die 'set VENV=/path/to/python-venv (or activate one so $VIRTUAL_ENV is set).'
-    [[ -x $runtime/bin/python ]] || rdna_die "VENV=$runtime has no bin/python."
+    # RDNA_DRY_RUN lets serve_rdna.sh PRINT the plan for a fork user before the
+    # venv exists; it never skips a check on a real launch.
+    if [[ ${RDNA_DRY_RUN:-0} != 1 ]]; then
+        [[ -x $runtime/bin/python ]] || rdna_die "VENV=$runtime has no bin/python."
+    fi
     VENV=$runtime
     export VENV
 
