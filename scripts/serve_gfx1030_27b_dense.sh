@@ -50,8 +50,16 @@ export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$source_dir/cache/indu
 export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-$source_dir/cache/extensions}
 export VLLM_TUNED_CONFIG_FOLDER=$source_dir/tuned-moe
 
+# TunableOp rows live in the fork (tunableop/rocblas-<libsha>/), selected by the
+# rocBLAS build hash. Set TUNABLEOP=0 to boot without them (lookup off).
+tunableop=${TUNABLEOP:-1}
 source "$source_dir/tools/rdna2_028/tunableop_env.sh"
-configure_mtp_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$source_dir/tunableop"
+if [ "$tunableop" = "1" ]; then
+  configure_mtp_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$source_dir/tunableop"
+else
+  export PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
+  export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
+fi
 
 if [ "$attn" = "fa" ]; then
   export VLLM_USE_RDNA2_FA=1

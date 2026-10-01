@@ -44,8 +44,14 @@ export TORCH_BLAS_PREFER_HIPBLASLT=0
 # wires a lookup-only env keyed by the rocBLAS build and falls back to
 # ~/.cache/tunableop/ when this build has no rows. Never /tmp or the run CWD.
 # shellcheck source=tools/rdna2_028/tunableop_env.sh
+tunableop=${TUNABLEOP:-1}
 source "$source_dir/tools/rdna2_028/tunableop_env.sh"
-configure_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$source_dir/tunableop"
+if [ "$tunableop" = "1" ]; then
+  configure_tunableop "$ROCM_SDK_LIB/librocblas.so.5" "$source_dir/tunableop"
+else
+  export PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
+  export PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0
+fi
 export VLLM_BATCH_INVARIANT=0
 # Mixed 16k skip_compiled hits reserved-unallocated holes next to FULL
 # keepalives. expandable_segments:True is required for that hole (serve26

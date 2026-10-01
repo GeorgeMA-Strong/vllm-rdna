@@ -10,7 +10,9 @@ sha256 (see `provenance.json`).
 | | rows | file |
 |---|---|---|
 | harvested (2026-09-27) | 903 | `tunableop_results{0..3}.csv` |
-| **curated (2026-09-29)** | **719** | `tunableop_results{0..3}.csv` |
+| curated (2026-09-29) | 719 | `tunableop_results{0..3}.csv` |
+| campaign-3 expansion (2026-09-30) | 760 | `tunableop_results{0..3}.csv` |
+| **EXL3 27B expansion (2026-10-01)** | **783** | `tunableop_results{0..3}.csv` |
 
 * The harvested set was missing every FP16 GEMM with **M ≤ 8** — exactly the
   cudagraph capture sizes for MTP-0 `[1,2,4,8]` and MTP-2 `[3,6,12,24]`. The
@@ -33,7 +35,25 @@ takes ~2.77 ms per call, the tuned row takes ~0.90 ms (3.0×) for M=1 and
 ~2.7–2.8× for M=2..8. That lands on every decode step in c=1, which is the
 recovery the earlier `/tmp` storage leak made invisible.
 
+## EXL3 27B expansion (2026-10-01)
+
+The canonical set also covers `Qwen3.8-27B-exl3-3.00bpw` (mul1, TP=4, FA-RDNA2,
+FULL_AND_PIECEWISE). 29 new rows were adopted (21 novel EXL3 K = 5120/1536/4352
+shapes + 8 small-M decode extensions, each ≥ 3 % faster than both the current row
+and the rocBLAS heuristic; best 2.35×) and 6 previously-shipped rows were dropped
+(fresh measurement 4–7 % slower than the heuristic). EXL3 fp16 GEMM shapes
+collide with none of the Flash-Next K = 2560/320/10240 set (0 collisions, 34
+novel captured). MTP=2 was **not** captured — the EXL3 MTP head is not wired in
+this tree, so the validated EXL3 serving config is MTP=0. Lookup-hit proof:
+**783/783**. Prior set preserved at
+`bench_results/2026-10-01_exl3-tunableop/repo-rows-premerge/`.
+
 ## Storage policy (mandatory)
+
+* **One canonical folder per rocBLAS build hash** (`rocblas-<sha256[:12]>/`).
+  This directory is **the** canonical set for the fork's serving build
+  (`5.5.0.cd957402` → `f30bb442e9b5`) and covers Flash-Next, 27B AWQ dense and
+  EXL3 27B. Foreign-build sets live under `../archive/`.
 
 * **Never** store rows in `/tmp` or the run CWD. Both are wiped / vary between
   runs, which silently drops c=1 and small-batch shapes back to rocBLAS

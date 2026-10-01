@@ -32,37 +32,20 @@ log "=== lookup-hit proof: rows=$ROWS device=$DEVICE ==="
   >"$OUT/lookup_hit.out" 2>"$OUT/lookup_hit.err" \
   || { log "VERIFY FAIL"; tail -20 "$OUT/lookup_hit.err"; exit 1; }
 
-python3 - <<'PY' "$OUT/lookup_hits.json" "$OUT/lookup_hit_summary.txt"
-import json, sys
-from pathlib import Path
-hits_path, summary_path = sys.argv[1], sys.argv[2]
+python3 - <<'PY' "$OUT/lookup_hits.json" "$OUT/lookup_hit_summary.txt" "$ROWS/tunableop_results0.csv"
+import csv, json, sys
+hits_path, summary_path, rows_path = sys.argv[1], sys.argv[2], sys.argv[3]
 p = json.load(open(hits_path))
-results = p["results"]
-expected_path = "/home/chenco_adm/vllm-rdna-0.28.0/tunableop/rocblas-f30bb442e9b5/tunableop_results0.csv"
-import csv
+solvers = p["solvers"]
 expected = {}
-for row in csv.reader(open(expected_path)):
-    if len(row) >= 4 and row[0] == "GemmTunableOp_Half_TN":
+for row in csv.reader(open(rows_path)):
+    if len(row) >= 4 and row[0].startswith("GemmTunableOp"):
         expected[row[1]] = row[2]
-hit = miss = total = 0
-misses = []
-for key, exp_solver in expected.items():
-    total += 1
-    rec = results.get(key)
-    if rec is None:
-        miss += 1
-        misses.append((key, exp_solver, "no-record"))
-        continue
-    solver = rec.get("solver")
-    if solver == exp_solver:
-        hit += 1
-    else:
-        miss += 1
-        misses.append((key, exp_solver, solver))
+misses = [(k, exp, solvers.get(k)) for k, exp in expected.items() if solvers.get(k) != exp]
 with open(summary_path, "w") as f:
-    f.write(f"total={total} hit={hit} miss={miss}\n")
+    f.write(f"total={len(expected)} hit={len(expected) - len(misses)} miss={len(misses)}\n")
     if misses:
-        f.write(f"first 10 misses:\n")
+        f.write("first 10 misses:\n")
         for k, e, a in misses[:10]:
             f.write(f"  {k}: expected={e} actual={a}\n")
 print(open(summary_path).read())
