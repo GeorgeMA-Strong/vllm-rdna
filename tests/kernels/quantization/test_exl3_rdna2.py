@@ -41,7 +41,7 @@ from vllm.model_executor.layers.fused_moe.activation import (  # noqa: E402
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
     moe_align_block_size,
 )
-from vllm.platforms.rocm import on_gfx1x, on_gfx10x  # noqa: E402
+from vllm.platforms.rocm import on_gfx10x, on_gfx1x  # noqa: E402
 
 device = "cuda"
 
@@ -720,8 +720,7 @@ def test_mul1_real_tiles_match_upstream_dp4a():
     index = os.path.join(root, "model.safetensors.index.json")
     if not os.path.isfile(index):
         pytest.skip(f"real mul1 checkpoint not at {root}")
-    with open(index) as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = json.load(open(index))["weight_map"]
     samples = (
         ("model.language_model.layers.0.mlp.down_proj.trellis", 0, 0),
         ("model.language_model.layers.0.mlp.down_proj.trellis", 3, 7),
@@ -740,7 +739,9 @@ def test_mul1_real_tiles_match_upstream_dp4a():
         W = _upstream_mul1_tile(tile).cuda()
         x = torch.randn(4, 16, dtype=torch.float16, device=device)
         c = torch.zeros(4, 16, dtype=torch.float16, device=device)
-        ops.exl3_gemm_rdna2(x, c, tile.view(1, 1, -1).cuda().contiguous(), bits, 2)
+        ops.exl3_gemm_rdna2(
+            x, c, tile.view(1, 1, -1).cuda().contiguous(), bits, 2
+        )
         torch.cuda.synchronize()
         ref = (x.float() @ W.float()).half()
         err = (c.float() - ref.float()).abs().max().item()
@@ -766,3 +767,135 @@ def test_decode_trellis_mul1_matches_upstream(bits):
             ref = _upstream_mul1_tile(trellis[kt, nt]).to(device)
             got = out[kt * 16 : (kt + 1) * 16, nt * 16 : (nt + 1) * 16]
             torch.testing.assert_close(got, ref, atol=4e-3, rtol=0)
+
+
+def test_lm_head_marker_selects_mul1_codebook():
+    """ParallelLMHead has no prefix of its own. The checkpoint mark is lm_head.
+
+    Decoding that 6-bit head with codebook 0 is uncorrelated with the
+    embedding. The loader must resolve ``*.lm_head`` to codebook 2 when
+    ``lm_head.mul1`` was captured, and leave an unmarked body layer on 3inst.
+    """
+    from vllm.model_executor.layers.quantization.exl3 import (
+        Exl3Config,
+        exl3_codebook_id,
+    )
+
+    mul1 = {"lm_head", "layers.17.mlp"}
+    assert exl3_codebook_id("language_model.lm_head", mul1, set(), 0) == 2
+    assert exl3_codebook_id("lm_head", mul1, set(), 0) == 2
+    assert exl3_codebook_id("model.layers.17.mlp.down_proj", mul1, set(), 0) == 2
+    assert exl3_codebook_id("model.layers.0.mlp.down_proj", mul1, set(), 0) == 0
+    assert exl3_codebook_id(None, mul1, set(), 0) == 0
+    assert exl3_codebook_id(
+        "model.layers.3.self_attn", set(), {"layers.3.self_attn"}, 0) == 1
+
+    cfg = Exl3Config(3.0, 6, "3inst")
+    saved_mul1 = set(Exl3Config._exl3_mul1_marks)
+    saved_mcg = set(Exl3Config._exl3_mcg_marks)
+    try:
+        Exl3Config._exl3_mul1_marks.clear()
+        Exl3Config._exl3_mcg_marks.clear()
+        assert cfg._capture_marker_names("lm_head.mul1") is False
+        assert cfg._capture_marker_names(
+            "model.language_model.layers.17.mlp.gate_proj.mul1") is False
+        assert cfg._capture_marker_names(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.mcg") is False
+        assert "lm_head" in Exl3Config._exl3_mul1_marks
+        assert "layers.17.mlp" in Exl3Config._exl3_mul1_marks
+        assert "layers.0.linear_attn" in Exl3Config._exl3_mcg_marks
+        assert exl3_codebook_id(
+            "lm_head", Exl3Config._exl3_mul1_marks, Exl3Config._exl3_mcg_marks, 0
+        ) == 2
+    finally:
+        Exl3Config._exl3_mul1_marks.clear()
+        Exl3Config._exl3_mul1_marks.update(saved_mul1)
+        Exl3Config._exl3_mcg_marks.clear()
+        Exl3Config._exl3_mcg_marks.update(saved_mcg)
+
+
+def test_suh_span_follows_n_range_not_load_order():
+    """Qwen checkpoints load k before q, and GDN qkv is one suh over 3 parts.
+
+    Pairing by append order puts k's input scale on q. The shipped helper
+    must follow the stored N span instead.
+    """
+    from vllm.model_executor.layers.quantization.exl3 import (
+        exl3_suh_parts_for_widths,
+    )
+
+    q, k, v, z, qkv = "qS", "kS", "vS", "zS", "qkvS"
+    layer = type("L", (), {})()
+    layer.suh = "fallback"
+    layer._exl3_suh_parts = [
+        (k, 12288, 1024),
+        (q, 0, 12288),
+        (v, 13312, 1024),
+    ]
+    parts = exl3_suh_parts_for_widths(layer, [12288, 1024, 1024])
+    assert [p[0] for p in parts] == [q, k, v]
+    assert [p[1] for p in parts] == [0, 12288, 13312]
+
+    layer._exl3_suh_parts = [(qkv, 0, 4096), (z, 4096, 6144)]
+    parts = exl3_suh_parts_for_widths(layer, [1024, 1024, 2048, 6144])
+    assert [p[0] for p in parts] == [qkv, qkv, qkv, z]
+
+
+def test_column_slice_replicates_kv_heads():
+    """0.8B has 2 KV heads and TP=4, so k/v svh is 512 not 256*4.
+
+    Ranks that share a head must read the same 256-wide slice.
+    """
+    from vllm.model_executor.layers.quantization.exl3 import exl3_column_slice
+
+    full = torch.arange(512)
+    expect = {0: 0, 1: 0, 2: 256, 3: 256}
+    for rank, start in expect.items():
+        sl = exl3_column_slice(full, 256, rank, tp=4, replicas=2)
+        assert sl is not None and sl.numel() == 256
+        assert int(sl[0]) == start
+    wide = torch.arange(1024)
+    sl = exl3_column_slice(wide, 256, rank=2, tp=4, replicas=1)
+    assert int(sl[0]) == 512 and sl.numel() == 256
+    assert exl3_column_slice(full, 256, 0, tp=4, replicas=1) is None
+
+
+def test_concat_tp_slices_splits_each_partition():
+    """GDN in_proj_qkv is [q|k|v]. TP must shard q, k, and v separately."""
+    from vllm.model_executor.layers.quantization.exl3 import (
+        exl3_concat_tp_slices,
+    )
+
+    src = torch.arange(16, dtype=torch.int16).view(1, 16, 1)
+    out = exl3_concat_tp_slices(src, [2, 1, 1], rank=1, tp=4, dim=1)
+    assert out is not None
+    assert out[0, :, 0].tolist() == [2, 3, 9, 13]
+    assert src[0, 4:8, 0].tolist() == [4, 5, 6, 7]
+
+    svh = torch.arange(32, dtype=torch.float16)
+    out_s = exl3_concat_tp_slices(svh, [4, 2, 2], rank=2, tp=4)
+    assert out_s.tolist() == [8, 9, 10, 11, 20, 21, 28, 29]
+    assert exl3_concat_tp_slices(src, [2, 1, 1], rank=0, tp=2, dim=1) is None
+
+
+def test_part_trellis_column_slice_matches_gemm():
+    """A fused N-slice is not contiguous. The GEMM indexes size(1) as packed."""
+    from vllm.model_executor.layers.quantization.exl3 import exl3_part_trellis
+
+    torch.manual_seed(0)
+    trellis = torch.randint(
+        -32768, 32767, (4, 32, 48), dtype=torch.int16, device="cuda")
+    view = trellis[:, 16:32, :]
+    assert not view.is_contiguous()
+    part = exl3_part_trellis(trellis, off=256, width=256)
+    assert part.is_contiguous() and tuple(part.shape) == (4, 16, 48)
+    x = torch.randn(2, 64, device="cuda", dtype=torch.float16)
+    y_part = torch.zeros(2, 256, device="cuda", dtype=torch.float16)
+    y_view = torch.zeros_like(y_part)
+    torch.ops._rocm_C.exl3_gemm_rdna2(x, y_part, part, 3, 0)
+    torch.ops._rocm_C.exl3_gemm_rdna2(x, y_view, view, 3, 0)
+    weight = torch.empty(64, 256, device="cuda", dtype=torch.float16)
+    torch.ops._rocm_C.exl3_decode_trellis_rdna2(part, weight, 3, 0)
+    ref = torch.nn.functional.linear(x, weight.t())
+    assert (y_part.float() - ref.float()).abs().max().item() < 0.05
+    assert (y_view.float() - ref.float()).abs().max().item() > 1.0
