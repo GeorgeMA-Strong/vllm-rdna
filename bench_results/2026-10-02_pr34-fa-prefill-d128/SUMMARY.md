@@ -81,25 +81,29 @@ Identical — as expected for D=256 even groups (both modes resolve to the same 
 
 ## D=128 kernel A/B (the PR's actual target) — `benchmarks/kernels/benchmark_fa_rdna2_prefill.py`
 
-Median µs, cudagraph timing, patched build. **gqa = new path; short/varlen/splitk = old path.**
+Median µs, cudagraph timing, patched build, **clean re-run on GPU 5** (a
+co-tenant job (`tf-measure-cells.py`) started on GPU 4 at ~01:57, after the
+Flash-Next matrix finished; the first benchmark pass overlapped it and the
+clean re-run is within 1–2% — see `remote/bench_clean_gpu5.out`).
+**gqa = new path; short/varlen/splitk = old path.**
 
 D=128, heads 32/8 (G=4 even):
 
 | case | gqa | short | varlen | splitk |
 |---|---:|---:|---:|---:|
-| prompt 512 | 582 | 2886 | 4001 | 6214 |
-| prompt 1k | 2181 | 10699 | 14778 | 23667 |
-| prompt 2k | 8587 | 40007 | 57561 | 91911 |
-| prompt 4k | 34364 | 156342 | 225113 | 364546 |
-| prompt 8k | 135419 | 624527 | 901017 | 1454261 |
-| 4×prompt 1k | 8606 | 40755 | 58294 | 94589 |
-| chunk 1k @ 8k | 32140 | 146949 | 210142 | 337001 |
-| chunk 2k @ 16k | 125721 | 576149 | 832187 | 1340987 |
+| prompt 512 | 588 | 2947 | 4026 | 6274 |
+| prompt 1k | 2210 | 10698 | 14921 | 23906 |
+| prompt 2k | 8562 | 40708 | 58369 | 93590 |
+| prompt 4k | 34327 | 157409 | 227151 | 367992 |
+| prompt 8k | 135684 | 627801 | 910217 | 1467741 |
+| 4×prompt 1k | 8575 | 41035 | 58986 | 95712 |
+| chunk 1k @ 8k | 32155 | 149169 | 212540 | 341565 |
+| chunk 2k @ 16k | 125991 | 583030 | 842857 | 1358999 |
 
 `gqa` wins **4–10×** at every shape — including the case the PR flagged as the
 likely loss ("short chunks behind long prefixes", where splitk has more CTAs):
-chunk 2k@16k is **10.7× faster** than splitk. G=7 (28/4, exercises `<128,1,16>`)
-and D=256 G=12 show the same. `max|diff|` vs gqa ≤ **9.8e-4** (fp16 rounding).
+chunk 2k@16k is **10.8× faster** than splitk. G=7 (28/4, exercises `<128,1,16>`)
+and D=256 G=12 show the same. `max|diff|` vs gqa ≤ **2.0e-3** (fp16 rounding).
 
 ⇒ The PR's open performance question is resolved in its favor on gfx1030: no
 shape measured prefers the old kernels. Default-on routing is justified.
@@ -114,7 +118,8 @@ shape measured prefers the old kernels. Default-on routing is justified.
 ## Artifacts (`remote/`)
 
 `matrix_combined.csv` (all metrics), `bench_d128.log`, `bench_d256.log`,
-`pytest_patched.log`, `fa_meta.txt` (kernel descriptors), `k256_{baseline,patched}.s`
+`bench_clean_gpu5.out` (clean D=128/D=256 kernel A/B), `pytest_patched.log`,
+`fa_meta.txt` (kernel descriptors), `k256_{baseline,patched}.s`
 (the 2-instruction D=256 diff), per-arm `driver.log` / `coherence.txt` /
 `cells/*.json`, `build_{baseline,patched}.log`, `bitwise_driver.sh`,
 `probe_bitwise_gqa256.py`, `isa_compare.sh`, `pr34_ab.sh`, `run_matrix.sh`.
