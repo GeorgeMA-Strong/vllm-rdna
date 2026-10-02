@@ -1042,15 +1042,7 @@ def qsa_store_cache_rows(
     """Store fixed-width rows in a QSA cache without boolean indexing."""
 
     if qsa_rdna2.qsa_use_rdna2():
-        # Strip the [rows, 1, WIDTH] head dim the Triton path allows.
-        rows_flat = rows.squeeze(1) if rows.ndim == 3 else rows
-        qsa_rdna2.qsa_store_cache_rows(
-            rows_flat,
-            slot_mapping,
-            cache,
-            page_size=cache.shape[1],
-            width=cache.shape[3],
-        )
+        qsa_rdna2.qsa_store_cache_rows_compat(cache, slot_mapping, rows)
         return
 
     if not cache.is_cuda or not HAS_TRITON:
@@ -1100,45 +1092,18 @@ def qsa_compress_groups_with_ratio(
     """Pool completed groups from the compressor-state ring and raw token rows."""
 
     if qsa_rdna2.qsa_use_rdna2():
-        rows = token_to_req.numel()
-        head_dim = raw_keys.shape[2]
-        # The HIP kernel takes raw_keys as [rows, head_dim] (squeeze the head=1).
-        raw_keys_flat = raw_keys.squeeze(1).contiguous()
-        # rope_cache may be aliased to compressor_state_cache; the HIP kernel
-        # needs the rope dim to be 3 (int64), so when load_rope_positions is
-        # False we pass an empty tensor.
-        load_rope = rope_cache is not None
-        rope_arg = (
-            rope_cache
-            if load_rope
-            else torch.empty(0, dtype=torch.int64, device=raw_keys.device)
-        )
-        # pooled is [rows, 1, head_dim]; the HIP path writes [rows, head_dim]
-        # and we unsqueeze to match the Triton contract.
-        pooled_flat = torch.empty(
-            (rows, head_dim), dtype=raw_keys.dtype, device=raw_keys.device
-        )
-        first_positions_out = torch.empty(
-            (rows, 3), dtype=torch.int64, device=raw_keys.device
-        )
-        qsa_rdna2.qsa_compress_groups(
-            raw_keys_flat,
+        return qsa_rdna2.qsa_compress_groups_with_ratio_compat(
+            raw_keys,
             raw_positions,
             compressor_state_cache,
-            rope_arg,
             compressor_state_block_table,
             token_to_req,
             query_start_loc,
             logical_positions,
             compressed_slots,
-            pooled_flat,
-            first_positions_out,
-            compress_ratio=compress_ratio,
-            compressor_state_size=compressor_state_cache.shape[1],
-            head_dim=head_dim,
-            load_rope_positions=load_rope,
+            compress_ratio,
+            rope_cache,
         )
-        return pooled_flat.unsqueeze(1).contiguous(), first_positions_out
 
     if not raw_keys.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA compression requires a GPU and Triton")

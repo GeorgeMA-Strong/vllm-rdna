@@ -635,25 +635,36 @@ void hc_combine_norm_rdna2(torch::Tensor residual,          // [N, DIM] fp16
 // ---------------------------------------------------------------------------
 
 void qsa_store_cache_rows_rdna2(
-    torch::Tensor rows,   // [num_rows, WIDTH] fp16
-    torch::Tensor slots,  // [num_rows] int32
-    torch::Tensor cache,  // [num_blocks, PAGE_SIZE, WIDTH] fp16
-    int64_t page_size, int64_t width);
+    torch::Tensor rows,       // [num_rows, WIDTH] fp16
+    torch::Tensor slots,      // [num_rows] int64
+    torch::Tensor cache,      // [num_blocks, PAGE_SIZE, 1, WIDTH] fp16/int64
+    const at::Tensor& page_size,
+    const at::Tensor& width);
 
 void qsa_compress_groups_rdna2(
-    torch::Tensor raw_keys, torch::Tensor raw_positions,
-    torch::Tensor compressor_state_cache, torch::Tensor rope_cache,
-    torch::Tensor compressor_state_table, torch::Tensor token_to_req,
-    torch::Tensor query_start_loc, torch::Tensor logical_positions,
-    torch::Tensor compressed_slots, torch::Tensor pooled,
-    torch::Tensor first_positions, int64_t compress_ratio,
-    int64_t compressor_state_size, int64_t head_dim, bool load_rope_positions);
+    torch::Tensor raw_keys,
+    torch::Tensor raw_positions,
+    torch::Tensor compressor_state_cache,
+    torch::Tensor rope_cache,
+    torch::Tensor compressor_state_table,
+    torch::Tensor token_to_req,
+    torch::Tensor query_start_loc,
+    torch::Tensor logical_positions,
+    torch::Tensor compressed_slots,
+    torch::Tensor pooled,
+    torch::Tensor first_positions,
+    const at::Tensor& compress_ratio,
+    const at::Tensor& compressor_state_size,
+    const at::Tensor& head_dim,
+    bool load_rope_positions);
 
-torch::Tensor qsa_mqa_paged_rdna2(torch::Tensor q_fp16, torch::Tensor kv_cache,
-                                  torch::Tensor weights,
-                                  torch::Tensor context_lens,
-                                  torch::Tensor block_tables,
-                                  int64_t max_model_len);
+torch::Tensor qsa_mqa_paged_rdna2(
+    torch::Tensor q_fp16,
+    torch::Tensor kv_cache,
+    torch::Tensor weights,
+    torch::Tensor context_lens,
+    torch::Tensor block_tables,
+    const at::Tensor& max_model_len);
 
 // ---------------------------------------------------------------------------
 // PLE dilated short-conv HIP kernels for Qwen4Exp / Qwen3.8-Flash-Next on
