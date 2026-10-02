@@ -78,8 +78,14 @@ __global__ void qsa_store_cache_rows_kernel(
       + (size_t)token * stride_cache_token;
   const char* row_ptr = rows + (size_t)row * stride_rows_row;
 
+  // The vectorized stride-1 path is only valid when both the row width and
+  // the cache width are dense (element stride == 1). The server passes a
+  // transposed ``canonical_qsa_rope_positions`` view whose last-dim stride is
+  // ``tokens``, so fall back to the stride-aware scalar loop otherwise.
   const int elems_per_vec = 16 / elem_bytes;
-  const int vec_count = WIDTH / elems_per_vec;
+  const bool row_dense = (stride_rows_dim == elem_bytes);
+  const bool cache_dense = (stride_cache_dim == elem_bytes);
+  const int vec_count = (row_dense && cache_dense) ? WIDTH / elems_per_vec : 0;
   for (int v = threadIdx.x; v < vec_count; v += blockDim.x) {
     const uint4 row_v = ld_u4(
         reinterpret_cast<const uint4*>(row_ptr + (size_t)v * 16));
