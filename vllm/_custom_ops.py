@@ -688,7 +688,13 @@ def qsa_store_cache_rows_rdna2(
     page_size: int,
     width: int,
 ) -> None:
-    torch.ops._rocm_C.qsa_store_cache_rows_rdna2(rows, slots, cache, page_size, width)
+    torch.ops._rocm_C.qsa_store_cache_rows_rdna2(
+        rows,
+        slots,
+        cache,
+        torch.tensor(page_size, dtype=torch.int64),
+        torch.tensor(width, dtype=torch.int64),
+    )
 
 
 def qsa_compress_groups_rdna2(
@@ -720,9 +726,9 @@ def qsa_compress_groups_rdna2(
         compressed_slots,
         pooled,
         first_positions,
-        compress_ratio,
-        compressor_state_size,
-        head_dim,
+        torch.tensor(compress_ratio, dtype=torch.int64),
+        torch.tensor(compressor_state_size, dtype=torch.int64),
+        torch.tensor(head_dim, dtype=torch.int64),
         load_rope_positions,
     )
 
@@ -736,7 +742,12 @@ def qsa_mqa_paged_rdna2(
     max_model_len: int,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.qsa_mqa_paged_rdna2(
-        q_fp16, kv_cache, weights, context_lens, block_tables, max_model_len
+        q_fp16,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        torch.tensor(max_model_len, dtype=torch.int64),
     )
 
 

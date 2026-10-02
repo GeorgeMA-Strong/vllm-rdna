@@ -464,7 +464,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // Qwen4Exp QSA decode HIP (opt-in: VLLM_RDNA_QSA_HIP=1).
   rocm_ops.def(
       "qsa_store_cache_rows_rdna2(Tensor rows, Tensor slots, "
-      "Tensor(a!) cache, int page_size, int width) -> ()");
+      "Tensor(a!) cache, Tensor page_size, Tensor width) -> ()");
   rocm_ops.impl("qsa_store_cache_rows_rdna2", torch::kCUDA,
                 &qsa_store_cache_rows_rdna2);
 
@@ -474,14 +474,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor compressor_state_table, Tensor token_to_req, "
       "Tensor query_start_loc, Tensor logical_positions, "
       "Tensor compressed_slots, Tensor(a!) pooled, Tensor(a!) first_positions, "
-      "int compress_ratio, int compressor_state_size, int head_dim, "
+      "Tensor compress_ratio, Tensor compressor_state_size, Tensor head_dim, "
       "bool load_rope_positions) -> ()");
   rocm_ops.impl("qsa_compress_groups_rdna2", torch::kCUDA,
                 &qsa_compress_groups_rdna2);
 
   rocm_ops.def(
       "qsa_mqa_paged_rdna2(Tensor q_fp16, Tensor kv_cache, Tensor weights, "
-      "Tensor context_lens, Tensor block_tables, int max_model_len) "
+      "Tensor context_lens, Tensor block_tables, Tensor max_model_len) "
       "-> Tensor");
   rocm_ops.impl("qsa_mqa_paged_rdna2", torch::kCUDA, &qsa_mqa_paged_rdna2);
 
