@@ -177,7 +177,7 @@ def test_fused_moe_w1_matches_dense(
 
 
 @gfx1030_only
-@pytest.mark.parametrize("tile", [8, 16])
+@pytest.mark.parametrize("tile", [8, 16, 32])
 @pytest.mark.parametrize("hidden, gate_up", [(2560, 1280), (640, 2560)])
 @pytest.mark.parametrize("fp32_accum", [False, True])
 def test_v620_moe_prefill_tiles_match_tile4(tile, hidden, gate_up, fp32_accum):
