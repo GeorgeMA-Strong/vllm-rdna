@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """T46: opaque custom ops with *runtime* decode/prefill dispatch for gfx1030.
 
 torch.compile traces the model once for a dynamic token range, so a Python
@@ -9,8 +10,10 @@ decision in a custom op makes it a runtime choice on the real batch size.
 
   rdna_dense_gemm   int8-shadow GEMV for decode, fp16 rocBLAS for prefill
   rdna_hc_mix       hyper-connection mix: 2 fused kernels for decode, torch for prefill
-  rdna_shared_expert shared expert (gate_up+silu*mul, down*sigmoid(gate)): 2 kernels / torch
+  rdna_shared_expert shared expert: 2 decode kernels / torch prefill
 """
+
+import os
 
 import torch
 import torch.nn.functional as F
@@ -74,19 +77,44 @@ def _rdna_hc_mix(
         block_input = ops.rdna_hc_up_gate_mix(lora, wu, su, xn, hc_count)
         return block_input, dai
     # prefill / fallback: the original op sequence
-    from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
     from vllm.model_executor.layers.rdna_dense_int8 import weight_for_gemm
+    from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix, hc_silu
 
     w_down = weight_for_gemm(w_down, w_down_i8, s_down)
     w_up = weight_for_gemm(w_up, w_up_i8, s_up)
-    dai = F.linear(xn, w_down)
+    group = None
+    local_xn = xn
+    if (
+        os.getenv("VLLM_RDNA_HC_PREFILL_SP", "0") == "1"
+        and n >= 1024
+        and xn.dtype == torch.float16
+        and xn.is_contiguous()
+        and w_down_i8 is None
+        and w_up_i8 is None
+    ):
+        from vllm.distributed import get_tp_group
+
+        tp = get_tp_group()
+        if tp.world_size > 1 and n % tp.world_size == 0:
+            rows = n // tp.world_size
+            local_xn = xn.narrow(0, tp.rank_in_group * rows, rows)
+            group = tp
+
+    dai = F.linear(local_xn, w_down)
     lora = hc_silu(dai[:, :lora_rank].contiguous(), hc_count)
     gate = F.linear(lora, w_up)
-    block_input = hc_gate_mix(xn, gate, hc_count)
+    block_input = hc_gate_mix(local_xn, gate, hc_count)
+    if group is not None:
+        # Keep the model's replicated activation/state contract. Only the
+        # narrow block input and low-rank output cross PCIe, never the wide gate.
+        block_input = group.all_gather(block_input, dim=0)
+        dai = group.all_gather(dai, dim=0)
     return block_input, dai
 
 
-def _rdna_hc_mix_fake(xn, w_down, w_down_i8, s_down, w_up, w_up_i8, s_up, lora_rank, hc_count):
+def _rdna_hc_mix_fake(
+    xn, w_down, w_down_i8, s_down, w_up, w_up_i8, s_up, lora_rank, hc_count
+):
     m = xn.shape[0]
     n_down = w_down_i8.shape[0] if w_down_i8 is not None else w_down.shape[0]
     return (
@@ -108,7 +136,12 @@ def _rdna_shared_expert(
 ) -> torch.Tensor:
     """Per-rank partial of sigmoid(w_gate.x) * down(silu(gate)*up); caller reduces."""
     n = _ntok(x)
-    if 0 < n <= _DECODE_MAX and x.dtype == torch.float16 and x.dim() == 2 and x.is_contiguous():
+    if (
+        0 < n <= _DECODE_MAX
+        and x.dtype == torch.float16
+        and x.dim() == 2
+        and x.is_contiguous()
+    ):
         from vllm import _custom_ops as ops
 
         a, sa = (w1_i8, s1) if w1_i8 is not None else (w1, None)

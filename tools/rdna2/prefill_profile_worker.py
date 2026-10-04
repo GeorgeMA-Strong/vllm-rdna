@@ -7,6 +7,7 @@ tools.rdna2.prefill_profile_worker.PrefillProfileWorker. Arm/disarm through
 collective_rpc; no synchronization is added to the measured forward calls.
 """
 
+import os
 from collections import defaultdict
 from functools import wraps
 
@@ -14,6 +15,14 @@ import torch
 
 
 class PrefillProfileWorker:
+    def set_hc_prefill_sp(self, enabled: str):
+        if enabled not in ("0", "1"):
+            raise ValueError("Expected 0 or 1")
+        if getattr(self, "_prefill_profile_active", False):
+            raise RuntimeError("Disarm the profiler before changing the route")
+        os.environ["VLLM_RDNA_HC_PREFILL_SP"] = enabled
+        return {"rank": self.rank, "hc_prefill_sp": enabled}
+
     def start_prefill_stage_profile(self, minimum_tokens: int = 512):
         if getattr(self, "_prefill_profile_active", False):
             raise RuntimeError("Prefill profiler already armed")
