@@ -49,7 +49,7 @@ def main():
                     row[2] = selected
     profile = args.output_dir / "profile.csv"
     with profile.open("w") as output:
-        csv.writer(output).writerows(rows)
+        csv.writer(output, lineterminator="\n").writerows(rows)
     torch.accelerator.set_device_index(0)
     tunable.set_filename(str(args.output_dir / "used.csv"), insert_device_ordinal=False)
     tunable.enable(True)
