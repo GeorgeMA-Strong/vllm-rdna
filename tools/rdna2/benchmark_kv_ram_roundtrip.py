@@ -25,6 +25,27 @@ def _metrics(base_url: str) -> list[str]:
     ]
 
 
+def _transfers(before: list[str], after: list[str]) -> dict[str, Any]:
+    """Expose transfer deltas; rank-summed timings are not request latency."""
+    old = {line.rsplit(" ", 1)[0]: float(line.rsplit(" ", 1)[1]) for line in before}
+    new = {line.rsplit(" ", 1)[0]: float(line.rsplit(" ", 1)[1]) for line in after}
+    result = {}
+    for direction in ("GPU_to_CPU", "CPU_to_GPU"):
+        delta = {}
+        for counter, label in (
+            ("total_bytes_total", "bytes"),
+            ("total_time_total", "rank_summed_seconds"),
+        ):
+            delta[label] = sum(
+                value - old.get(name, 0)
+                for name, value in new.items()
+                if name.startswith(f"vllm:kv_offload_{counter}{{")
+                and f'transfer_type="{direction}"' in name
+            )
+        result[direction] = delta
+    return result
+
+
 def _stream_chat(base_url: str, model: str, content: str) -> dict[str, Any]:
     payload = json.dumps(
         {
@@ -111,7 +132,27 @@ def main() -> None:
     result["session_a_reload"] = _stream_chat(args.base_url, args.model, continuation)
     time.sleep(args.settle_seconds)
     result["metrics_after_a_reload"] = _metrics(args.base_url)
+    result["transfer_totals"] = _transfers(
+        result["metrics_before"], result["metrics_after_a_reload"]
+    )
+    result["reload_transfers"] = _transfers(
+        result["metrics_after_b"], result["metrics_after_a_reload"]
+    )
+    result["content_valid"] = all(
+        marker in result[key]["text"]
+        for key, marker in (
+            ("session_a_cold", "ALPHA-SESSION-200K"),
+            ("session_b_switch", "BETA-SESSION-100K"),
+            ("session_a_reload", "ALPHA-SESSION-RELOADED"),
+        )
+    )
+    result["ram_reload_verified"] = (
+        result["reload_transfers"]["CPU_to_GPU"]["bytes"] > 0
+    )
+    result["passed"] = result["content_valid"] and result["ram_reload_verified"]
     print(json.dumps(result, indent=2, sort_keys=True))
+    if not result["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
