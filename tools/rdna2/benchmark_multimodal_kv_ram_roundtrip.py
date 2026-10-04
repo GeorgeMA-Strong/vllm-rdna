@@ -148,12 +148,19 @@ def main() -> None:
     result["multimodal_reload"] = _stream_chat(continued_messages)
     time.sleep(15)
     result["metrics_after_reload"] = _metric_values()
-    combined = (cold["text"] + " " + result["multimodal_reload"]["text"]).lower()
     result["content_valid"] = all(
-        phrase in combined
+        phrase in response["text"].lower()
+        for response in (cold, result["multimodal_reload"])
         for phrase in ("hello, ai world", "safe is important", "multimodal")
     )
+    result["reload_bytes"] = result["metrics_after_reload"].get(
+        "cpu_to_gpu_bytes", 0
+    ) - result["metrics_after_pressure"].get("cpu_to_gpu_bytes", 0)
+    result["ram_reload_verified"] = result["reload_bytes"] > 0
+    result["passed"] = result["content_valid"] and result["ram_reload_verified"]
     print(json.dumps(result, indent=2, sort_keys=True))
+    if not result["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
