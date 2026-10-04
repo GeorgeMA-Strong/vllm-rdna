@@ -56,20 +56,43 @@
 // Form the small signed INT4 value before applying its scale. Folding the
 // scale into the large 1024/64 encoding offsets rounds away cancellation in
 // fp16: even quantized zero then becomes a nonzero weight.
+template <int N_COLUMNS>
 __forceinline__ __device__ void refresh_moe_group(
     int group, int n, const uint32_t* zeros, const half* scales, int size_n,
-    int zero_offset, half2 (&z)[4][2], half2 (&y)[4][2],
-    half2 (&group_scales)[4]) {
-  int column_zeros[4];
-  half column_scales[4];
-  vllm::gptq_rdna2::load4_zeros(zeros + group * (size_n / 8), n, column_zeros);
-  vllm::gptq_rdna2::load4_scales<half>(scales + group * size_n, n,
-                                       column_scales);
+    int zero_offset, half2 (&z)[N_COLUMNS][2], half2 (&y)[N_COLUMNS][2],
+    half2 (&group_scales)[N_COLUMNS]) {
+  const uint32_t packed = zeros[group * (size_n / 8) + n / 8] >> ((n & 7) * 4);
   #pragma unroll
-  for (int col = 0; col < 4; ++col) {
+  for (int col = 0; col < N_COLUMNS; ++col) {
     vllm::gptq_rdna2::prep_zero_scale_fp16(
-        column_zeros[col] + zero_offset, __float2half_rn(1.0f), z[col], y[col]);
-    group_scales[col] = __half2half2(column_scales[col]);
+        ((packed >> (col * 4)) & 15) + zero_offset, __float2half_rn(1.0f),
+        z[col], y[col]);
+    group_scales[col] = __half2half2(scales[group * size_n + n + col]);
+  }
+}
+
+template <typename C_T>
+__forceinline__ __device__ void moe_accum_pair(const float (&vals)[2],
+                                               C_T* out) {
+  if constexpr (std::is_same_v<C_T, float>) {
+    atomicAdd(out, vals[0]);
+    atomicAdd(out + 1, vals[1]);
+  } else {
+    auto* address = reinterpret_cast<unsigned int*>(out);
+    const half2 value =
+        __halves2half2(__float2half_rn(vals[0]), __float2half_rn(vals[1]));
+    unsigned int old = *address;
+    while (true) {
+      union {
+        unsigned int bits;
+        half2 pair;
+      } current, sum;
+      current.bits = old;
+      sum.pair = __hadd2(current.pair, value);
+      const unsigned int previous = atomicCAS(address, old, sum.bits);
+      if (previous == old) break;
+      old = previous;
+    }
   }
 }
 
@@ -99,12 +122,14 @@ __global__ void moe_gemm_q4_kernel_rdna2(
     const int expert_zeros_stride,   // groups * (N/8)
     const bool mul_topk_weight,
     const int output_topk) {  // >0: reduce output by token_id/output_topk
+  constexpr int N_COLUMNS = BLOCK_SIZE_M >= 16 ? 2 : 4;
+  using WeightWord = std::conditional_t<N_COLUMNS == 4, int4, int2>;
   const int t = threadIdx.x;
   const int token_block = blockIdx.x;
-  const int offset_n = blockIdx.y * BLOCK_KN_SIZE * 4;
+  const int offset_n = blockIdx.y * BLOCK_KN_SIZE * N_COLUMNS;
   const int offset_k = blockIdx.z * BLOCK_KN_SIZE;
   const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
-  const int n = offset_n + t * 4;
+  const int n = offset_n + t * N_COLUMNS;
 
   // Early exit for padding blocks or invalid experts (expert_map = -1)
   if (token_block * BLOCK_SIZE_M >= num_tokens_post_padded[0]) return;
@@ -156,7 +181,7 @@ __global__ void moe_gemm_q4_kernel_rdna2(
   const uint32_t* b_ptr = expert_weights + qk * size_n + n;
 
   // Per-column dequant constants (4 columns per thread)
-  half2 z1z16_h[4][2], y1y16_h[4][2], group_scales[4];
+  half2 z1z16_h[N_COLUMNS][2], y1y16_h[N_COLUMNS][2], group_scales[N_COLUMNS];
 
   // GPTQv1: zero_offset = 1
   constexpr int zero_offset = 1;
@@ -166,11 +191,11 @@ __global__ void moe_gemm_q4_kernel_rdna2(
                     reinterpret_cast<const half*>(expert_scales), size_n,
                     zero_offset, z1z16_h, y1y16_h, group_scales);
 
-  float block_c[BLOCK_SIZE_M][4];
+  float block_c[BLOCK_SIZE_M][N_COLUMNS];
   #pragma unroll
   for (int m = 0; m < BLOCK_SIZE_M; ++m) {
   #pragma unroll
-    for (int j = 0; j < 4; ++j) block_c[m][j] = 0.0f;
+    for (int j = 0; j < N_COLUMNS; ++j) block_c[m][j] = 0.0f;
   }
 
   // --- Main K-loop ---
@@ -191,10 +216,10 @@ __global__ void moe_gemm_q4_kernel_rdna2(
     constexpr int PREFETCH_WORDS = BLOCK_SIZE_M >= 16 ? 1 : 4;
   #pragma unroll 1
     for (int word = 0; word < 4; word += PREFETCH_WORDS) {
-      int4 b_w[PREFETCH_WORDS];
+      WeightWord b_w[PREFETCH_WORDS];
   #pragma unroll
       for (int j = 0; j < PREFETCH_WORDS; ++j) {
-        b_w[j] = *(const int4*)(b_ptr + (word + j) * size_n);
+        b_w[j] = *(const WeightWord*)(b_ptr + (word + j) * size_n);
       }
 
   #pragma unroll
@@ -202,18 +227,20 @@ __global__ void moe_gemm_q4_kernel_rdna2(
         const int a_off = (k - offset_k) + 8 * (word + j);
 
         // fp16 path: dequant via bit-trick, dot via v_dot2_f32_f16
-        half2 dq[4][4];
+        half2 dq[N_COLUMNS][4];
         vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0],
                                               z1z16_h[0], y1y16_h[0]);
         vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1],
                                               z1z16_h[1], y1y16_h[1]);
-        vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2],
-                                              z1z16_h[2], y1y16_h[2]);
-        vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3],
-                                              z1z16_h[3], y1y16_h[3]);
+        if constexpr (N_COLUMNS == 4) {
+          vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2],
+                                                z1z16_h[2], y1y16_h[2]);
+          vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3],
+                                                z1z16_h[3], y1y16_h[3]);
+        }
 
   #pragma unroll
-        for (int col = 0; col < 4; ++col) {
+        for (int col = 0; col < N_COLUMNS; ++col) {
   #pragma unroll
           for (int pair = 0; pair < 4; ++pair) {
             dq[col][pair] = __hmul2(dq[col][pair], group_scales[col]);
@@ -223,10 +250,10 @@ __global__ void moe_gemm_q4_kernel_rdna2(
   #pragma unroll
         for (int m = 0; m < BLOCK_SIZE_M; ++m) {
           const half* a_ptr = reinterpret_cast<const half*>(&block_a[m][a_off]);
-          block_c[m][0] += vllm::gptq_rdna2::dot22_8_f(dq[0], a_ptr);
-          block_c[m][1] += vllm::gptq_rdna2::dot22_8_f(dq[1], a_ptr);
-          block_c[m][2] += vllm::gptq_rdna2::dot22_8_f(dq[2], a_ptr);
-          block_c[m][3] += vllm::gptq_rdna2::dot22_8_f(dq[3], a_ptr);
+  #pragma unroll
+          for (int col = 0; col < N_COLUMNS; ++col) {
+            block_c[m][col] += vllm::gptq_rdna2::dot22_8_f(dq[col], a_ptr);
+          }
         }
       }
     }
@@ -246,7 +273,7 @@ __global__ void moe_gemm_q4_kernel_rdna2(
     if (mul_topk_weight && topk_weights != nullptr) {
       float tw = topk_weights[token_id];
   #pragma unroll
-      for (int j = 0; j < 4; ++j) block_c[m][j] *= tw;
+      for (int j = 0; j < N_COLUMNS; ++j) block_c[m][j] *= tw;
     }
 
     // output_topk > 0: reduce by mapping token_id back to original token
@@ -254,7 +281,11 @@ __global__ void moe_gemm_q4_kernel_rdna2(
     int64_t out_row = (output_topk > 0) ? (int64_t)(token_id / output_topk)
                                         : (int64_t)token_id;
     C_T* out = c + out_row * size_n + n;
-    vllm::gptq_rdna2::moe_accum_row<C_T>(block_c[m], out);
+    if constexpr (N_COLUMNS == 4) {
+      vllm::gptq_rdna2::moe_accum_row<C_T>(block_c[m], out);
+    } else {
+      moe_accum_pair<C_T>(block_c[m], out);
+    }
   }
 }
 
@@ -283,9 +314,11 @@ void launch_moe_gemm_q4(
     int expert_scales_stride, int expert_zeros_stride, bool mul_topk_weight,
     int output_topk, cudaStream_t stream) {
   dim3 block(THREADS_X);
-  dim3 grid(num_token_blocks,
-            (size_n + BLOCK_KN_SIZE * 4 - 1) / (BLOCK_KN_SIZE * 4),
-            (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
+  constexpr int N_COLUMNS = BLOCK_SIZE_M >= 16 ? 2 : 4;
+  dim3 grid(
+      num_token_blocks,
+      (size_n + BLOCK_KN_SIZE * N_COLUMNS - 1) / (BLOCK_KN_SIZE * N_COLUMNS),
+      (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
 
   moe_gemm_q4_kernel_rdna2<T, C_T, BLOCK_SIZE_M><<<grid, block, 0, stream>>>(
       a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
