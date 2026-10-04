@@ -16,15 +16,15 @@ import torch
 
 
 class PrefillProfileWorker:
-    def set_moe_prefill_tile16(self, enabled: str):
-        if enabled not in ("0", "1"):
-            return {"rank": self.rank, "error": "Expected 0 or 1"}
+    def set_moe_prefill_tile(self, tile: str):
+        if tile not in ("8", "16", "32"):
+            return {"rank": self.rank, "error": "Expected 8, 16 or 32"}
         if getattr(self, "_prefill_profile_active", False):
             return {"rank": self.rank, "error": "Disarm profiler first"}
-        os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = enabled
-        return {"rank": self.rank, "moe_prefill_tile16": enabled}
+        os.environ["VLLM_RDNA_MOE_PREFILL_TILE"] = tile
+        return {"rank": self.rank, "moe_prefill_tile": tile}
 
-    def benchmark_moe_prefill_tile16(self):
+    def benchmark_moe_prefill_tiles(self, tile: str = "16"):
         """Real resident expert weights/routing; unchanged MoE test tolerance."""
         from vllm.model_executor.layers.quantization.rdna2_moe_resident import (
             apply_resident,
@@ -51,13 +51,15 @@ class PrefillProfileWorker:
         )
         logits = torch.randn(4096, 10, device=weight.device, generator=generator)
         routing = torch.softmax(logits, dim=-1)
-        previous = os.environ.get("VLLM_RDNA_MOE_PREFILL_TILE16")
-        result = {"rank": self.rank, "routes": []}
+        previous = os.environ.get("VLLM_RDNA_MOE_PREFILL_TILE")
+        result = {"rank": self.rank, "tile": tile, "routes": []}
         try:
-            os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = "0"
+            os.environ["VLLM_RDNA_MOE_PREFILL_TILE"] = "8"
             expected = apply_resident(layer, x, routing, ids).clone()
             for enabled in ("0", "1", "0"):
-                os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = enabled
+                os.environ["VLLM_RDNA_MOE_PREFILL_TILE"] = (
+                    tile if enabled == "1" else "8"
+                )
                 actual = apply_resident(layer, x, routing, ids).clone()
                 errors = []
                 try:
@@ -87,9 +89,9 @@ class PrefillProfileWorker:
                 )
         finally:
             if previous is None:
-                os.environ.pop("VLLM_RDNA_MOE_PREFILL_TILE16", None)
+                os.environ.pop("VLLM_RDNA_MOE_PREFILL_TILE", None)
             else:
-                os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = previous
+                os.environ["VLLM_RDNA_MOE_PREFILL_TILE"] = previous
         return result
 
     def benchmark_hc_prefill_sp(self, rows: str = "4096"):

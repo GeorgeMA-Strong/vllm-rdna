@@ -12,7 +12,7 @@
 // [E, groups, N] scales, [E, groups, N/8] packed zeros.
 //
 // Scope notes:
-//   1. block_size_m ∈ {1, 2, 4, 8, 16}. Larger token tiles reuse each
+//   1. block_size_m ∈ {1, 2, 4, 8, 16, 32}. Larger token tiles reuse each
 //      dequantized weight across more activations. gfx1030 has no WMMA ISA;
 //      both decode and prefill retain the same scalar V_DOT2 arithmetic.
 //   2. Output accumulation supports two modes (see moe_accum_rdna2.cuh):
@@ -372,10 +372,17 @@ void dispatch_moe_gemm_q4(
           size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
           expert_zeros_stride, mul_topk_weight, output_topk, stream);
       break;
+    case 32:
+      launch_moe_gemm_q4<T, C_T, 32>(
+          a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
+          expert_ids, num_tokens_post_padded, num_token_blocks, size_m, size_n,
+          size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
+          expert_zeros_stride, mul_topk_weight, output_topk, stream);
+      break;
     default:
       TORCH_CHECK(
           false,
-          "moe_gptq_gemm_rdna2: block_size_m must be 1, 2, 4, 8, or 16, "
+          "moe_gptq_gemm_rdna2: block_size_m must be 1, 2, 4, 8, 16, or 32, "
           "got ",
           block_size_m);
   }
@@ -398,7 +405,7 @@ void dispatch_moe_gemm_q4(
 //   expert_ids             [num_blocks]              int32
 //   num_tokens_post_padded [1]                       int32
 //   top_k                  int
-//   block_size_m           int (1, 2, 4, 8, or 16)
+//   block_size_m           int (1, 2, 4, 8, 16, or 32)
 //   mul_topk_weight        bool
 //   fp32_accum             bool: accumulate partials in a cached fp32 scratch
 //                          (native fp32 atomics, no CAS) and round to fp16

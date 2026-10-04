@@ -1,13 +1,13 @@
 # Experimental resident MoE prefill tile16
 
-`VLLM_RDNA_MOE_PREFILL_TILE16=1` reuses each dequantized W4 weight across
-16 token rows rather than 8. This is an opt-in native HIP variant, not a
+`VLLM_RDNA_MOE_PREFILL_TILE=16` or `32` reuses each dequantized W4 weight across
+16 or32 token rows rather than8 (the default). These are opt-in native HIP variants, not a
 Triton kernel or an activation-precision change. The existing FP16 activations,
 W4 weights, scale/zero handling, per-row dot-product order, split-K and selected
 FP16/FP32 accumulation mode remain unchanged. No dense expert-weight cache is
 introduced.
 
-Default remains off. Dispatch requires the existing qualified Intel geometry:
+Default remains8. Dispatch requires the existing qualified Intel geometry:
 at least 4096 rows, FP16, hidden2560, intermediate640, topk10, local/global
 experts128/512 and group128 for both projections. All other configurations and
 decode retain the original route. This experiment does not change graphs,

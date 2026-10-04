@@ -17,7 +17,9 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:8082")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--wait-ready", type=float, default=900)
-    parser.add_argument("--candidate", choices=("hc", "moe-tile16"), default="hc")
+    parser.add_argument(
+        "--candidate", choices=("hc", "moe-tile16", "moe-tile32"), default="hc"
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     deadline = time.monotonic() + args.wait_ready
@@ -41,11 +43,15 @@ def main():
         with urllib.request.urlopen(request, timeout=150) as response:
             return json.load(response)
 
-    method = "set_hc_prefill_sp" if args.candidate == "hc" else "set_moe_prefill_tile16"
+    method = "set_hc_prefill_sp" if args.candidate == "hc" else "set_moe_prefill_tile"
+    baseline = "0" if args.candidate == "hc" else "8"
+    candidate = (
+        "1" if args.candidate == "hc" else args.candidate.removeprefix("moe-tile")
+    )
     micro = (
         rpc("benchmark_hc_prefill_sp", ["4096"])
         if args.candidate == "hc"
-        else rpc("benchmark_moe_prefill_tile16", [])
+        else rpc("benchmark_moe_prefill_tiles", [candidate])
     )
     (args.output_dir / "loaded-weight-micro.json").write_text(
         json.dumps(micro, indent=2)
@@ -60,9 +66,9 @@ def main():
 
     try:
         for phase, enabled in (
-            ("control-before", "0"),
-            ("sharded", "1"),
-            ("control-after", "0"),
+            ("control-before", baseline),
+            ("candidate", candidate),
+            ("control-after", baseline),
         ):
             print(
                 json.dumps({"phase": phase, "rpc": rpc(method, [enabled])}),
@@ -84,7 +90,7 @@ def main():
                     check=True,
                 )
     finally:
-        rpc(method, ["0"])
+        rpc(method, [baseline])
 
 
 if __name__ == "__main__":

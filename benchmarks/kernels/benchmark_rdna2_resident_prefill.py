@@ -46,10 +46,10 @@ def main():
             x, routing, ids, native, MoEActivation.SILU, False, 512, mapping
         )
 
-    os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = "0"
+    os.environ["VLLM_RDNA_MOE_PREFILL_TILE"] = "8"
     reference = call().clone()
-    for enabled in ("0", "1", "0"):
-        os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = enabled
+    for tile in (8, 16, 32, 8):
+        os.environ["VLLM_RDNA_MOE_PREFILL_TILE"] = str(tile)
         actual = call().clone()
         torch.testing.assert_close(actual, reference, atol=0.1, rtol=0.01)
         for _ in range(5):
@@ -67,7 +67,7 @@ def main():
         print(
             json.dumps(
                 {
-                    "tile": 16 if enabled == "1" else 8,
+                    "tile": tile,
                     "median_ms": statistics.median(samples),
                     "samples_ms": samples,
                     "max_abs": (actual - reference).abs().max().item(),

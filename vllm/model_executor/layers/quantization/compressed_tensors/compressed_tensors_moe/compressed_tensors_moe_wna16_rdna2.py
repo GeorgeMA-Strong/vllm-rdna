@@ -206,11 +206,10 @@ def _rdna2_fused_moe(
     )
     # Tile 8 is measured for this Qwen4-Exp geometry; retain existing choices elsewhere.
     block_size_m = 8 if use_large_prefill_tile8 else (1 if num_tokens <= 4 else 4)
-    if (
-        use_large_prefill_tile8
-        and os.getenv("VLLM_RDNA_MOE_PREFILL_TILE16", "0") == "1"
-    ):
-        block_size_m = 16
+    if use_large_prefill_tile8:
+        requested_tile = os.getenv("VLLM_RDNA_MOE_PREFILL_TILE", "8")
+        if requested_tile in ("8", "16", "32"):
+            block_size_m = int(requested_tile)
 
     if use_large_prefill_tile8:
         logger.info_once(
