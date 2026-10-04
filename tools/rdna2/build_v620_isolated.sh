@@ -25,10 +25,15 @@ isolated_site=$source_dir/.venv/lib/python3.12/site-packages
 for entry in "$reference_site"/*; do
     name=${entry##*/}
     case $name in
-        vllm | vllm-* | __editable__*vllm* | *vllm*.pth | easy-install.pth) continue ;;
+        vllm | __editable__*vllm* | *vllm*.pth | easy-install.pth) continue ;;
     esac
     if [[ ! -e $isolated_site/$name && ! -L $isolated_site/$name ]]; then
         ln -s -- "$entry" "$isolated_site/$name"
+    fi
+done
+for executable in rocm-sdk cmake ninja; do
+    if [[ -x $dependencies/bin/$executable && ! -e $source_dir/.venv/bin/$executable ]]; then
+        ln -s -- "$dependencies/bin/$executable" "$source_dir/.venv/bin/$executable"
     fi
 done
 
@@ -40,7 +45,9 @@ TRITON_KERNELS_SRC_DIR=$(cd -- "$reference/vllm/third_party/triton_kernels" && p
 export TRITON_KERNELS_SRC_DIR
 export CMAKE_HIP_COMPILER=$rocm/lib/llvm/bin/clang++
 export HIP_DEVICE_LIB_PATH=$rocm/lib/llvm/amdgcn/bitcode
+"$source_dir/.venv/bin/python" -c 'import setuptools_scm, sys; setuptools_scm.get_version(root=sys.argv[1], write_to="vllm/_version.py", fallback_version="0.28.0")' "$source_dir"
 
+if [[ ${V620_BUILD_SKIP_NATIVE:-0} != 1 ]]; then
 "$dependencies/bin/cmake" -S "$source_dir" -B "$source_dir/build-native" -G Ninja \
     -DVLLM_TARGET_DEVICE=rocm \
     -DVLLM_PYTHON_EXECUTABLE="$source_dir/.venv/bin/python" \
@@ -49,6 +56,7 @@ export HIP_DEVICE_LIB_PATH=$rocm/lib/llvm/amdgcn/bitcode
     -DCMAKE_INSTALL_PREFIX="$source_dir"
 "$dependencies/bin/cmake" --build "$source_dir/build-native" --parallel "$jobs"
 "$dependencies/bin/cmake" --install "$source_dir/build-native" --prefix "$source_dir"
+fi
 
 "$source_dir/.venv/bin/python" -c 'import torch, vllm, vllm._rocm_C; print("torch:", torch.__version__); print("HIP:", torch.version.hip); print("vLLM:", vllm.__file__); print("native:", vllm._rocm_C.__file__)'
 sha256sum "$source_dir/vllm/_rocm_C.abi3.so"
