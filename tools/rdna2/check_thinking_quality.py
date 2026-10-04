@@ -59,9 +59,13 @@ def main() -> None:
                 chat_template_kwargs={"enable_thinking": True},
                 engine="vllm",
             )
+            status = trial.get("http_status")
+            engine_error = not trial["ok"] and (
+                bool(trial.get("error")) or status is None or not 200 <= status < 300
+            )
             trial["passed"], trial["score_detail"] = (
                 score_response(trial["response"], case["checker"])
-                if trial["ok"]
+                if not engine_error
                 else (False, trial["error"])
             )
             section["cases"].append(
@@ -79,9 +83,9 @@ def main() -> None:
             print(
                 f"{case['id']}: {trial['passed']} ({trial['score_detail']})", flush=True
             )
-            if not trial["ok"]:
-                # An engine failure is not an incorrect model answer. Stop
-                # before disconnected requests pollute the accuracy denominator.
+            if engine_error:
+                # HTTP 200 with no final answer (e.g. thinking exhausted the
+                # token budget) is a quality failure, not a disconnected engine.
                 result["engine_errors"] += 1
                 result["status"] = "invalid"
                 result["finished_at"] = utc_now()
