@@ -6,7 +6,11 @@ KV. No activation/PLE quantization, INT8 shadows, MTP tuning, or scheduling
 fairness changes. Research only; no server actions or fresh measurements.
 
 Pinned RDNA baseline: `a6ab43cf9661935e05f2a601b8fc1336d6c42491`.
-Pinned vLLM mainline: `155488d853a0bc42df227dbfc74005b3fd488e94`.
+Initially inspected vLLM mainline: `155488d853a0bc42df227dbfc74005b3fd488e94`.
+Rechecked during implementation: `7867d6c52d4542c1b5da641f8ca79124be497ee3`.
+The sole additional commit is frontend model-not-found error wording
+([PR59889](https://github.com/vllm-project/vllm/pull/59889)); it does not change
+prefill computation. RDNA head remains the pinned baseline above.
 The official [v0.30.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.30.0)
 was published 2026-09-22. Findings below distinguish merged work from open PRs;
 release numbering alone does not imply the AMD model uses NVIDIA optimizations.
