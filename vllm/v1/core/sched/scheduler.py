@@ -39,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.dynamic_prefill import maybe_create
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -316,6 +317,14 @@ class Scheduler(SchedulerInterface):
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
+        # Adaptive prefill scheduling. Off unless VLLM_RDNA_DYNAMIC_PREFILL=1; when it
+        # is off every hook below is skipped and the static config is used unchanged.
+        self._dyn_prefill = maybe_create(
+            self.scheduler_config.long_prefill_token_threshold,
+            self.scheduler_config.prefill_schedule_interval,
+            logger,
+        )
+        self._dyn_last_ts = time.monotonic()
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -459,7 +468,7 @@ class Scheduler(SchedulerInterface):
         # and re-aligns at the next boundary.
         if end < prefill_end and not use_internal_checkpoint:
             max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            long_prefill_threshold = self._effective_lpt()
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
@@ -534,6 +543,12 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _effective_lpt(self) -> int:
+        """Chunk cap for this step: the tuner's value when enabled, else the config."""
+        if self._dyn_prefill is not None:
+            return self._dyn_prefill.effective_lpt()
+        return self.scheduler_config.long_prefill_token_threshold
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -583,9 +598,23 @@ class Scheduler(SchedulerInterface):
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
+        # Adaptive cadence (opt-in): the controller owns the throttle decision and,
+        # through _effective_lpt, the chunk cap. It observes the batch itself.
+        # Requests already decoding before this step. Pre-step flags matter: a freshly
+        # admitted prefill still carries is_prefill_chunk=False until _update_after_schedule
+        # recomputes it, and counting it as a decoder reports a zero-token "decoder" and a
+        # false floor breach to the tuner.
+        prev_decoders = {r.request_id for r in self.running if not r.is_prefill_chunk}
+        has_decoder = bool(prev_decoders)
+        if self._dyn_prefill is not None:
+            self._dyn_prefill.begin_step(scheduled_timestamp - self._dyn_last_ts)
+            self._dyn_last_ts = scheduled_timestamp
+            throttle_prefills = self._dyn_prefill.decide_defer(
+                has_decoder, self.prefill_capacity_bound
+            )
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+        ) and has_decoder
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -635,8 +664,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            lpt_cap = self._effective_lpt()
+            if 0 < lpt_cap < num_new_tokens:
+                num_new_tokens = lpt_cap
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -1034,7 +1064,7 @@ class Scheduler(SchedulerInterface):
                             break
                         pad_spec_decode = True
 
-                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    threshold = self._effective_lpt()
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
@@ -1353,6 +1383,26 @@ class Scheduler(SchedulerInterface):
         ):
             scheduled_encoder_input_stats = self._make_scheduled_encoder_input_stats(
                 scheduled_encoder_inputs
+            )
+
+        if self._dyn_prefill is not None:
+            decoders = prev_decoders.intersection(num_scheduled_tokens)
+            prefill_tokens = sum(
+                n for rid, n in num_scheduled_tokens.items() if rid not in decoders
+            )
+            backlog = sum(
+                max(0, r.num_prompt_tokens - r.num_computed_tokens) for r in self.running
+            ) + sum(
+                max(0, r.num_prompt_tokens - r.num_computed_tokens)
+                for q in (self.waiting, self.skipped_waiting)
+                for r in q
+            )
+            self._dyn_prefill.note_scheduled(
+                decoders,
+                prefill_tokens,
+                backlog,
+                len(self.running),
+                len(self.waiting) + len(self.skipped_waiting),
             )
 
         scheduler_output = SchedulerOutput(
@@ -1914,6 +1964,8 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            if self._dyn_prefill is not None and not request.is_prefill_chunk:
+                self._dyn_prefill.note_tokens(req_id, len(generated_token_ids))
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
