@@ -184,46 +184,53 @@ __global__ void moe_gemm_q4_kernel_rdna2(
                         zero_offset, z1z16_h, y1y16_h, group_scales);
     }
 
-    // Prefetch 4 weight words (128 bytes)
-    int4 b_w[4];
+    // The 16-row accumulator leaves less register space. Keeping four
+    // weight words live spills into scratch on gfx1030; stage one at a time
+    // without changing the per-row K accumulation order. Smaller tiles keep
+    // their existing four-word prefetch.
+    constexpr int PREFETCH_WORDS = BLOCK_SIZE_M >= 16 ? 1 : 4;
+  #pragma unroll 1
+    for (int word = 0; word < 4; word += PREFETCH_WORDS) {
+      int4 b_w[PREFETCH_WORDS];
   #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      b_w[j] = *(const int4*)(b_ptr + j * size_n);
-    }
-    b_ptr += 4 * size_n;
+      for (int j = 0; j < PREFETCH_WORDS; ++j) {
+        b_w[j] = *(const int4*)(b_ptr + (word + j) * size_n);
+      }
 
   #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int a_off = (k - offset_k) + 8 * j;
+      for (int j = 0; j < PREFETCH_WORDS; ++j) {
+        const int a_off = (k - offset_k) + 8 * (word + j);
 
-      // fp16 path: dequant via bit-trick, dot via v_dot2_f32_f16
-      half2 dq[4][4];
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0],
-                                            z1z16_h[0], y1y16_h[0]);
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1],
-                                            z1z16_h[1], y1y16_h[1]);
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2],
-                                            z1z16_h[2], y1y16_h[2]);
-      vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3],
-                                            z1z16_h[3], y1y16_h[3]);
+        // fp16 path: dequant via bit-trick, dot via v_dot2_f32_f16
+        half2 dq[4][4];
+        vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].x, dq[0],
+                                              z1z16_h[0], y1y16_h[0]);
+        vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].y, dq[1],
+                                              z1z16_h[1], y1y16_h[1]);
+        vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].z, dq[2],
+                                              z1z16_h[2], y1y16_h[2]);
+        vllm::gptq_rdna2::dequant_4bit_8_fp16((uint32_t)b_w[j].w, dq[3],
+                                              z1z16_h[3], y1y16_h[3]);
 
   #pragma unroll
-      for (int col = 0; col < 4; ++col) {
+        for (int col = 0; col < 4; ++col) {
   #pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-          dq[col][pair] = __hmul2(dq[col][pair], group_scales[col]);
+          for (int pair = 0; pair < 4; ++pair) {
+            dq[col][pair] = __hmul2(dq[col][pair], group_scales[col]);
+          }
+        }
+
+  #pragma unroll
+        for (int m = 0; m < BLOCK_SIZE_M; ++m) {
+          const half* a_ptr = reinterpret_cast<const half*>(&block_a[m][a_off]);
+          block_c[m][0] += vllm::gptq_rdna2::dot22_8_f(dq[0], a_ptr);
+          block_c[m][1] += vllm::gptq_rdna2::dot22_8_f(dq[1], a_ptr);
+          block_c[m][2] += vllm::gptq_rdna2::dot22_8_f(dq[2], a_ptr);
+          block_c[m][3] += vllm::gptq_rdna2::dot22_8_f(dq[3], a_ptr);
         }
       }
-
-  #pragma unroll
-      for (int m = 0; m < BLOCK_SIZE_M; ++m) {
-        const half* a_ptr = reinterpret_cast<const half*>(&block_a[m][a_off]);
-        block_c[m][0] += vllm::gptq_rdna2::dot22_8_f(dq[0], a_ptr);
-        block_c[m][1] += vllm::gptq_rdna2::dot22_8_f(dq[1], a_ptr);
-        block_c[m][2] += vllm::gptq_rdna2::dot22_8_f(dq[2], a_ptr);
-        block_c[m][3] += vllm::gptq_rdna2::dot22_8_f(dq[3], a_ptr);
-      }
     }
+    b_ptr += 4 * size_n;
     k += 32;
   }
 
