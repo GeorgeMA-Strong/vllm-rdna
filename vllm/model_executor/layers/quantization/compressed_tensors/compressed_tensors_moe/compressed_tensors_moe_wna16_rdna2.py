@@ -214,8 +214,9 @@ def _rdna2_fused_moe(
 
     if use_large_prefill_tile8:
         logger.info_once(
-            "RDNA2 resident MoE: tile8 prefill active "
-            "(hidden=2560, intermediate=640, local/global experts=128/512, topk=10)"
+            "RDNA2 resident MoE: tile%d prefill active "
+            "(hidden=2560, intermediate=640, local/global experts=128/512, topk=10)",
+            block_size_m,
         )
 
     # --- Token routing ---
