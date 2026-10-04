@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exercise multimodal prompt KV eviction and RAM-cache restoration."""
 
+import argparse
 import json
 import time
 import urllib.request
@@ -91,6 +92,12 @@ def _stream_chat(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def main() -> None:
+    global BASE_URL, MODEL
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", default=BASE_URL)
+    parser.add_argument("--model", default=MODEL)
+    args = parser.parse_args()
+    BASE_URL, MODEL = args.base_url.rstrip("/"), args.model
     repo = Path(__file__).resolve().parents[2]
     image1 = _image_url(repo / "tests/multimodal/assets/image1.png")
     image2 = _image_url(repo / "tests/multimodal/assets/image2.png")
