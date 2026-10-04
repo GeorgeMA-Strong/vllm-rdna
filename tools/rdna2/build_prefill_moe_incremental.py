@@ -55,6 +55,7 @@ def main():
             root / "csrc",
             "-o",
             build / "csrc",
+            root / "csrc/rocm/moe_accum_rdna2.cuh",
             root / changed,
         ],
         cwd=base_build,
