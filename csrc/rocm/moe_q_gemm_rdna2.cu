@@ -12,11 +12,9 @@
 // [E, groups, N] scales, [E, groups, N/8] packed zeros.
 //
 // Scope notes:
-//   1. Decode only. block_size_m ∈ {1, 2, 4, 8} covers M ∈ [1, 15] in
-//      tiles; the larger MoE block sizes used in upstream vLLM
-//      (M ∈ {16, 32, 64, 128}) are out of scope and fall through to
-//      the upstream MoE path. gfx1030 has no WMMA ISA, so a prefill
-//      MoE kernel on gfx1030 would also be a scalar V_DOT2 design.
+//   1. block_size_m ∈ {1, 2, 4, 8, 16}. Larger token tiles reuse each
+//      dequantized weight across more activations. gfx1030 has no WMMA ISA;
+//      both decode and prefill retain the same scalar V_DOT2 arithmetic.
 //   2. Output accumulation supports two modes (see moe_accum_rdna2.cuh):
 //      the default fp32 path uses native v_global_atomic_add_f32 into a
 //      cached fp32 scratch and casts to fp16 once at the end; the opt-in
@@ -282,12 +280,11 @@ void launch_moe_gemm_q4(
             (size_n + BLOCK_KN_SIZE * 4 - 1) / (BLOCK_KN_SIZE * 4),
             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
 
-  moe_gemm_q4_kernel_rdna2<T, C_T, BLOCK_SIZE_M>
-      <<<grid, block, 0, stream>>>(
-          a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
-          expert_ids, num_tokens_post_padded, size_m, size_n, size_k, groups,
-          top_k, expert_weight_stride, expert_scales_stride,
-          expert_zeros_stride, mul_topk_weight, output_topk);
+  moe_gemm_q4_kernel_rdna2<T, C_T, BLOCK_SIZE_M><<<grid, block, 0, stream>>>(
+      a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
+      expert_ids, num_tokens_post_padded, size_m, size_n, size_k, groups, top_k,
+      expert_weight_stride, expert_scales_stride, expert_zeros_stride,
+      mul_topk_weight, output_topk);
 }
 
 template <typename T, typename C_T>
@@ -328,11 +325,19 @@ void dispatch_moe_gemm_q4(
           size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
           expert_zeros_stride, mul_topk_weight, output_topk, stream);
       break;
+    case 16:
+      launch_moe_gemm_q4<T, C_T, 16>(
+          a, c, b_q_weight, b_scales, b_qzeros, topk_weights, sorted_token_ids,
+          expert_ids, num_tokens_post_padded, num_token_blocks, size_m, size_n,
+          size_k, groups, top_k, expert_weight_stride, expert_scales_stride,
+          expert_zeros_stride, mul_topk_weight, output_topk, stream);
+      break;
     default:
-      TORCH_CHECK(false,
-                  "moe_gptq_gemm_rdna2: block_size_m must be 1, 2, 4, or 8, "
-                  "got ",
-                  block_size_m);
+      TORCH_CHECK(
+          false,
+          "moe_gptq_gemm_rdna2: block_size_m must be 1, 2, 4, 8, or 16, "
+          "got ",
+          block_size_m);
   }
 }
 
@@ -353,7 +358,7 @@ void dispatch_moe_gemm_q4(
 //   expert_ids             [num_blocks]              int32
 //   num_tokens_post_padded [1]                       int32
 //   top_k                  int
-//   block_size_m           int (1, 2, 4, or 8)
+//   block_size_m           int (1, 2, 4, 8, or 16)
 //   mul_topk_weight        bool
 //   fp32_accum             bool: accumulate partials in a cached fp32 scratch
 //                          (native fp32 atomics, no CAS) and round to fp16

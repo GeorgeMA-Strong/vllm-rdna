@@ -35,4 +35,12 @@ The extension provides `start_prefill_stage_profile`,
 `stop_prefill_stage_profile` and `set_hc_prefill_sp` through the loopback-only
 development RPC endpoint. Never expose development RPC on a public interface.
 The toggle allows controlled off/on/off trials in one loaded process; it is
-not a production configuration API. No speedup is established yet.
+not a production configuration API.
+
+## Hardware rejection — 2026-10-04
+
+Real loaded FP16 weights at 4096 rows with TP4 passed neither of the two
+strict output comparisons. The isolated operation fell from approximately
+2.49 ms to 1.69 ms, including gathers, but changing GEMM row shapes changed
+rounding. This is **not a deployable optimization or a whole-model gain**.
+The route remains off; tolerances and precision have not been relaxed.

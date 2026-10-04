@@ -16,6 +16,82 @@ import torch
 
 
 class PrefillProfileWorker:
+    def set_moe_prefill_tile16(self, enabled: str):
+        if enabled not in ("0", "1"):
+            return {"rank": self.rank, "error": "Expected 0 or 1"}
+        if getattr(self, "_prefill_profile_active", False):
+            return {"rank": self.rank, "error": "Disarm profiler first"}
+        os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = enabled
+        return {"rank": self.rank, "moe_prefill_tile16": enabled}
+
+    def benchmark_moe_prefill_tile16(self):
+        """Real resident expert weights/routing; unchanged MoE test tolerance."""
+        from vllm.model_executor.layers.quantization.rdna2_moe_resident import (
+            apply_resident,
+        )
+
+        layer = next(
+            module
+            for module in self.model_runner.model.modules()
+            if hasattr(module, "_rdna2_resident")
+        )
+        native = layer._rdna2_resident
+        weight = native.w13_weight_scale
+        generator = torch.Generator(device=weight.device).manual_seed(620)
+        x = torch.randn(
+            4096, 2560, dtype=weight.dtype, device=weight.device, generator=generator
+        )
+        ids = torch.randint(
+            0,
+            512,
+            (4096, 10),
+            device=weight.device,
+            dtype=torch.int32,
+            generator=generator,
+        )
+        logits = torch.randn(4096, 10, device=weight.device, generator=generator)
+        routing = torch.softmax(logits, dim=-1)
+        previous = os.environ.get("VLLM_RDNA_MOE_PREFILL_TILE16")
+        result = {"rank": self.rank, "routes": []}
+        try:
+            os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = "0"
+            expected = apply_resident(layer, x, routing, ids).clone()
+            for enabled in ("0", "1", "0"):
+                os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = enabled
+                actual = apply_resident(layer, x, routing, ids).clone()
+                errors = []
+                try:
+                    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.01)
+                except AssertionError as error:
+                    errors.append(str(error))
+                for _ in range(3):
+                    apply_resident(layer, x, routing, ids)
+                timings = []
+                for _ in range(3):
+                    start = torch.Event(device=x.device, enable_timing=True)
+                    end = torch.Event(device=x.device, enable_timing=True)
+                    start.record()
+                    for _ in range(10):
+                        apply_resident(layer, x, routing, ids)
+                    end.record()
+                    end.synchronize()
+                    timings.append(start.elapsed_time(end) / 10)
+                result["routes"].append(
+                    {
+                        "enabled": enabled,
+                        "median_ms": statistics.median(timings),
+                        "samples_ms": timings,
+                        "numerical_errors": errors,
+                        "max_abs": (actual - expected).abs().max().item(),
+                    }
+                )
+        finally:
+            if previous is None:
+                os.environ.pop("VLLM_RDNA_MOE_PREFILL_TILE16", None)
+            else:
+                os.environ["VLLM_RDNA_MOE_PREFILL_TILE16"] = previous
+        return result
+
     def benchmark_hc_prefill_sp(self, rows: str = "4096"):
         """Compare actual loaded HC weights with real TP collectives."""
         if getattr(self, "_prefill_profile_active", False):

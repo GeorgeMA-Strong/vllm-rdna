@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Rebuild only the expert kernel, reusing immutable qualified native objects."""
+
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reference", type=Path, required=True)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[2]
+    reference = args.reference.resolve()
+    if reference == root:
+        raise RuntimeError("Reference must not be the experiment checkout")
+    changed = "csrc/rocm/moe_q_gemm_rdna2.cu"
+    for source in (root / "csrc").rglob("*"):
+        if source.is_file() and source.suffix in (".cu", ".cpp", ".cuh", ".h"):
+            relative = source.relative_to(root)
+            if str(relative) != changed and sha(source) != sha(reference / relative):
+                raise RuntimeError(f"Unqualified additional native change: {relative}")
+    protected = reference / "vllm/_rocm_C.abi3.so"
+    before = sha(protected)
+    build = root / "build-prefill-moe"
+    build.mkdir(exist_ok=True)
+    base_build = reference / "build-native"
+    ninja = reference / ".venv/bin/ninja"
+    env = os.environ.copy()
+    sdk = root / ".venv/lib/python3.12/site-packages/_rocm_sdk_core"
+    env["PATH"] = f"{root}/.venv/bin:/opt/rocm/core-10.0/bin:" + env["PATH"]
+    env["LD_LIBRARY_PATH"] = (
+        f"{sdk}/lib:{sdk}/lib/host-math/lib:/opt/rocm/core-10.0/lib"
+    )
+
+    def call(values):
+        subprocess.run(list(map(str, values)), cwd=base_build, env=env, check=True)
+
+    call(
+        [
+            sys.executable,
+            root / "cmake/hipify.py",
+            "-p",
+            root / "csrc",
+            "-o",
+            build / "csrc",
+            root / changed,
+        ]
+    )
+    obj = "CMakeFiles/_rocm_C.dir/csrc/rocm/moe_q_gemm_rdna2.hip.o"
+    output_obj = build / obj
+    output_obj.parent.mkdir(parents=True, exist_ok=True)
+    commands = subprocess.check_output(
+        [str(ninja), "-t", "commands", obj], cwd=base_build, env=env, text=True
+    ).splitlines()
+    command = next(line for line in commands if obj in line and " -c " in line)
+    values = shlex.split(command)
+    values.insert(1, "-I" + str(build / "csrc"))
+    for flag, value in (
+        ("-MT", output_obj),
+        ("-MF", str(output_obj) + ".d"),
+        ("-o", output_obj),
+        ("-c", build / "csrc/rocm/moe_q_gemm_rdna2.hip"),
+    ):
+        values[values.index(flag) + 1] = str(value)
+    (build / "compile-command.json").write_text(json.dumps(values, indent=2))
+    call(values)
+    commands = subprocess.check_output(
+        [str(ninja), "-t", "commands", "_rocm_C"], cwd=base_build, env=env, text=True
+    ).splitlines()
+    command = next(
+        line
+        for line in reversed(commands)
+        if line.startswith(": &&") and "-o _rocm_C.abi3.so" in line
+    )
+    values = shlex.split(command)[2:-2]
+    values[values.index(obj)] = str(output_obj)
+    values[values.index("-o") + 1] = str(root / "vllm/_rocm_C.abi3.so")
+    (build / "link-command.json").write_text(json.dumps(values, indent=2))
+    call(values)
+    if sha(protected) != before:
+        raise RuntimeError("Reference native artifact changed")
+    print(
+        json.dumps(
+            {
+                "reference_sha256": before,
+                "candidate_sha256": sha(root / "vllm/_rocm_C.abi3.so"),
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
