@@ -180,11 +180,17 @@ def test_fused_moe_w1_matches_dense(
 @pytest.mark.parametrize("tile", [8, 16, 32])
 @pytest.mark.parametrize("hidden, gate_up", [(2560, 1280), (640, 2560)])
 @pytest.mark.parametrize("fp32_accum", [False, True])
-def test_v620_moe_prefill_tiles_match_tile4(tile, hidden, gate_up, fp32_accum):
+@pytest.mark.parametrize("reduce_topk", [False, True])
+def test_v620_moe_prefill_tiles_match_tile4(
+    tile, hidden, gate_up, fp32_accum, reduce_topk
+):
     """The qualified V620 expert shape must preserve the existing tile output."""
     experts, top_k, group_size, tokens = 16, 10, 128, 64
     torch.manual_seed(42)
     x = torch.randn(tokens, hidden, dtype=torch.float16, device=device)
+    if reduce_topk:
+        x = x.repeat_interleave(top_k, dim=0)
+    routing = torch.softmax(torch.randn(tokens, top_k, device=device), dim=-1)
     weight = _make_packed_weights(experts, hidden, gate_up)
     scales = _make_scales(experts, hidden // group_size, gate_up, torch.float16)
     zeros = _make_qzeros(experts, hidden // group_size, gate_up)
@@ -197,7 +203,10 @@ def test_v620_moe_prefill_tiles_match_tile4(tile, hidden, gate_up, fp32_accum):
             topk_ids, block_size_m, experts
         )
         output = torch.zeros(
-            tokens * top_k, gate_up, dtype=torch.float16, device=device
+            tokens if reduce_topk else tokens * top_k,
+            gate_up,
+            dtype=torch.float16,
+            device=device,
         )
         ops.moe_gptq_gemm_rdna2(
             x,
@@ -205,14 +214,14 @@ def test_v620_moe_prefill_tiles_match_tile4(tile, hidden, gate_up, fp32_accum):
             weight,
             scales,
             zeros,
-            torch.empty(0, device=device),
+            routing if reduce_topk else torch.empty(0, device=device),
             sorted_ids,
             expert_ids,
             padded_count,
-            top_k,
+            1 if reduce_topk else top_k,
             block_size_m,
-            False,
-            0,
+            reduce_topk,
+            top_k if reduce_topk else 0,
             fp32_accum=fp32_accum,
         )
         outputs.append(output)
