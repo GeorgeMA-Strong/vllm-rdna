@@ -98,7 +98,7 @@ __forceinline__ __device__ void moe_accum_pair(const float (&vals)[2],
 
 template <typename T, int M, int N_COLUMNS, bool CHECK_PADDING>
 __forceinline__ __device__ void accumulate_moe_rows(
-    const half2 (&dq)[N_COLUMNS][4], const T (&block_a)[M][BLOCK_KN_SIZE + 8],
+    half2 (&dq)[N_COLUMNS][4], const T (&block_a)[M][BLOCK_KN_SIZE + 8],
     int a_off, float (&block_c)[M][N_COLUMNS], uint32_t valid_mask) {
   #pragma unroll
   for (int m = 0; m < M; ++m) {
