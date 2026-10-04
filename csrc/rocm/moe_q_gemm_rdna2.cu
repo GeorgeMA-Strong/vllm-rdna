@@ -236,11 +236,11 @@ __global__ void moe_gemm_q4_kernel_rdna2(
                         zero_offset, z1z16_h, y1y16_h, group_scales);
     }
 
-    // The 16-row accumulator leaves less register space. Keeping four
-    // weight words live spills into scratch on gfx1030; stage one at a time
-    // without changing the per-row K accumulation order. Smaller tiles keep
-    // their existing four-word prefetch.
-    constexpr int PREFETCH_WORDS = BLOCK_SIZE_M >= 16 ? 1 : 4;
+    // Limit weight liveness in prefill tiles without changing per-row K order.
+    // Wide tiles spill with four prefetched words; tile8 also uses125VGPRs
+    // with that schedule, constraining occupancy. Decode tiles keep the
+    // original four-word prefetch.
+    constexpr int PREFETCH_WORDS = BLOCK_SIZE_M >= 8 ? 1 : 4;
   #pragma unroll 1
     for (int word = 0; word < 4; word += PREFETCH_WORDS) {
       WeightWord b_w[PREFETCH_WORDS];
