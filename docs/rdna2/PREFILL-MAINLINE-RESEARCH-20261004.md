@@ -158,6 +158,11 @@ Exact mainline changes, distinct from a portable large prefill speedup:
   layer benefits if its strided output gate required a copy, but this is
   memory/overhead, not faster recurrent math. AITER compile fusion is not
   applicable when AITER and compile are off.
+  A direct copy of this helper is unsafe here: the RDNA `RMSNormGated.forward_hip`
+  native fast path explicitly requires 2D input. Passing3D would fall back to
+  decomposed PyTorch math, and the current HIP binding requires contiguous gate
+  input anyway. A useful port needs a stride-aware native norm, not just deleted
+  reshapes.
 - `b538d807ffe0976af7e5d107ccfe77e676b83b70`,
   [PR59536](https://github.com/vllm-project/vllm/pull/59536): group-local GDN
   checkpoint metadata is correctness, not an advertised math speedup.
