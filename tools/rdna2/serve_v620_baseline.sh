@@ -65,6 +65,9 @@ fi
 if [[ ${V620_SKIP_MM_PROFILING:-0} == 1 ]]; then
     command+=(--skip-mm-profiling)
 fi
+if [[ ${V620_PROFILE_PREFILL:-0} == 1 ]]; then
+    command+=(--worker-extension-cls tools.rdna2.prefill_profile_worker.PrefillProfileWorker)
+fi
 if [[ ${1:-} == --dry-run ]]; then
     env | LC_ALL=C sort | grep -E '^(V620_|VLLM_|PYTORCH_|TORCH_|TRITON_|HSA_|OMP_|HF_|TRANSFORMERS_|TOKENIZERS_|PYTHONFAULTHANDLER=|PYTHONPATH=|LD_LIBRARY_PATH=|PATH=)'
     printf '%q ' "${command[@]}"
