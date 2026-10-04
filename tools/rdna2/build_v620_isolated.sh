@@ -36,7 +36,8 @@ export PATH="$source_dir/.venv/bin:$dependencies/bin:$rocm/bin:$rocm/llvm/bin:$P
 export PYTHONPATH=$source_dir
 sdk=$isolated_site/_rocm_sdk_core
 export LD_LIBRARY_PATH="$sdk/lib:$sdk/lib/host-math/lib:$rocm/lib"
-export TRITON_KERNELS_SRC_DIR=$reference/vllm/third_party/triton_kernels
+TRITON_KERNELS_SRC_DIR=$(cd -- "$reference/vllm/third_party/triton_kernels" && pwd -P)
+export TRITON_KERNELS_SRC_DIR
 export CMAKE_HIP_COMPILER=$rocm/lib/llvm/bin/clang++
 export HIP_DEVICE_LIB_PATH=$rocm/lib/llvm/amdgcn/bitcode
 
