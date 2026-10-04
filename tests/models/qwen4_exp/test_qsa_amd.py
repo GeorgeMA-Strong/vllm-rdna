@@ -141,10 +141,10 @@ def _qsa_sparse_paged_attention_reference(
 
 @pytest.mark.parametrize("contiguous", [False, True])
 def test_qsa_rope_uses_platform_dispatch(monkeypatch, contiguous) -> None:
-    tensor = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+    tensor = torch.arange(16, dtype=torch.float32, device="cuda").reshape(2, 2, 4)
     if not contiguous:
         tensor = tensor.transpose(0, 1)
-    positions = torch.tensor([0, 1])
+    positions = torch.tensor([0, 1], device="cuda")
     calls = []
 
     def apply_rotary_emb(
@@ -170,7 +170,7 @@ def test_qsa_rope_uses_platform_dispatch(monkeypatch, contiguous) -> None:
         rotary_dim=2,
         is_neox_style=True,
         apply_rotary_emb=apply_rotary_emb,
-        _match_cos_sin_cache_dtype=lambda _: torch.zeros(2, 2),
+        _match_cos_sin_cache_dtype=lambda _: torch.zeros(2, 2, device="cuda"),
     )
 
     output = apply_qsa_rope(rotary_emb, positions, tensor)
@@ -181,9 +181,9 @@ def test_qsa_rope_uses_platform_dispatch(monkeypatch, contiguous) -> None:
 
 
 def test_qsa_rmsnorm_uses_portable_implementation(default_vllm_config) -> None:
-    norm = GemmaRMSNorm(4, eps=1e-6)
+    norm = GemmaRMSNorm(4, eps=1e-6).to("cuda")
     norm.weight.data.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4]))
-    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    tensor = torch.arange(8, dtype=torch.float32, device="cuda").reshape(2, 4)
     output = apply_qsa_rmsnorm(norm, tensor)
 
     torch.testing.assert_close(output, norm.forward_native(tensor))
