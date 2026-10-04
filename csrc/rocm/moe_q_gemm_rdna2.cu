@@ -96,6 +96,23 @@ __forceinline__ __device__ void moe_accum_pair(const float (&vals)[2],
   }
 }
 
+template <typename T, int M, int N_COLUMNS, bool CHECK_PADDING>
+__forceinline__ __device__ void accumulate_moe_rows(
+    const half2 (&dq)[N_COLUMNS][4], const T (&block_a)[M][BLOCK_KN_SIZE + 8],
+    int a_off, float (&block_c)[M][N_COLUMNS], uint32_t valid_mask) {
+  #pragma unroll
+  for (int m = 0; m < M; ++m) {
+    if constexpr (CHECK_PADDING) {
+      if ((valid_mask & (uint32_t{1} << m)) == 0) continue;
+    }
+    const half* a_ptr = reinterpret_cast<const half*>(&block_a[m][a_off]);
+  #pragma unroll
+    for (int col = 0; col < N_COLUMNS; ++col) {
+      block_c[m][col] += vllm::gptq_rdna2::dot22_8_f(dq[col], a_ptr);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fused MoE kernel.
 // ---------------------------------------------------------------------------
@@ -152,6 +169,16 @@ __global__ void moe_gemm_q4_kernel_rdna2(
                 "BLOCK_KN_SIZE must equal THREADS_X");
 
   const int offset_m_base = token_block * BLOCK_SIZE_M;
+  uint32_t valid_mask = UINT32_MAX;
+  if constexpr (BLOCK_SIZE_M >= 32) {
+    valid_mask = 0;
+  #pragma unroll
+    for (int m = 0; m < BLOCK_SIZE_M; ++m) {
+      if (sorted_token_ids[offset_m_base + m] / top_k < size_m) {
+        valid_mask |= uint32_t{1} << m;
+      }
+    }
+  }
 
   if (offset_k + t < end_k) {
   #pragma unroll
@@ -247,13 +274,17 @@ __global__ void moe_gemm_q4_kernel_rdna2(
           }
         }
 
-  #pragma unroll
-        for (int m = 0; m < BLOCK_SIZE_M; ++m) {
-          const half* a_ptr = reinterpret_cast<const half*>(&block_a[m][a_off]);
-  #pragma unroll
-          for (int col = 0; col < N_COLUMNS; ++col) {
-            block_c[m][col] += vllm::gptq_rdna2::dot22_8_f(dq[col], a_ptr);
+        if constexpr (BLOCK_SIZE_M >= 32) {
+          if (valid_mask != UINT32_MAX) {
+            accumulate_moe_rows<T, BLOCK_SIZE_M, N_COLUMNS, true>(
+                dq, block_a, a_off, block_c, valid_mask);
+          } else {
+            accumulate_moe_rows<T, BLOCK_SIZE_M, N_COLUMNS, false>(
+                dq, block_a, a_off, block_c, valid_mask);
           }
+        } else {
+          accumulate_moe_rows<T, BLOCK_SIZE_M, N_COLUMNS, false>(
+              dq, block_a, a_off, block_c, valid_mask);
         }
       }
     }
