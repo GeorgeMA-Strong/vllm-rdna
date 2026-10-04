@@ -139,8 +139,11 @@ def _qsa_sparse_paged_attention_reference(
     return output
 
 
-def test_qsa_rope_uses_platform_dispatch() -> None:
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_qsa_rope_uses_platform_dispatch(monkeypatch, contiguous) -> None:
     tensor = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+    if not contiguous:
+        tensor = tensor.transpose(0, 1)
     positions = torch.tensor([0, 1])
     calls = []
 
@@ -152,10 +155,22 @@ def test_qsa_rope_uses_platform_dispatch() -> None:
         calls.append((rotary_input, cos, sin))
         return rotary_input + 1
 
+    def native_rotary(positions, query, key, head_dim, cache, is_neox_style):
+        assert key is None
+        assert head_dim == 4
+        assert is_neox_style
+        calls.append((query, cache, positions))
+        query.view(2, 2, 4)[..., :2].add_(1)
+
+    monkeypatch.setattr(
+        "vllm.models.qwen4_exp.amd.indexer_qsa.ops.rotary_embedding",
+        native_rotary,
+    )
     rotary_emb = SimpleNamespace(
         rotary_dim=2,
+        is_neox_style=True,
         apply_rotary_emb=apply_rotary_emb,
-        _match_cos_sin_cache_dtype=lambda _: torch.zeros(2, 4),
+        _match_cos_sin_cache_dtype=lambda _: torch.zeros(2, 2),
     )
 
     output = apply_qsa_rope(rotary_emb, positions, tensor)
