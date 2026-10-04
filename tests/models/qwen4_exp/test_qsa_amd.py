@@ -180,10 +180,11 @@ def test_qsa_rope_uses_platform_dispatch(monkeypatch, contiguous) -> None:
     torch.testing.assert_close(output[..., 2:], tensor[..., 2:])
 
 
-def test_qsa_rmsnorm_uses_portable_implementation(default_vllm_config) -> None:
-    norm = GemmaRMSNorm(4, eps=1e-6).to("cuda")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_qsa_rmsnorm_uses_portable_implementation(default_vllm_config, dtype) -> None:
+    norm = GemmaRMSNorm(4, eps=1e-6).to(device="cuda", dtype=dtype)
     norm.weight.data.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4]))
-    tensor = torch.arange(8, dtype=torch.float32, device="cuda").reshape(2, 4)
+    tensor = torch.arange(8, dtype=dtype, device="cuda").reshape(2, 4)
     output = apply_qsa_rmsnorm(norm, tensor)
 
     torch.testing.assert_close(output, norm.forward_native(tensor))
