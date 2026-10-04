@@ -152,3 +152,41 @@ def test_hc_prefill_sharding_computes_only_local_rows(monkeypatch, rank):
     torch.testing.assert_close(actual_down, expected_down)
     assert projection_rows == [256, 256]
     assert gather_count == 2
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="RDNA2 only")
+@pytest.mark.parametrize("rows", [9, 1023, 1025])
+def test_hc_prefill_sharding_preserves_small_and_unaligned_fallback(monkeypatch, rows):
+    """Mixed-batch tails must not insert divergent collectives."""
+    import torch.nn.functional as functional
+
+    import vllm.distributed as distributed
+    from vllm.model_executor.layers import rdna_ops  # noqa: F401
+
+    x = torch.randn(rows, 128, device="cuda", dtype=torch.float16)
+    down = torch.randn(32, 128, device="cuda", dtype=torch.float16) * 0.05
+    up = torch.randn(128, 16, device="cuda", dtype=torch.float16) * 0.05
+    monkeypatch.setenv("VLLM_RDNA_HC_PREFILL_SP", "0")
+    expected = torch.ops.vllm.rdna_hc_mix(x, down, None, None, up, None, None, 16, 4)
+
+    class Group:
+        world_size = 4
+        rank_in_group = 0
+
+        def all_gather(self, *args, **kwargs):
+            raise AssertionError("Unsupported rows entered a collective")
+
+    monkeypatch.setattr(distributed, "get_tp_group", lambda: Group())
+    monkeypatch.setenv("VLLM_RDNA_HC_PREFILL_SP", "1")
+    projection_rows = []
+    original_linear = functional.linear
+
+    def measured_linear(value, weight, bias=None):
+        projection_rows.append(value.shape[0])
+        return original_linear(value, weight, bias)
+
+    monkeypatch.setattr(functional, "linear", measured_linear)
+    actual = torch.ops.vllm.rdna_hc_mix(x, down, None, None, up, None, None, 16, 4)
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+    assert projection_rows == [rows, rows]

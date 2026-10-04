@@ -87,6 +87,7 @@ def _rdna_hc_mix(
     if (
         os.getenv("VLLM_RDNA_HC_PREFILL_SP", "0") == "1"
         and n >= 1024
+        and xn.dim() == 2
         and xn.dtype == torch.float16
         and xn.is_contiguous()
         and w_down_i8 is None
