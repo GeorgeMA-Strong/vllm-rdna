@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,12 @@ def main():
     hip_source = Path(hipify.strip().splitlines()[-1]).resolve()
     if not hip_source.is_relative_to(root) or not hip_source.is_file():
         raise RuntimeError("Hipify did not return an isolated generated source")
+    # Quoted includes next to the source must resolve to the qualified,
+    # already-hipified common headers, not the original CUDA headers.
+    generated = build / "generated"
+    generated.mkdir(exist_ok=True)
+    generated_source = generated / hip_source.name
+    shutil.copy2(hip_source, generated_source)
     obj = "CMakeFiles/_rocm_C.dir/csrc/rocm/moe_q_gemm_rdna2.hip.o"
     output_obj = build / obj
     output_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -72,12 +79,12 @@ def main():
     ).splitlines()
     command = next(line for line in commands if obj in line and " -c " in line)
     values = shlex.split(command)
-    values.insert(1, "-I" + str(build / "csrc"))
+    values.insert(1, "-I" + str(base_build / "csrc/rocm"))
     for flag, value in (
         ("-MT", output_obj),
         ("-MF", str(output_obj) + ".d"),
         ("-o", output_obj),
-        ("-c", hip_source),
+        ("-c", generated_source),
     ):
         values[values.index(flag) + 1] = str(value)
     (build / "compile-command.json").write_text(json.dumps(values, indent=2))
