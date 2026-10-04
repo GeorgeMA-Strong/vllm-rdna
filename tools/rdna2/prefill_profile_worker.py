@@ -8,6 +8,7 @@ collective_rpc; no synchronization is added to the measured forward calls.
 """
 
 import os
+import statistics
 from collections import defaultdict
 from functools import wraps
 
@@ -15,6 +16,87 @@ import torch
 
 
 class PrefillProfileWorker:
+    def benchmark_hc_prefill_sp(self, rows: str = "4096"):
+        """Compare actual loaded HC weights with real TP collectives."""
+        if getattr(self, "_prefill_profile_active", False):
+            raise RuntimeError("Disarm the profiler before benchmarking")
+        count = int(rows)
+        if count not in (1024, 2048, 4096):
+            raise ValueError("Expected 1024, 2048 or 4096 rows")
+        module = next(
+            module
+            for module in self.model_runner.model.modules()
+            if type(module).__name__ == "GatedResidual" and module.use_combine
+        )
+        down = module.input_mix_weight_down_block_inject.weight
+        up = module.input_mix_weight_up.weight
+        generator = torch.Generator(device=down.device).manual_seed(620)
+        x = torch.randn(
+            count,
+            down.shape[1],
+            device=down.device,
+            dtype=down.dtype,
+            generator=generator,
+        )
+
+        def call():
+            return torch.ops.vllm.rdna_hc_mix(
+                x,
+                down,
+                None,
+                None,
+                up,
+                None,
+                None,
+                module.lora_rank,
+                module.hc_count,
+            )
+
+        previous = os.environ.get("VLLM_RDNA_HC_PREFILL_SP")
+        result = {"rank": self.rank, "rows": count, "routes": []}
+        try:
+            os.environ["VLLM_RDNA_HC_PREFILL_SP"] = "0"
+            expected = call()
+            for enabled in ("0", "1", "0"):
+                os.environ["VLLM_RDNA_HC_PREFILL_SP"] = enabled
+                actual = call()
+                errors = []
+                for value, reference in zip(actual, expected):
+                    try:
+                        torch.testing.assert_close(value, reference)
+                    except AssertionError as error:
+                        errors.append(str(error))
+                for _ in range(3):
+                    call()
+                timings = []
+                for _ in range(3):
+                    start = torch.Event(device=x.device, enable_timing=True)
+                    end = torch.Event(device=x.device, enable_timing=True)
+                    start.record()
+                    for _ in range(10):
+                        call()
+                    end.record()
+                    end.synchronize()
+                    timings.append(start.elapsed_time(end) / 10)
+                result["routes"].append(
+                    {
+                        "enabled": enabled,
+                        "median_ms": statistics.median(timings),
+                        "samples_ms": timings,
+                        "numerical_errors": errors,
+                        "max_abs": [
+                            (value - reference).abs().max().item()
+                            for value, reference in zip(actual, expected)
+                        ],
+                    }
+                )
+        finally:
+            if previous is None:
+                os.environ.pop("VLLM_RDNA_HC_PREFILL_SP", None)
+            else:
+                os.environ["VLLM_RDNA_HC_PREFILL_SP"] = previous
+        return result
+
     def set_hc_prefill_sp(self, enabled: str):
         if enabled not in ("0", "1"):
             raise ValueError("Expected 0 or 1")
@@ -25,7 +107,7 @@ class PrefillProfileWorker:
 
     def start_prefill_stage_profile(self, minimum_tokens: int = 512):
         if getattr(self, "_prefill_profile_active", False):
-            raise RuntimeError("Prefill profiler already armed")
+            return {"rank": self.rank, "error": "Prefill profiler already armed"}
         self._prefill_profile_events = []
         self._prefill_profile_restores = []
         self._prefill_profile_active = True

@@ -3,11 +3,15 @@
 """Measure cold-prefix prefill stage costs on an isolated V620 server."""
 
 import argparse
+import fcntl
+import hashlib
 import json
 import random
+import tempfile
 import time
 import urllib.request
 import uuid
+from pathlib import Path
 
 
 def main():
@@ -16,6 +20,14 @@ def main():
     parser.add_argument("--tokens", type=int, default=16384)
     parser.add_argument("--repetitions", type=int, default=3)
     args = parser.parse_args()
+    lock_path = Path(tempfile.gettempdir()) / (
+        "v620-prefill-profile-" + hashlib.sha256(args.base_url.encode()).hexdigest()
+    )
+    lock = lock_path.open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        parser.exit(2, "Another prefill profile client owns this endpoint\n")
 
     def post(path, payload):
         request = urllib.request.Request(
@@ -47,10 +59,12 @@ def main():
         return {"seconds": seconds, "tokens_per_second": args.tokens / seconds}
 
     print(json.dumps({"warmup": inference()}), flush=True)
-    post(
+    armed = post(
         "/collective_rpc",
         {"method": "start_prefill_stage_profile", "args": [512], "timeout": 30},
     )
+    if any("error" in result for result in armed["results"]):
+        raise RuntimeError(armed)
     try:
         for trial in range(args.repetitions):
             print(json.dumps({"trial": trial, **inference()}), flush=True)
