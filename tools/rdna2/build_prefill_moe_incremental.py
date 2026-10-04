@@ -46,7 +46,7 @@ def main():
     def call(values):
         subprocess.run(list(map(str, values)), cwd=base_build, env=env, check=True)
 
-    call(
+    hipify = subprocess.check_output(
         [
             sys.executable,
             root / "cmake/hipify.py",
@@ -55,8 +55,15 @@ def main():
             "-o",
             build / "csrc",
             root / changed,
-        ]
+        ],
+        cwd=base_build,
+        env=env,
+        text=True,
     )
+    print(hipify, flush=True)
+    hip_source = Path(hipify.strip().splitlines()[-1]).resolve()
+    if not hip_source.is_relative_to(root) or not hip_source.is_file():
+        raise RuntimeError("Hipify did not return an isolated generated source")
     obj = "CMakeFiles/_rocm_C.dir/csrc/rocm/moe_q_gemm_rdna2.hip.o"
     output_obj = build / obj
     output_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +77,7 @@ def main():
         ("-MT", output_obj),
         ("-MF", str(output_obj) + ".d"),
         ("-o", output_obj),
-        ("-c", build / "csrc/rocm/moe_q_gemm_rdna2.hip"),
+        ("-c", hip_source),
     ):
         values[values.index(flag) + 1] = str(value)
     (build / "compile-command.json").write_text(json.dumps(values, indent=2))
