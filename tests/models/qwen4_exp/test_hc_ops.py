@@ -4,18 +4,27 @@
 import pytest
 import torch
 
-from vllm.models.qwen4_exp.nvidia.ops.hc import (
-    grouped_gemma_rmsnorm,
-    hc_combine,
-    hc_combine_norm,
-    hc_gate_mix,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
+if current_platform.is_rocm():
+    from vllm.models.qwen4_exp.amd.ops.hc import (
+        grouped_gemma_rmsnorm,
+        hc_combine,
+        hc_combine_norm,
+        hc_gate_mix,
+    )
+else:
+    from vllm.models.qwen4_exp.nvidia.ops.hc import (
+        grouped_gemma_rmsnorm,
+        hc_combine,
+        hc_combine_norm,
+        hc_gate_mix,
+    )
+
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda() or not HAS_TRITON,
-    reason="HC kernels require CUDA and Triton",
+    not current_platform.is_cuda_alike() or not HAS_TRITON,
+    reason="HC kernels require a GPU and Triton",
 )
 
 HC = 4
@@ -92,3 +101,54 @@ def test_hc_combine_norm() -> None:
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_norm, expected_norm.to(torch.bfloat16))
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="RDNA2 only")
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_hc_prefill_sharding_computes_only_local_rows(monkeypatch, rank):
+    """Each TP rank computes one quarter, preserving the full public output."""
+    import torch.nn.functional as functional
+
+    import vllm.distributed as distributed
+    from vllm.model_executor.layers import rdna_ops  # noqa: F401
+    from vllm.models.qwen4_exp.amd.ops.hc import hc_silu
+
+    torch.manual_seed(620)
+    x = torch.randn(1024, 128, device="cuda", dtype=torch.float16)
+    down = torch.randn(32, 128, device="cuda", dtype=torch.float16) * 0.05
+    up = torch.randn(128, 16, device="cuda", dtype=torch.float16) * 0.05
+    expected_down = functional.linear(x, down)
+    gate = functional.linear(hc_silu(expected_down[:, :16].contiguous(), 4), up)
+    expected_block = hc_gate_mix(x, gate, 4)
+    expected = [expected_block, expected_down]
+    gather_count = 0
+
+    class Group:
+        world_size = 4
+        rank_in_group = rank
+
+        def all_gather(self, value, dim):
+            nonlocal gather_count
+            full = expected[gather_count]
+            torch.testing.assert_close(value, full[rank * 256 : (rank + 1) * 256])
+            assert dim == 0
+            gather_count += 1
+            return full.clone()
+
+    monkeypatch.setattr(distributed, "get_tp_group", lambda: Group())
+    monkeypatch.setenv("VLLM_RDNA_HC_PREFILL_SP", "1")
+    original_linear = functional.linear
+    projection_rows = []
+
+    def measured_linear(value, weight, bias=None):
+        projection_rows.append(value.shape[0])
+        return original_linear(value, weight, bias)
+
+    monkeypatch.setattr(functional, "linear", measured_linear)
+    actual_block, actual_down = torch.ops.vllm.rdna_hc_mix(
+        x, down, None, None, up, None, None, 16, 4
+    )
+    torch.testing.assert_close(actual_block, expected_block)
+    torch.testing.assert_close(actual_down, expected_down)
+    assert projection_rows == [256, 256]
+    assert gather_count == 2
