@@ -9,6 +9,69 @@ from vllm.platforms import current_platform
 from ...utils import create_new_process_for_each_test
 
 
+@pytest.mark.parametrize("rows", [9, 257])
+def test_amd_ple_forward_releases_gate_temporaries_before_convolution(
+    monkeypatch, rows
+):
+    """Consumed projection buffers must not inflate convolution's live memory."""
+    import math
+    import weakref
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.amd.ple_layer import Qwen4ExpPLELayer
+
+    hc, hidden = 4, 32
+    references = {}
+
+    def embedding(x, *_):
+        value = x.clone()
+        references["embedding"] = weakref.ref(value)
+        return value
+
+    def projection(name, width):
+        def call(x):
+            value = x.new_ones((rows, width))
+            references[name] = weakref.ref(value)
+            return value, None
+
+        return call
+
+    def norm(name, value):
+        result = value.clone()
+        if name != "conv":
+            references[name] = weakref.ref(result)
+        return result
+
+    def convolution(inputs, output, prefix):
+        assert prefix == "memory-fixture"
+        assert all(reference() is None for reference in references.values())
+        output.copy_(inputs)
+
+    monkeypatch.setattr(torch.ops.vllm, "qwen4_exp_ple_short_conv", convolution)
+    layer = SimpleNamespace(
+        ple_embedding=embedding,
+        key_proj=projection("key_projection", hc * hidden),
+        value_proj=projection("value_projection", hidden),
+        hc_count=hc,
+        hidden_size=hidden,
+        norm_key="key_norm",
+        norm_query="query_norm",
+        norm_conv="conv",
+        _apply_norm=norm,
+        prefix="memory-fixture",
+    )
+    torch.manual_seed(620)
+    with torch.inference_mode():
+        x = torch.randn(rows, hc * hidden, dtype=torch.float16)
+        query = x.reshape(rows, hc, hidden)
+        gate = query.sum(-1, keepdim=True) / math.sqrt(hidden)
+        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+        gated = gate * x.new_ones((rows, hidden)).unsqueeze(-2)
+        expected = gated.flatten(-2) + gated.flatten(-2)
+        actual = Qwen4ExpPLELayer.forward(layer, x, torch.arange(rows), None, None)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def _ple_grouped_norm_reference(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
