@@ -26,9 +26,15 @@ def main():
     if reference == root:
         raise RuntimeError("Reference must not be the experiment checkout")
     changed = "csrc/rocm/moe_q_gemm_rdna2.cu"
-    for source in (root / "csrc").rglob("*"):
-        if source.is_file() and source.suffix in (".cu", ".cpp", ".cuh", ".h"):
-            relative = source.relative_to(root)
+    tracked = (
+        subprocess.check_output(["git", "ls-files", "-z", "csrc"], cwd=root)
+        .decode()
+        .split("\0")
+    )
+    for name in filter(None, tracked):
+        source = root / name
+        if source.suffix in (".cu", ".cpp", ".cuh", ".h"):
+            relative = Path(name)
             if str(relative) != changed and sha(source) != sha(reference / relative):
                 raise RuntimeError(f"Unqualified additional native change: {relative}")
     protected = reference / "vllm/_rocm_C.abi3.so"
