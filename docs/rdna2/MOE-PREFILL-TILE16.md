@@ -13,11 +13,23 @@ experts128/512 and group128 for both projections. All other configurations and
 decode retain the original route. This experiment does not change graphs,
 batch size, scheduling, MTP, PLE or the 64GiB RAM KV cache.
 
-The regression test was run before implementation and failed with unsupported
-block_size_m16. After the isolated native rebuild, all eight comparisons passed:
-both expert projection shapes, both accumulation modes, and tile8/tile16 versus
-tile4. The existing tolerance was not changed. These are kernel tests, not
-model-quality clearance or evidence of a whole-model throughput improvement.
+The regression tests were run before implementation and failed with unsupported
+block_size_m16/32. After the isolated native rebuild, all24 targeted comparisons
+pass: both expert projection shapes, both accumulation modes, unweighted output
+and weighted top-k reduction, and tile8/16/32 versus tile4. The existing tolerance
+was not changed. These are kernel tests, not model-quality clearance or evidence
+of a whole-model throughput improvement.
+
+The first tile16 variant spilled116–120bytes per thread and lost5.57% whole-model
+prefill against bracketing controls. Staging one packed weight word at a time
+eliminated those spills. The current wide variant uses two output columns per
+thread, retaining four for original tiles, and FP16 pair CAS rather than the
+original quad CAS. Per-element rounding and selected accumulation dtype stay
+the same; reduction order remains nondeterministic as in the original kernel.
+At4096 synthetic rows the complete expert-only helper measures tile16=8.666ms
+against tile8=9.093/9.119ms (about5% component gain). Actual loaded TP4 and normal
+generation tests must establish whether there is a useful model-level gain.
+Padding-aware tile32 measures20.501ms and is rejected, not a serving setting.
 
 The measurement extension compares actual loaded resident weights/routing, then
 performs serialized tile8/tile16/tile8 full-prefill stage trials. Only normal
