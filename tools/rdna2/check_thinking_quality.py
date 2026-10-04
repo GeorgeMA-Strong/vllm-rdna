@@ -37,6 +37,7 @@ def main() -> None:
         "token_floor": args.token_floor,
         "started_at": utc_now(),
         "status": "running",
+        "engine_errors": 0,
         "suites": {},
     }
     for name in ("regular", "coding"):
@@ -78,6 +79,14 @@ def main() -> None:
             print(
                 f"{case['id']}: {trial['passed']} ({trial['score_detail']})", flush=True
             )
+            if not trial["ok"]:
+                # An engine failure is not an incorrect model answer. Stop
+                # before disconnected requests pollute the accuracy denominator.
+                result["engine_errors"] += 1
+                result["status"] = "invalid"
+                result["finished_at"] = utc_now()
+                write_json_atomic(args.output, result)
+                raise SystemExit(2)
     result["status"] = "complete"
     result["finished_at"] = utc_now()
     write_json_atomic(args.output, result)
