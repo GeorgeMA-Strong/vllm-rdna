@@ -96,7 +96,7 @@ def _ple_grouped_norm_reference(
 def test_amd_ple_prefill_packs_once_and_preserves_output_and_state(
     monkeypatch, lengths, device
 ):
-    """Ragged prefill must not duplicate full token buffers for packing/output."""
+    """Ragged prefill packs directly into history without duplicate outputs."""
     from types import SimpleNamespace
 
     import torch.nn.functional as F
@@ -174,7 +174,7 @@ def test_amd_ple_prefill_packs_once_and_preserves_output_and_state(
         )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
-    assert allocated_packs == [(count, hidden, max(lengths))]
+    assert allocated_packs == [(count, hidden, max(lengths) + state_len)]
     assert not empty_outputs
 
 
