@@ -622,6 +622,8 @@ def _run_resident_skinny(layer, x, ids, weights, emap, act, out):
 @pytest.mark.parametrize("m", [1, 3, 4, 6, 9, 12])
 @pytest.mark.parametrize("k,n", [(256, 128), (2560, 640)])
 def test_resident_skinny_decode_reference_and_graph(m, k, n):
+    from types import SimpleNamespace
+
     if not hasattr(torch.ops._rocm_C, "moe_resident_int4_decode"):
         pytest.skip("resident skinny op not built")
     layer, x, ids, weights, emap, w13, w2 = _resident_skinny_case(m, k, n)
@@ -645,6 +647,24 @@ def test_resident_skinny_decode_reference_and_graph(m, k, n):
     _run_resident_skinny(layer, x, ids, weights, emap, act, out)
     torch.testing.assert_close(out, reference(), atol=3e-3, rtol=1e-2)
     assert torch.isfinite(out).all()
+
+    # Exercise the serving dispatcher too, including verification batches
+    # larger than the original four-row eligibility gate.
+    layer.skinny_decode = True
+    layer.group_size = 128
+    serving_layer = SimpleNamespace(
+        _rdna2_resident=layer,
+        activation=MoEActivation.SILU,
+        apply_router_weight_on_input=False,
+        expert_map=emap,
+        global_num_experts=emap.numel(),
+    )
+    torch.testing.assert_close(
+        apply_resident(serving_layer, x, weights, ids),
+        reference(),
+        atol=3e-3,
+        rtol=1e-2,
+    )
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
