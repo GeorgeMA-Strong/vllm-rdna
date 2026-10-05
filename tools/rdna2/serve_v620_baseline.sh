@@ -44,7 +44,7 @@ command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
     --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
     --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
     --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4026531840
-    --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,12]}'
+    --compilation-config "${V620_COMPILATION_CONFIG:-{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[3,6,12]}}"
     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
     --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
     --default-chat-template-kwargs '{"enable_thinking":false}'
@@ -58,7 +58,11 @@ fi
 if [[ ${V620_SKIP_MM_PROFILING:-0} == 1 ]]; then
     command+=(--skip-mm-profiling)
 fi
+if [[ -n ${V620_WORKER_EXTENSION:-} ]]; then
+    command+=(--worker-extension-cls "$V620_WORKER_EXTENSION")
+fi
 if [[ ${1:-} == --dry-run ]]; then
+    env | LC_ALL=C sort | grep -E '^(V620_|VLLM_|PYTORCH_|TORCH_|TRITON_|HSA_|OMP_|HF_|TRANSFORMERS_|TOKENIZERS_|PYTHONFAULTHANDLER=|PYTHONPATH=|LD_LIBRARY_PATH=|PATH=)'
     printf '%q ' "${command[@]}"
     printf '\n'
     exit 0
