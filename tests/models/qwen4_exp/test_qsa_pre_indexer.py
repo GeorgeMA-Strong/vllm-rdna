@@ -102,6 +102,8 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     torch.manual_seed(42)
     dtype = torch.float16 if backend == "rocm_fp16" else torch.bfloat16
     if backend == "rocm_fp16":
+        if not mrope:
+            pytest.skip("The opt-in RDNA fusion requires interleaved MRoPE")
         from vllm.model_executor.layers.layernorm import GemmaRMSNorm
         from vllm.models.qwen4_exp.amd.indexer_qsa import (
             apply_qsa_rmsnorm,

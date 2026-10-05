@@ -29,14 +29,10 @@ def supports_fused_pre_indexer(
     mrope_section = getattr(rotary_emb, "mrope_section", None)
     return (
         bool(getattr(rotary_emb, "is_neox_style", False))
-        and (
-            not mrope_section
-            or (
-                len(mrope_section) == 3
-                and sum(mrope_section) == rotary_dim // 2
-                and bool(getattr(rotary_emb, "mrope_interleaved", False))
-            )
-        )
+        and mrope_section is not None
+        and len(mrope_section) == 3
+        and sum(mrope_section) == rotary_dim // 2
+        and bool(getattr(rotary_emb, "mrope_interleaved", False))
         and head_dim == 128
         and rotary_dim == 64
         and num_kv_heads == 1
@@ -58,6 +54,7 @@ def _norm_rope(
     IS_MROPE: tl.constexpr,
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
+    IS_COMPRESSED: tl.constexpr,
 ):
     """Apply Gemma RMSNorm and selected-axis NeoX RoPE to register rows."""
     TILE_T: tl.constexpr = x.shape[0]
@@ -136,7 +133,13 @@ def _norm_rope(
         r0, r1 = r0.to(tl.float32), r1.to(tl.float32)
         cos, sin = cos.to(tl.float32), sin.to(tl.float32)
     out0 = (r0 * cos - r1 * sin).to(y.dtype)
-    out1 = (r1 * cos + r0 * sin).to(y.dtype)
+    if IS_MROPE and IS_COMPRESSED:
+        # The existing single-head MRoPE rounds r1*cos first, then fuses the
+        # other product. LLVM otherwise chooses the opposite contraction in
+        # this CTA layout, changing cancellation-sensitive FP16 results.
+        out1 = tl.fma(r0, sin, r1 * cos).to(y.dtype)
+    else:
+        out1 = (r1 * cos + r0 * sin).to(y.dtype)
     rotated = tl.reshape(tl.permute(tl.join(out0, out1), (0, 2, 1)), (ROWS, HALF))
     result = tl.reshape(tl.permute(tl.join(rotated, passthrough), (0, 2, 1)), (ROWS, D))
     return tl.reshape(result, (TILE_T, TILE_H, D))
@@ -245,6 +248,7 @@ def _qsa_pre_indexer_kernel(
             IS_2D_POSITIONS,
             MROPE_H,
             MROPE_W,
+            False,
         )
         tl.store(
             q_out_ptr
@@ -403,6 +407,7 @@ def _qsa_pre_indexer_kernel(
                 IS_K_MROPE,
                 MROPE_H,
                 MROPE_W,
+                True,
             )
             compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
             compressed_row = compressed_slot % COMP_PAGE_SIZE
