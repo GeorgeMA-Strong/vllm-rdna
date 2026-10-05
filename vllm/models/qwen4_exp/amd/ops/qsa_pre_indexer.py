@@ -106,8 +106,24 @@ def _norm_rope(
     x = tl.reshape(x, (ROWS, D)).to(tl.float32)
     weight = tl.load(norm_weight_ptr + tl.arange(0, D)).to(tl.float32)
     # Match the HIP RMSNorm: four 32-lane sums, then the cross-wave sum.
-    squares = tl.reshape(x * x, (ROWS, 4, 32))
-    ssq = tl.sum(tl.sum(squares, axis=2), axis=1)
+    squares = x * x
+    dims = tl.arange(0, D)
+    for shift in tl.static_range(5):
+        partners = dims ^ (16 >> shift)
+        squares += tl.gather(
+            squares, tl.broadcast_to(partners[None, :], (ROWS, D)), axis=1
+        )
+    partials = tl.gather(
+        squares,
+        tl.broadcast_to((tl.arange(0, 4) * 32)[None, :], (ROWS, 4)),
+        axis=1,
+    )
+    for shift in tl.static_range(2):
+        partners = tl.arange(0, 4) ^ (2 >> shift)
+        partials += tl.gather(
+            partials, tl.broadcast_to(partners[None, :], (ROWS, 4)), axis=1
+        )
+    ssq = tl.reshape(tl.gather(partials, tl.full((ROWS, 1), 0, tl.int32), 1), (ROWS,))
     rrms = tl.rsqrt(ssq / D + eps)
     y = (x * rrms[:, None] * weight[None, :]).to(cos.dtype)
     rotated, passthrough = tl.split(
