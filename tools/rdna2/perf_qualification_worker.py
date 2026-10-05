@@ -146,7 +146,12 @@ class PerfQualificationWorker:
             maximum = 0.0
         else:
             expected = torch.load(path, weights_only=True)
-            torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.01)
+            torch.testing.assert_close(
+                actual,
+                expected,
+                atol=3e-3 if num_rows <= 12 else 0.1,
+                rtol=0.01,
+            )
             maximum = (actual - expected).abs().max().item()
         return {
             "rank": self.rank,
