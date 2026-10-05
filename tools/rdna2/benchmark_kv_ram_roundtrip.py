@@ -111,7 +111,42 @@ def main() -> None:
     result["session_a_reload"] = _stream_chat(args.base_url, args.model, continuation)
     time.sleep(args.settle_seconds)
     result["metrics_after_a_reload"] = _metrics(args.base_url)
+    result["content_valid"] = (
+        "ALPHA-SESSION-200K" in result["session_a_cold"]["text"]
+        and "BETA-SESSION-100K" in result["session_b_switch"]["text"]
+        and "ALPHA-SESSION-RELOADED" in result["session_a_reload"]["text"]
+    )
+
+    def counter(lines: list[str], name: str, label: str = "") -> float:
+        return sum(
+            float(line.rsplit(" ", 1)[1])
+            for line in lines
+            if line.startswith(name + "{") and label in line
+        )
+
+    for key, name, label in (
+        (
+            "cpu_to_gpu_bytes_reload_delta",
+            "vllm:kv_offload_total_bytes_total",
+            'transfer_type="CPU_to_GPU"',
+        ),
+        (
+            "external_hit_tokens_reload_delta",
+            "vllm:external_prefix_cache_hits_total",
+            "",
+        ),
+    ):
+        result[key] = counter(result["metrics_after_a_reload"], name, label) - counter(
+            result["metrics_after_b"], name, label
+        )
+    result["passed"] = (
+        result["content_valid"]
+        and result["cpu_to_gpu_bytes_reload_delta"] > 0
+        and result["external_hit_tokens_reload_delta"] > 0
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
+    if not result["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
