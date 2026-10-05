@@ -10,7 +10,13 @@ Initially inspected vLLM mainline: `155488d853a0bc42df227dbfc74005b3fd488e94`.
 Rechecked during implementation: `7867d6c52d4542c1b5da641f8ca79124be497ee3`.
 The sole additional commit is frontend model-not-found error wording
 ([PR59889](https://github.com/vllm-project/vllm/pull/59889)); it does not change
-prefill computation. RDNA head remains the pinned baseline above.
+prefill computation. RDNA head remained the pinned baseline at that check.
+On October 5, RDNA advanced to `121af1b4786feb60748afe2fd73c2a49d459dc8b`
+with PR36's opt-in adaptive scheduler; the experiment branch incorporates it
+with `VLLM_RDNA_DYNAMIC_PREFILL=0` for unchanged compute comparisons.
+Mainline advanced to `4a30c4cad01401d778adb03b029d9da767c59fed`;
+[the follow-up review](PREFILL-MAINLINE-UPDATE-20261005.md) covers newly merged
+QSA projection fusion and distinguishes compatibility/correctness changes.
 The official [v0.30.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.30.0)
 was published 2026-09-22. Findings below distinguish merged work from open PRs;
 release numbering alone does not imply the AMD model uses NVIDIA optimizations.
