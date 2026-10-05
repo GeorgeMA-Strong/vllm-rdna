@@ -88,7 +88,7 @@ def main():
                 "--timeout",
                 "1800",
                 "--request-tag-scope",
-                "perf-qualification-20261005",
+                f"perf-qualification-20261005-c{concurrency}",
                 "--output",
                 str(args.directory / f"c{concurrency}.json"),
                 "--command",
