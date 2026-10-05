@@ -74,7 +74,14 @@ def main():
         text=True,
     )
     print(hipify, flush=True)
-    hip_source = Path(hipify.strip().splitlines()[-1]).resolve()
+    hip_sources = [
+        Path(line.strip()).resolve()
+        for line in hipify.splitlines()
+        if line.strip().endswith(f"/{args.kernel}.hip")
+    ]
+    if len(hip_sources) != 1:
+        raise RuntimeError("Hipify did not identify exactly one selected kernel")
+    hip_source = hip_sources[0]
     if not hip_source.is_relative_to(root) or not hip_source.is_file():
         raise RuntimeError("Hipify did not return an isolated generated source")
     # Quoted includes next to the source must resolve to the qualified,
@@ -83,14 +90,23 @@ def main():
     generated.mkdir(exist_ok=True)
     generated_source = generated / hip_source.name
     shutil.copy2(hip_source, generated_source)
-    obj = f"CMakeFiles/_rocm_C.dir/csrc/rocm/{args.kernel}.hip.o"
+    commands = subprocess.check_output(
+        [str(ninja), "-t", "commands", "_rocm_C"],
+        cwd=base_build,
+        env=env,
+        text=True,
+    ).splitlines()
+    command = next(
+        line
+        for line in commands
+        if " -c " in line and shlex.split(line)[-1].endswith(f"/{args.kernel}.hip")
+    )
+    values = shlex.split(command)
+    obj = values[values.index("-o") + 1]
+    if Path(obj).is_absolute() or ".." in Path(obj).parts:
+        raise RuntimeError("Expected a relative native object target")
     output_obj = build / obj
     output_obj.parent.mkdir(parents=True, exist_ok=True)
-    commands = subprocess.check_output(
-        [str(ninja), "-t", "commands", obj], cwd=base_build, env=env, text=True
-    ).splitlines()
-    command = next(line for line in commands if obj in line and " -c " in line)
-    values = shlex.split(command)
     values.insert(1, "-I" + str(base_build / "csrc/rocm"))
     for flag, value in (
         ("-MT", output_obj),
