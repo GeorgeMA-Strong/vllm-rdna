@@ -91,6 +91,93 @@ def _ple_grouped_norm_reference(
     return (normalized.flatten(-2) * (1.0 + weight.float())).to(input_dtype)
 
 
+@pytest.mark.parametrize("lengths", [[17], [9, 0, 4, 7]])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_amd_ple_prefill_packs_once_and_preserves_output_and_state(
+    monkeypatch, lengths, device
+):
+    """Ragged prefill must not duplicate full token buffers for packing/output."""
+    from types import SimpleNamespace
+
+    import torch.nn.functional as F
+
+    import vllm.models.qwen4_exp.amd.ple_layer as ple
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("Requires a GPU")
+    monkeypatch.setattr(ple, "ple_conv_use_rdna2", lambda: False)
+    torch.manual_seed(620)
+    count, hidden, state_len = len(lengths), 8, 4
+    starts = [0]
+    for length in lengths:
+        starts.append(starts[-1] + length)
+    slots = [1] if count == 1 else [1, 2, 0, 3]
+    initial = [False] if count == 1 else [True, False, True, False]
+    x = torch.randn(starts[-1], hidden, dtype=torch.float16, device=device)
+    weights = torch.randn(hidden, 3, dtype=x.dtype, device=device)
+    state = torch.randn(count + 1, hidden, state_len + 2, dtype=x.dtype, device=device)
+    expected_state = state.clone()
+    packed = x.new_zeros((count, hidden, max(lengths)))
+    histories = []
+    for row, (length, slot, has_initial) in enumerate(zip(lengths, slots, initial)):
+        packed[row, :, :length] = x[starts[row] : starts[row + 1]].T
+        previous = (
+            state[slot, :, :state_len]
+            if slot and has_initial
+            else state.new_zeros((hidden, state_len))
+        )
+        history = torch.cat((previous, packed[row]), dim=-1)
+        histories.append(history)
+        if slot and length:
+            expected_state[slot, :, :state_len] = history[
+                :, length : length + state_len
+            ]
+    expected = F.silu(
+        F.conv1d(
+            torch.stack(histories), weights.unsqueeze(1), groups=hidden, dilation=2
+        )
+    ).transpose(1, 2)
+    expected = torch.cat(
+        [
+            expected[row, :length] if slot else torch.zeros_like(expected[row, :length])
+            for row, (length, slot) in enumerate(zip(lengths, slots))
+        ]
+    )
+    allocated_packs, empty_outputs = [], []
+    original_zeros, original_empty = torch.Tensor.new_zeros, torch.empty_like
+
+    def new_zeros(tensor, size, **kwargs):
+        allocated_packs.append(tuple(size))
+        return original_zeros(tensor, size, **kwargs)
+
+    def empty_like(tensor, **kwargs):
+        empty_outputs.append(tuple(tensor.shape))
+        return original_empty(tensor, **kwargs)
+
+    with monkeypatch.context() as allocation_hooks, torch.inference_mode():
+        allocation_hooks.setattr(torch.Tensor, "new_zeros", new_zeros)
+        allocation_hooks.setattr(torch, "empty_like", empty_like)
+        actual = ple.Qwen4ExpPLELayer._short_conv_dilated_prefill_batched(
+            SimpleNamespace(conv_state_len=state_len, short_conv_dilation=2),
+            x,
+            SimpleNamespace(
+                non_spec_query_start_loc=torch.tensor(starts, device=device),
+                has_initial_states_p=torch.tensor(initial, device=device),
+                max_prefill_query_len=max(lengths),
+            ),
+            state,
+            weights,
+            torch.tensor(slots, device=device),
+            count,
+            0,
+            starts[-1],
+        )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
+    assert allocated_packs == [(count, hidden, max(lengths))]
+    assert not empty_outputs
+
+
 @create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize("group_size", [None, 8])
 def test_amd_ple_grouped_norm_cpu_fallback_matches_reference(
