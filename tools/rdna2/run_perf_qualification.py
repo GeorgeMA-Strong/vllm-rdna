@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[1, 3])
     parser.add_argument("--suite", default="coding")
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--request-tag-scope", default="perf-qualification-20261005")
     parser.add_argument("--launch", type=Path, required=True)
     parser.add_argument("--census", action="store_true")
     parser.add_argument("--save-reference", type=Path)
@@ -88,7 +89,7 @@ def main():
                 "--timeout",
                 "1800",
                 "--request-tag-scope",
-                f"perf-qualification-20261005-c{concurrency}",
+                f"{args.request_tag_scope}-c{concurrency}",
                 "--output",
                 str(args.directory / f"c{concurrency}.json"),
                 "--command",
@@ -110,6 +111,15 @@ def main():
                     stderr=subprocess.STDOUT,
                     check=True,
                 )
+            report_path = args.directory / f"c{concurrency}.json"
+            report = json.loads(report_path.read_text())
+            rows = report.get("performance_table", [])
+            if (
+                report.get("status") != "complete"
+                or not rows
+                or any(not row.get("performance_valid") for row in rows)
+            ):
+                raise RuntimeError(f"Invalid benchmark report: {report_path}")
         finally:
             if args.census:
                 end = rpc(args.base_url, "end_perf_phase", {})
