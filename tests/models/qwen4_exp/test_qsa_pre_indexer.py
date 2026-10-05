@@ -331,6 +331,31 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     compressed_rows = gemma_rmsnorm(pooled.reshape(-1, D), k_weight, EPS).reshape(
         -1, 1, D
     )
+    if backend == "rocm_fp16":
+        # Identity RoPE isolates the native norm's FP16 rounding boundary.
+        norm_query = torch.empty_like(compressed_rows)
+        qsa_pre_indexer(
+            pooled.reshape(-1, D),
+            pooled.reshape(-1, D),
+            torch.zeros_like(positions),
+            rope.cos_sin_cache,
+            fused_k_weight,
+            fused_k_weight,
+            EPS,
+            norm_query,
+            fused_raw,
+            raw_slots,
+            raw_block_table,
+            query_start_loc,
+            logical_positions,
+            fused_compressed,
+            compressed_slots,
+            torch.full_like(k_work_metadata, -1),
+            compress_ratio=CR,
+            mrope_section=MROPE_SECTION if mrope else None,
+            rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
+        )
+        torch.testing.assert_close(norm_query, compressed_rows, rtol=0, atol=0)
     group_positions = (
         first_positions.transpose(0, 1) if mrope else first_positions[:, 0]
     )
