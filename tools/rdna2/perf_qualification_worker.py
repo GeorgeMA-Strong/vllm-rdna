@@ -100,12 +100,16 @@ class PerfQualificationWorker:
         }
 
     @torch.inference_mode()
-    def check_actual_moe_weights(self, directory: str, save: bool = False):
+    def check_actual_moe_weights(
+        self, directory: str, save: bool = False, num_rows: int = 4096
+    ):
         """Compare the loaded resident experts with a saved baseline output."""
         from vllm.model_executor.layers.quantization.rdna2_moe_resident import (
             apply_resident,
         )
 
+        if not 1 <= num_rows <= 4096:
+            raise ValueError("Actual-weight probe rows must be in 1..4096")
         layer = next(
             module
             for module in self.model_runner.model.modules()
@@ -115,21 +119,26 @@ class PerfQualificationWorker:
         weight = native.w13_weight_scale
         generator = torch.Generator(device=weight.device).manual_seed(620)
         x = torch.randn(
-            4096, 2560, dtype=weight.dtype, device=weight.device, generator=generator
+            num_rows,
+            2560,
+            dtype=weight.dtype,
+            device=weight.device,
+            generator=generator,
         )
         ids = torch.randint(
             0,
             512,
-            (4096, 10),
+            (num_rows, 10),
             device=weight.device,
             dtype=torch.int32,
             generator=generator,
         )
         routing = torch.softmax(
-            torch.randn(4096, 10, device=weight.device, generator=generator), dim=-1
+            torch.randn(num_rows, 10, device=weight.device, generator=generator), dim=-1
         )
         actual = apply_resident(layer, x, routing, ids).cpu()
-        path = Path(directory) / f"resident-rank{self.rank}.pt"
+        suffix = "" if num_rows == 4096 else f"-m{num_rows}"
+        path = Path(directory) / f"resident{suffix}-rank{self.rank}.pt"
         if save:
             if path.exists():
                 raise RuntimeError(f"Refusing to replace {path}")
@@ -139,4 +148,9 @@ class PerfQualificationWorker:
             expected = torch.load(path, weights_only=True)
             torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.01)
             maximum = (actual - expected).abs().max().item()
-        return {"rank": self.rank, "saved": save, "max_abs": maximum}
+        return {
+            "rank": self.rank,
+            "rows": num_rows,
+            "saved": save,
+            "max_abs": maximum,
+        }
