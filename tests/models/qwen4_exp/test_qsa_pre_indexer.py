@@ -397,7 +397,10 @@ def test_qsa_fused_pre_indexer_matches_unfused(
                 max_seq_len=max(seq_lens),
             )
 
+        # Native top-k emits threshold-bin winners in atomic arrival order.
+        # Even repeated unfused calls can permute complete blocks; the selected
+        # token set (including the tail and -1 padding) is the public contract.
         assert torch.equal(
-            select(fused_query, fused_compressed),
-            select(unfused_query, unfused_compressed),
+            select(fused_query, fused_compressed).sort(dim=1).values,
+            select(unfused_query, unfused_compressed).sort(dim=1).values,
         )

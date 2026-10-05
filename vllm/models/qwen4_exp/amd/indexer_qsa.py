@@ -152,6 +152,10 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
             )
         )
+        if self.use_fused_pre_indexer:
+            from vllm.platforms.rocm import on_gfx10x
+
+            self.use_fused_pre_indexer = on_gfx10x()
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
