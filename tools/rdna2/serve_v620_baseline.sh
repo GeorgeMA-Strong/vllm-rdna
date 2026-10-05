@@ -63,6 +63,11 @@ if [[ ${V620_SKIP_MM_PROFILING:-0} == 1 ]]; then
     command+=(--skip-mm-profiling)
 fi
 if [[ -n ${V620_WORKER_EXTENSION:-} ]]; then
+    if [[ $host != 127.0.0.1 && $host != localhost && $host != ::1 ]]; then
+        printf 'Diagnostic worker RPC requires a loopback host.\n' >&2
+        exit 2
+    fi
+    export VLLM_SERVER_DEV_MODE=1
     command+=(--worker-extension-cls "$V620_WORKER_EXTENSION")
 fi
 if [[ ${1:-} == --dry-run ]]; then
