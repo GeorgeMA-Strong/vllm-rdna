@@ -38,13 +38,17 @@ export PATH="$runtime/.venv/bin:/opt/rocm/core-10.0/bin:/opt/rocm/core-10.0/llvm
 export LD_LIBRARY_PATH="$sdk/lib:$sdk/lib/host-math/lib:/opt/rocm/core-10.0/lib"
 source "$source_dir/tools/rdna2/tunableop_env.sh"
 configure_v620_tunableop "$runtime/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5" "$runtime/tunableop"
+compilation_config=${V620_COMPILATION_CONFIG:-}
+if [[ -z $compilation_config ]]; then
+    compilation_config='{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,6,12]}'
+fi
 command=("$runtime/.venv/bin/python" -m vllm.entrypoints.openai.api_server
     --model "$model" --served-model-name active qwen3.8-flash-next
     --host "$host" --port "$port" --tensor-parallel-size 4
     --pipeline-parallel-size 1 --enable-expert-parallel --enable-ep-weight-filter
     --dtype float16 --max-model-len 262144 --block-size 1024 --max-num-seqs 4
     --max-num-batched-tokens 4096 --kv-cache-memory-bytes 4026531840
-    --compilation-config "${V620_COMPILATION_CONFIG:-{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[3,6,12]}}"
+    --compilation-config "$compilation_config"
     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
     --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
     --default-chat-template-kwargs '{"enable_thinking":false}'
