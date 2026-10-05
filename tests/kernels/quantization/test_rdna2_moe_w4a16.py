@@ -177,9 +177,11 @@ def test_fused_moe_w1_matches_dense(
 
 
 @gfx1030_only
-def test_v620_moe_prefill_tile8_matches_tile4():
+@pytest.mark.parametrize("hidden,gate_up", [(2560, 1280), (640, 2560)])
+@pytest.mark.parametrize("tokens", [64, 4096])
+def test_v620_moe_prefill_tile8_matches_tile4(hidden, gate_up, tokens):
     """The qualified V620 expert shape must preserve the existing tile output."""
-    experts, hidden, gate_up, top_k, group_size, tokens = 16, 2560, 1280, 10, 128, 64
+    experts, top_k, group_size = 16, 10, 128
     torch.manual_seed(42)
     x = torch.randn(tokens, hidden, dtype=torch.float16, device=device)
     weight = _make_packed_weights(experts, hidden, gate_up)
@@ -696,17 +698,42 @@ def _run_moe_for_accum_test(
     si, ei, ntp = moe_align_block_size(topk_ids, block_size_m, E)
     if mul_topk_weight:
         topk_w = torch.softmax(
-            torch.randn(M * top_k, device=device), dim=-1,
+            torch.randn(M * top_k, device=device),
+            dim=-1,
         ).float()
     else:
         topk_w = torch.empty(0, device=device, dtype=torch.float32)
     out = torch.zeros(M * top_k, N, dtype=torch.float16, device=device)
     ops.moe_gptq_gemm_rdna2(
-        x, out, w, s, z, topk_w, si, ei, ntp, top_k, block_size_m,
-        mul_topk_weight, output_topk, fp32_accum,
+        x,
+        out,
+        w,
+        s,
+        z,
+        topk_w,
+        si,
+        ei,
+        ntp,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+        fp32_accum,
     )
-    return out, (x, w, s, z, topk_w, si, ei, ntp, top_k, block_size_m,
-                 mul_topk_weight, output_topk)
+    return out, (
+        x,
+        w,
+        s,
+        z,
+        topk_w,
+        si,
+        ei,
+        ntp,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+    )
 
 
 @gfx1030_only
@@ -723,7 +750,14 @@ def _run_moe_for_accum_test(
 )
 @pytest.mark.parametrize("mul_topk_weight", [False, True])
 def test_fp32_accum_run_to_run_stable(
-    E, K, N, top_k, group_size, block_size_m, M, mul_topk_weight,
+    E,
+    K,
+    N,
+    top_k,
+    group_size,
+    block_size_m,
+    M,
+    mul_topk_weight,
 ):
     """fp32 accumulation is run-to-run stable within fp16 noise budget.
 
@@ -737,12 +771,30 @@ def test_fp32_accum_run_to_run_stable(
     rounding to fp16 exactly once at the end.
     """
     out_a, params = _run_moe_for_accum_test(
-        True, E, K, N, M, top_k, group_size, block_size_m,
-        seed=1234, mul_topk_weight=mul_topk_weight, output_topk=0,
+        True,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=1234,
+        mul_topk_weight=mul_topk_weight,
+        output_topk=0,
     )
     out_b, _ = _run_moe_for_accum_test(
-        True, E, K, N, M, top_k, group_size, block_size_m,
-        seed=1234, mul_topk_weight=mul_topk_weight, output_topk=0,
+        True,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=1234,
+        mul_topk_weight=mul_topk_weight,
+        output_topk=0,
     )
     assert torch.isfinite(out_a).all() and torch.isfinite(out_b).all()
     diff_fp16 = (out_a.float() - out_b.float()).abs().max().item()
@@ -760,8 +812,17 @@ def test_fp32_accum_run_to_run_stable(
     # when it happens to match by luck would be unsafe, so we just assert
     # the fp32 path's noise budget holds.
     out_cas, _ = _run_moe_for_accum_test(
-        False, E, K, N, M, top_k, group_size, block_size_m,
-        seed=1234, mul_topk_weight=mul_topk_weight, output_topk=0,
+        False,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=1234,
+        mul_topk_weight=mul_topk_weight,
+        output_topk=0,
     )
     assert torch.isfinite(out_cas).all()
 
@@ -777,7 +838,13 @@ def test_fp32_accum_run_to_run_stable(
     ],
 )
 def test_fp32_accum_rel_l2_vs_cas(
-    E, K, N, top_k, group_size, block_size_m, M,
+    E,
+    K,
+    N,
+    top_k,
+    group_size,
+    block_size_m,
+    M,
 ):
     """fp32 accumulation is close to the CAS path on every legal shape.
 
@@ -788,12 +855,30 @@ def test_fp32_accum_rel_l2_vs_cas(
     8-wide expert sums at fp16.
     """
     fp32_out, _ = _run_moe_for_accum_test(
-        True, E, K, N, M, top_k, group_size, block_size_m,
-        seed=99, mul_topk_weight=True, output_topk=0,
+        True,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=99,
+        mul_topk_weight=True,
+        output_topk=0,
     )
     cas_out, _ = _run_moe_for_accum_test(
-        False, E, K, N, M, top_k, group_size, block_size_m,
-        seed=99, mul_topk_weight=True, output_topk=0,
+        False,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=99,
+        mul_topk_weight=True,
+        output_topk=0,
     )
     fp32_f = fp32_out.float()
     cas_f = cas_out.float()
@@ -824,15 +909,28 @@ def test_fp32_accum_cudagraph_capture_stable():
     topk_ids = torch.randint(0, E, (M, top_k), device=device, dtype=torch.int32)
     si, ei, ntp = moe_align_block_size(topk_ids, block_size_m, E)
     topk_w = torch.softmax(
-        torch.randn(M * top_k, device=device), dim=-1,
+        torch.randn(M * top_k, device=device),
+        dim=-1,
     ).float()
     out = torch.zeros(M * top_k, N, dtype=torch.float16, device=device)
 
     # Eager reference run.
     out_eager = out.clone()
     ops.moe_gptq_gemm_rdna2(
-        x, out_eager, w, s, z, topk_w, si, ei, ntp, top_k, block_size_m,
-        True, 0, True,
+        x,
+        out_eager,
+        w,
+        s,
+        z,
+        topk_w,
+        si,
+        ei,
+        ntp,
+        top_k,
+        block_size_m,
+        True,
+        0,
+        True,
     )
 
     # Capture + replay cycle.
@@ -840,8 +938,20 @@ def test_fp32_accum_cudagraph_capture_stable():
     out_capture = torch.zeros(M * top_k, N, dtype=torch.float16, device=device)
     with torch.cuda.graph(graph):
         ops.moe_gptq_gemm_rdna2(
-            x, out_capture, w, s, z, topk_w, si, ei, ntp, top_k, block_size_m,
-            True, 0, True,
+            x,
+            out_capture,
+            w,
+            s,
+            z,
+            topk_w,
+            si,
+            ei,
+            ntp,
+            top_k,
+            block_size_m,
+            True,
+            0,
+            True,
         )
 
     # New inputs on replay; the captured graph must compute against them.
@@ -849,15 +959,28 @@ def test_fp32_accum_cudagraph_capture_stable():
     topk_ids2 = torch.randint(0, E, (M, top_k), device=device, dtype=torch.int32)
     si2, ei2, ntp2 = moe_align_block_size(topk_ids2, block_size_m, E)
     topk_w2 = torch.softmax(
-        torch.randn(M * top_k, device=device), dim=-1,
+        torch.randn(M * top_k, device=device),
+        dim=-1,
     ).float()
 
     # Build the captured graph's expected output by running eagerly on the
     # new inputs; then replay and compare.
     out_replay = out_capture.clone()
     ops.moe_gptq_gemm_rdna2(
-        x2, out_replay, w, s, z, topk_w2, si2, ei2, ntp2, top_k, block_size_m,
-        True, 0, True,
+        x2,
+        out_replay,
+        w,
+        s,
+        z,
+        topk_w2,
+        si2,
+        ei2,
+        ntp2,
+        top_k,
+        block_size_m,
+        True,
+        0,
+        True,
     )
     out_capture.zero_()
     x.copy_(x2)
@@ -883,12 +1006,30 @@ def test_fp32_accum_default_off_byte_identical_to_cas(monkeypatch):
     monkeypatch.setattr(ops, "_RDNA2_MOE_FP32_ACCUM", False)
     E, K, N, top_k, group_size, block_size_m, M = 16, 256, 512, 8, 32, 4, 4
     out_default, _ = _run_moe_for_accum_test(
-        None, E, K, N, M, top_k, group_size, block_size_m,
-        seed=1234, mul_topk_weight=True, output_topk=0,
+        None,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=1234,
+        mul_topk_weight=True,
+        output_topk=0,
     )
     out_cas, _ = _run_moe_for_accum_test(
-        False, E, K, N, M, top_k, group_size, block_size_m,
-        seed=1234, mul_topk_weight=True, output_topk=0,
+        False,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=1234,
+        mul_topk_weight=True,
+        output_topk=0,
     )
     assert torch.equal(out_default, out_cas), (
         "fp32_accum=None (module default off) must be byte-identical to "
@@ -907,12 +1048,30 @@ def test_fp32_accum_env_on_enables_fp32_scratch(monkeypatch):
     monkeypatch.setattr(ops, "_RDNA2_MOE_FP32_ACCUM", True)
     E, K, N, top_k, group_size, block_size_m, M = 16, 2048, 512, 8, 32, 4, 4
     out_a, _ = _run_moe_for_accum_test(
-        None, E, K, N, M, top_k, group_size, block_size_m,
-        seed=1234, mul_topk_weight=True, output_topk=0,
+        None,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=1234,
+        mul_topk_weight=True,
+        output_topk=0,
     )
     out_b, _ = _run_moe_for_accum_test(
-        None, E, K, N, M, top_k, group_size, block_size_m,
-        seed=1234, mul_topk_weight=True, output_topk=0,
+        None,
+        E,
+        K,
+        N,
+        M,
+        top_k,
+        group_size,
+        block_size_m,
+        seed=1234,
+        mul_topk_weight=True,
+        output_topk=0,
     )
     assert torch.isfinite(out_a).all() and torch.isfinite(out_b).all()
     diff = (out_a.float() - out_b.float()).abs().max().item()
