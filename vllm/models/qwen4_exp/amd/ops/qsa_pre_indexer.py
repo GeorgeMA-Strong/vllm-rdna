@@ -10,7 +10,7 @@ FP32 accumulation and FP16 rounding boundary.
 import torch
 from torch import nn
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 
 
 def supports_fused_pre_indexer(
@@ -124,7 +124,8 @@ def _norm_rope(
             partials, tl.broadcast_to(partners[None, :], (ROWS, 4)), axis=1
         )
     ssq = tl.reshape(tl.gather(partials, tl.full((ROWS, 1), 0, tl.int32), 1), (ROWS,))
-    rrms = tl.rsqrt(ssq / D + eps)
+    # HIP rsqrtf uses OCML, not Triton's approximate hardware rsqrt.
+    rrms = tldevice.rsqrt(ssq / D + eps)
     y = (x * rrms[:, None] * weight[None, :]).to(cos.dtype)
     rotated, passthrough = tl.split(
         tl.permute(tl.reshape(y, (ROWS, 2, HALF)), (0, 2, 1))
