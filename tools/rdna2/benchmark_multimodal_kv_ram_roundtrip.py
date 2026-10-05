@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exercise multimodal prompt KV eviction and RAM-cache restoration."""
 
+import argparse
 import json
 import time
 import urllib.request
@@ -10,17 +11,14 @@ from typing import Any
 
 import pybase64 as base64
 
-BASE_URL = "http://127.0.0.1:8080"
-MODEL = "active"
-
 
 def _image_url(path: Path) -> str:
     encoded = base64.b64encode(path.read_bytes()).decode()
     return f"data:image/png;base64,{encoded}"
 
 
-def _metric_values() -> dict[str, float]:
-    with urllib.request.urlopen(f"{BASE_URL}/metrics", timeout=30) as response:
+def _metric_values(base_url: str) -> dict[str, float]:
+    with urllib.request.urlopen(f"{base_url}/metrics", timeout=30) as response:
         lines = response.read().decode().splitlines()
     wanted = {
         (
@@ -45,10 +43,12 @@ def _metric_values() -> dict[str, float]:
     return result
 
 
-def _stream_chat(messages: list[dict[str, Any]]) -> dict[str, Any]:
+def _stream_chat(
+    base_url: str, model: str, messages: list[dict[str, Any]]
+) -> dict[str, Any]:
     data = json.dumps(
         {
-            "model": MODEL,
+            "model": model,
             "messages": messages,
             "max_tokens": 64,
             "temperature": 0,
@@ -58,7 +58,7 @@ def _stream_chat(messages: list[dict[str, Any]]) -> dict[str, Any]:
         }
     ).encode()
     request = urllib.request.Request(
-        f"{BASE_URL}/v1/chat/completions",
+        f"{base_url}/v1/chat/completions",
         data=data,
         headers={"Content-Type": "application/json"},
     )
@@ -91,6 +91,10 @@ def _stream_chat(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--model", default="active")
+    args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     image1 = _image_url(repo / "tests/multimodal/assets/image1.png")
     image2 = _image_url(repo / "tests/multimodal/assets/image2.png")
@@ -108,11 +112,11 @@ def main() -> None:
     ]
     first_messages = [{"role": "user", "content": user_content}]
 
-    result: dict[str, Any] = {"metrics_before": _metric_values()}
-    cold = _stream_chat(first_messages)
+    result: dict[str, Any] = {"metrics_before": _metric_values(args.base_url)}
+    cold = _stream_chat(args.base_url, args.model, first_messages)
     result["multimodal_cold"] = cold
     time.sleep(15)
-    result["metrics_after_cold"] = _metric_values()
+    result["metrics_after_cold"] = _metric_values(args.base_url)
 
     pressure_messages = [
         {
@@ -124,9 +128,11 @@ def main() -> None:
             ),
         }
     ]
-    result["pressure_session"] = _stream_chat(pressure_messages)
+    result["pressure_session"] = _stream_chat(
+        args.base_url, args.model, pressure_messages
+    )
     time.sleep(15)
-    result["metrics_after_pressure"] = _metric_values()
+    result["metrics_after_pressure"] = _metric_values(args.base_url)
 
     continued_messages = [
         *first_messages,
@@ -138,15 +144,32 @@ def main() -> None:
             ),
         },
     ]
-    result["multimodal_reload"] = _stream_chat(continued_messages)
+    result["multimodal_reload"] = _stream_chat(
+        args.base_url, args.model, continued_messages
+    )
     time.sleep(15)
-    result["metrics_after_reload"] = _metric_values()
-    combined = (cold["text"] + " " + result["multimodal_reload"]["text"]).lower()
-    result["content_valid"] = all(
-        phrase in combined
-        for phrase in ("hello, ai world", "safe is important", "multimodal")
+    result["metrics_after_reload"] = _metric_values(args.base_url)
+    phrases = ("hello, ai world", "safe is important")
+    result["content_valid"] = (
+        all(phrase in cold["text"].lower() for phrase in phrases)
+        and "MULTIMODAL-A" in cold["text"]
+        and all(
+            phrase in result["multimodal_reload"]["text"].lower() for phrase in phrases
+        )
+        and "MULTIMODAL-RELOADED" in result["multimodal_reload"]["text"]
+        and "TEXT-B" in result["pressure_session"]["text"]
+    )
+    for key in ("cpu_to_gpu_bytes", "external_hit_tokens"):
+        result[key + "_reload_delta"] = result["metrics_after_reload"].get(
+            key, 0
+        ) - result["metrics_after_pressure"].get(key, 0)
+    result["passed"] = result["content_valid"] and all(
+        result[key + "_reload_delta"] > 0
+        for key in ("cpu_to_gpu_bytes", "external_hit_tokens")
     )
     print(json.dumps(result, indent=2, sort_keys=True))
+    if not result["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
