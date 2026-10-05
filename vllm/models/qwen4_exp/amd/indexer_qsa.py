@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import cast
 
 import torch
@@ -136,6 +137,21 @@ class QSAIndexer(nn.Module):
         # MTP step 0 selects the target-aligned rows; later steps reuse them
         # while continuing to update the QSA side cache.
         self.skip_topk = False
+        # Experimental, opt-in: keep the qualified unfused path as the default.
+        from .ops.qsa_pre_indexer import supports_fused_pre_indexer
+
+        self.use_fused_pre_indexer = (
+            os.getenv("VLLM_RDNA_QSA_FUSED_INDEXER", "0") == "1"
+            and current_platform.is_rocm()
+            and qsa_dtype == torch.float16
+            and self.index_n_heads == 4
+            and supports_fused_pre_indexer(
+                rotary_emb,
+                self.index_head_dim,
+                self.index_kv_heads,
+                self.compress_ratio,
+            )
+        )
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -216,6 +232,52 @@ class QSAIndexer(nn.Module):
         else:
             positions = first_rope_positions[:, 0]
         return apply_qsa_rope(self.rotary_emb, positions, keys)
+
+    def _fused_project_and_update(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        raw: QSAForwardMetadata,
+        compressed: QSAForwardMetadata,
+    ) -> torch.Tensor:
+        from .ops.qsa_pre_indexer import qsa_pre_indexer
+
+        qk, _ = self.index_qk_proj(hidden_states)
+        q = torch.empty(
+            (qk.shape[0], self.index_n_heads, self.index_head_dim),
+            dtype=qk.dtype,
+            device=qk.device,
+        )
+        # Cache only after checkpoint loading, just like apply_qsa_rmsnorm.
+        for norm in (self.q_layernorm, self.k_layernorm):
+            if getattr(norm, "_rdna_w1", None) is None:
+                norm._rdna_w1 = (norm.weight.float() + 1.0).to(qk.dtype).contiguous()
+        qsa_pre_indexer(
+            qk[:, : self.index_n_heads * self.index_head_dim],
+            qk[:, self.index_n_heads * self.index_head_dim :],
+            positions,
+            self.rotary_emb._match_cos_sin_cache_dtype(qk),
+            self.q_layernorm._rdna_w1,
+            self.k_layernorm._rdna_w1,
+            self.q_layernorm.variance_epsilon,
+            q,
+            self.raw_key_cache.kv_cache,
+            raw.slot_mapping,
+            raw.block_table,
+            raw.query_start_loc,
+            raw.logical_positions,
+            self.compressed_key_cache.kv_cache,
+            compressed.slot_mapping,
+            compressed.k_work_metadata,
+            compress_ratio=self.compress_ratio,
+            mrope_section=getattr(self.rotary_emb, "mrope_section", None),
+            rope_pos_offset=(
+                self.index_head_dim
+                if self.raw_key_cache.rope_position_cache is not None
+                else None
+            ),
+        )
+        return q
 
     def _metadata(
         self,
@@ -333,15 +395,23 @@ class QSAIndexer(nn.Module):
             return result
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
-        q, token_k = self.project_qk(
-            hidden_states[:num_tokens], positions[..., :num_tokens]
-        )
-        self._update_and_compress(
-            token_k,
-            positions[..., :num_tokens],
-            raw_metadata,
-            compressed_metadata,
-        )
+        if self.use_fused_pre_indexer:
+            q = self._fused_project_and_update(
+                hidden_states[:num_tokens],
+                positions[..., :num_tokens],
+                raw_metadata,
+                compressed_metadata,
+            )
+        else:
+            q, token_k = self.project_qk(
+                hidden_states[:num_tokens], positions[..., :num_tokens]
+            )
+            self._update_and_compress(
+                token_k,
+                positions[..., :num_tokens],
+                raw_metadata,
+                compressed_metadata,
+            )
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")

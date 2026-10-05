@@ -10,20 +10,12 @@ from vllm.models.qwen4_exp.common.qsa_cache import (
     circular_qsa_slot_mapping,
     compressed_qsa_slot_mapping,
 )
-from vllm.models.qwen4_exp.nvidia.indexer_qsa import apply_qsa_rope
-from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-    qsa_compress_groups_with_ratio,
-    qsa_store_cache_rows,
-)
-from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import (
-    qsa_pre_indexer,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
 requires_qsa_kernels = pytest.mark.skipif(
-    not current_platform.is_cuda() or not HAS_TRITON,
-    reason="QSA kernels require CUDA and Triton",
+    not (current_platform.is_cuda() or current_platform.is_rocm()) or not HAS_TRITON,
+    reason="QSA kernels require CUDA/ROCm and Triton",
 )
 
 HQ, D = 4, 128
@@ -52,6 +44,23 @@ def _make_block_table(block_counts):
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 @pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            "cuda_bf16",
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="NVIDIA reference"
+            ),
+        ),
+        pytest.param(
+            "rocm_fp16",
+            marks=pytest.mark.skipif(
+                not current_platform.is_rocm(), reason="AMD FP16 reference"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
     [
         pytest.param(True, True, True, 4, *MIXED_BATCH, id="mrope"),
@@ -71,9 +80,15 @@ def _make_block_table(block_counts):
         ),
         pytest.param(True, True, True, 4, [37], [37], [0], id="fresh"),
         pytest.param(True, True, True, 4, [4097], [4097], [0], id="tiled"),
+        pytest.param(True, True, True, 8, [260], [1], [8], id="decode-1"),
+        pytest.param(True, True, True, 8, [262], [3], [8], id="decode-3"),
+        pytest.param(True, True, True, 8, [262] * 2, [3] * 2, [8] * 2, id="decode-6"),
+        pytest.param(True, True, True, 8, [262] * 3, [3] * 3, [8] * 3, id="decode-9"),
+        pytest.param(True, True, True, 8, [262] * 4, [3] * 4, [8] * 4, id="decode-12"),
     ],
 )
 def test_qsa_fused_pre_indexer_matches_unfused(
+    backend,
     mrope,
     is_2d_positions,
     cache_rope_positions,
@@ -82,9 +97,41 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     query_lens,
     history_lens,
 ) -> None:
-    from flashinfer.norm import gemma_rmsnorm
-
     from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    torch.manual_seed(42)
+    dtype = torch.float16 if backend == "rocm_fp16" else torch.bfloat16
+    if backend == "rocm_fp16":
+        from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+        from vllm.models.qwen4_exp.amd.indexer_qsa import (
+            apply_qsa_rmsnorm,
+            apply_qsa_rope,
+        )
+        from vllm.models.qwen4_exp.amd.ops.qsa import (
+            qsa_compress_groups_with_ratio,
+            qsa_select_paged_tokens,
+            qsa_store_cache_rows,
+        )
+        from vllm.models.qwen4_exp.amd.ops.qsa_pre_indexer import qsa_pre_indexer
+
+        def amd_gemma_rmsnorm(x, weight, eps):
+            norm = GemmaRMSNorm(D, eps=eps).to(device=x.device, dtype=x.dtype)
+            with torch.no_grad():
+                norm.weight.copy_(weight)
+            return apply_qsa_rmsnorm(norm, x)
+
+        gemma_rmsnorm = amd_gemma_rmsnorm
+    else:
+        from flashinfer.norm import gemma_rmsnorm as cuda_gemma_rmsnorm
+
+        gemma_rmsnorm = cuda_gemma_rmsnorm
+
+        from vllm.models.qwen4_exp.nvidia.indexer_qsa import apply_qsa_rope
+        from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+            qsa_compress_groups_with_ratio,
+            qsa_store_cache_rows,
+        )
+        from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import qsa_pre_indexer
 
     device = "cuda"
     rope_params = {
@@ -100,7 +147,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
             head_size=256,
             max_position=32768,
             rope_parameters=rope_params,
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
 
     token_to_req = torch.cat(
@@ -188,7 +235,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     fused_raw_storage = torch.zeros(
         num_raw_blocks,
         raw_page_elements + 16,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device=device,
     )
     fused_raw = torch.as_strided(
@@ -201,7 +248,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         for position in range(history_end - history_len, history_end):
             block = int(raw_block_table[request, 0])
             row = fused_raw[block, position % state_size, 0]
-            row[:D] = torch.randn(D, dtype=torch.bfloat16, device=device)
+            row[:D] = torch.randn(D, dtype=dtype, device=device)
             if cache_rope_positions:
                 row[ROPE_POS_OFFSET:].view(torch.int64).copy_(
                     torch.tensor(
@@ -215,7 +262,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     fused_compressed_storage = torch.zeros(
         num_compressed_blocks,
         compressed_page_elements + 16,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device=device,
     )
     fused_compressed = torch.as_strided(
@@ -225,20 +272,23 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     )
     unfused_compressed = fused_compressed.clone()
 
-    projected_qk = torch.randn(
-        num_tokens, (HQ + 1) * D, dtype=torch.bfloat16, device=device
-    )
-    q_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
-    k_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
+    projected_qk = torch.randn(num_tokens, (HQ + 1) * D, dtype=dtype, device=device)
+    q_weight = torch.randn(D, dtype=dtype, device=device) * 0.2
+    k_weight = torch.randn(D, dtype=dtype, device=device) * 0.2
+    fused_q_weight = q_weight
+    fused_k_weight = k_weight
+    if backend == "rocm_fp16":
+        fused_q_weight = (q_weight.float() + 1.0).to(dtype)
+        fused_k_weight = (k_weight.float() + 1.0).to(dtype)
 
-    fused_query = torch.empty(num_tokens, HQ, D, dtype=torch.bfloat16, device=device)
+    fused_query = torch.empty(num_tokens, HQ, D, dtype=dtype, device=device)
     qsa_pre_indexer(
         projected_qk[:, : HQ * D],
         projected_qk[:, HQ * D :],
         positions,
         rope.cos_sin_cache,
-        q_weight,
-        k_weight,
+        fused_q_weight,
+        fused_k_weight,
         EPS,
         fused_query,
         fused_raw,
@@ -290,8 +340,28 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     if rope_positions is not None:
         qsa_store_cache_rows(rope_positions, raw_slots, position_rows)
 
-    torch.testing.assert_close(fused_query, unfused_query, rtol=RTOL, atol=ATOL)
+    # AMD FP16 uses PyTorch's strict default FP16 tolerance, not the donor's
+    # much looser BF16 tolerance. Raw keys/packed MRoPE positions remain exact.
+    tolerance = {} if backend == "rocm_fp16" else {"rtol": RTOL, "atol": ATOL}
+    torch.testing.assert_close(fused_query, unfused_query, **tolerance)
     assert torch.equal(fused_raw.view(torch.int16), unfused_raw.view(torch.int16))
-    torch.testing.assert_close(
-        fused_compressed, unfused_compressed, rtol=RTOL, atol=ATOL
-    )
+    torch.testing.assert_close(fused_compressed, unfused_compressed, **tolerance)
+    if backend == "rocm_fp16":
+
+        def select(query, cache):
+            return qsa_select_paged_tokens(
+                query,
+                cache,
+                compressed_block_table.to(device),
+                token_to_req,
+                logical_positions,
+                torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                12,
+                CR,
+                max_seq_len=max(seq_lens),
+            )
+
+        assert torch.equal(
+            select(fused_query, fused_compressed),
+            select(unfused_query, unfused_compressed),
+        )
