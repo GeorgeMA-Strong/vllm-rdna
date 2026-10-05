@@ -410,6 +410,13 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         assert torch.equal(fused_raw.view(torch.int16), unfused_raw.view(torch.int16))
         torch.testing.assert_close(fused_compressed, unfused_compressed, **tolerance)
         if backend == "rocm_fp16":
+            # Check the FP16 bit patterns too, including the sign of zero.
+            assert torch.equal(
+                fused_query.view(torch.int16), unfused_query.view(torch.int16)
+            )
+            assert torch.equal(
+                fused_compressed.view(torch.int16), unfused_compressed.view(torch.int16)
+            )
 
             def select(query, cache):
                 return qsa_select_paged_tokens(
@@ -425,8 +432,8 @@ def test_qsa_fused_pre_indexer_matches_unfused(
                 )
 
             # Native top-k emits threshold-bin winners in atomic arrival order.
-            # Even repeated unfused calls can permute complete blocks; the selected
-            # token set (including the tail and -1 padding) is the public contract.
+            # Compare unordered sets for these initialized fixtures, including
+            # tail/-1 padding; audit mismatches for reference cutoff-tie changes.
             selected_fused = select(fused_query, fused_compressed).sort(dim=1).values
             selected_reference = (
                 select(unfused_query, unfused_compressed).sort(dim=1).values
