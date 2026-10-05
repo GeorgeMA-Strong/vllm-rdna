@@ -1339,6 +1339,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
         gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated_value = gate * value.unsqueeze(-2)
+        # Release consumed projection buffers before convolution's workspace.
+        del embeddings, key, query, value, gate
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
         conv_output = torch.zeros_like(normalized)
         torch.ops.vllm.qwen4_exp_ple_short_conv(
