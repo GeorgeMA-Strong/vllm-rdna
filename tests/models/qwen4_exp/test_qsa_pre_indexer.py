@@ -259,7 +259,10 @@ def test_qsa_fused_pre_indexer_matches_unfused(
                         device=device,
                     )
                 )
-    unfused_raw = fused_raw.clone()
+    unfused_raw_storage = fused_raw_storage.clone()
+    unfused_raw = torch.as_strided(
+        unfused_raw_storage, fused_raw.shape, fused_raw.stride()
+    )
     compressed_page_elements = COMP_PAGE * D
     fused_compressed_storage = torch.zeros(
         num_compressed_blocks,
@@ -272,7 +275,10 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         (num_compressed_blocks, COMP_PAGE, 1, D),
         (compressed_page_elements + 16, D, D, 1),
     )
-    unfused_compressed = fused_compressed.clone()
+    unfused_compressed_storage = fused_compressed_storage.clone()
+    unfused_compressed = torch.as_strided(
+        unfused_compressed_storage, fused_compressed.shape, fused_compressed.stride()
+    )
 
     projected_qk = torch.randn(num_tokens, (HQ + 1) * D, dtype=dtype, device=device)
     q_weight = torch.randn(D, dtype=dtype, device=device) * 0.2
@@ -367,9 +373,12 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     if rope_positions is not None:
         qsa_store_cache_rows(rope_positions, raw_slots, position_rows)
 
-    # AMD FP16 uses PyTorch's strict default FP16 tolerance, not the donor's
-    # much looser BF16 tolerance. Raw keys/packed MRoPE positions remain exact.
-    tolerance = {} if backend == "rocm_fp16" else {"rtol": RTOL, "atol": ATOL}
+    # Require exact AMD query/cache values, not the donor's BF16 tolerance.
+    tolerance = (
+        {"rtol": 0, "atol": 0}
+        if backend == "rocm_fp16"
+        else {"rtol": RTOL, "atol": ATOL}
+    )
     torch.testing.assert_close(fused_query, unfused_query, **tolerance)
     assert torch.equal(fused_raw.view(torch.int16), unfused_raw.view(torch.int16))
     torch.testing.assert_close(fused_compressed, unfused_compressed, **tolerance)
