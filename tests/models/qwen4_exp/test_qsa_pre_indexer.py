@@ -421,10 +421,46 @@ def test_qsa_fused_pre_indexer_matches_unfused(
             # Native top-k emits threshold-bin winners in atomic arrival order.
             # Even repeated unfused calls can permute complete blocks; the selected
             # token set (including the tail and -1 padding) is the public contract.
-            assert torch.equal(
-                select(fused_query, fused_compressed).sort(dim=1).values,
-                select(unfused_query, unfused_compressed).sort(dim=1).values,
+            selected_fused = select(fused_query, fused_compressed).sort(dim=1).values
+            selected_reference = (
+                select(unfused_query, unfused_compressed).sort(dim=1).values
             )
+            if not torch.equal(selected_fused, selected_reference):
+                from vllm.models.qwen4_exp.amd.ops.qsa import qsa_mqa_paged
+
+                repeated_reference = (
+                    select(unfused_query, unfused_compressed).sort(dim=1).values
+                )
+
+                def score(query, cache):
+                    return qsa_mqa_paged(
+                        query,
+                        cache,
+                        compressed_block_table.to(device),
+                        token_to_req,
+                        logical_positions,
+                        torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                        CR,
+                    )
+
+                fused_logits, fused_visible = score(fused_query, fused_compressed)
+                reference_logits, reference_visible = score(
+                    unfused_query, unfused_compressed
+                )
+                print(
+                    "QSA selector audit:",
+                    {
+                        "logits_exact": torch.equal(fused_logits, reference_logits),
+                        "visible_exact": torch.equal(fused_visible, reference_visible),
+                        "baseline_repeat_changed_rows": int(
+                            (selected_reference != repeated_reference).any(1).sum()
+                        ),
+                        "fusion_comparison_changed_rows": int(
+                            (selected_fused != selected_reference).any(1).sum()
+                        ),
+                    },
+                )
+            assert torch.equal(selected_fused, selected_reference)
 
     compare()
 
