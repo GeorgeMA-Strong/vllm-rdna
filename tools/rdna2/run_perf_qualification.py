@@ -33,9 +33,12 @@ def main():
     parser.add_argument("--request-tag-scope", default="perf-qualification-20261005")
     parser.add_argument("--launch", type=Path, required=True)
     parser.add_argument("--census", action="store_true")
+    parser.add_argument("--gpu-timing", action="store_true")
     parser.add_argument("--save-reference", type=Path)
     parser.add_argument("--compare-reference", type=Path)
     args = parser.parse_args()
+    if args.gpu_timing and not args.census:
+        parser.error("GPU event timing requires --census; use separate speed runs")
     args.directory.mkdir(exist_ok=False, parents=True)
     if args.save_reference or args.compare_reference:
         reference = args.save_reference or args.compare_reference
@@ -55,7 +58,11 @@ def main():
     for concurrency in args.concurrencies:
         name = f"{args.profile}-c{concurrency}"
         if args.census:
-            begin = rpc(args.base_url, "begin_perf_phase", {"name": name})
+            begin = rpc(
+                args.base_url,
+                "begin_perf_phase",
+                {"name": name, **({"gpu_timing": True} if args.gpu_timing else {})},
+            )
             print(json.dumps({"begin": begin}), flush=True)
         try:
             command = [
