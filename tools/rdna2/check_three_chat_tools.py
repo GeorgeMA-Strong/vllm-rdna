@@ -52,9 +52,12 @@ def main() -> None:
     parser.add_argument("--words", type=int, default=99_000)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--stagger-seconds", type=float, default=0)
+    parser.add_argument("--tool-words", type=int, default=0)
     args = parser.parse_args()
     if args.stagger_seconds < 0:
         parser.error("Tool-return staggering must be nonnegative")
+    if args.tool_words < 0:
+        parser.error("Tool-result background size must be nonnegative")
     tool = {
         "type": "function",
         "function": {
@@ -97,6 +100,7 @@ def main() -> None:
     result: dict[str, Any] = {
         "tag": args.tag,
         "stagger_seconds": args.stagger_seconds,
+        "tool_words": args.tool_words,
         "metrics_before": metrics(args.base_url),
     }
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -123,16 +127,20 @@ def main() -> None:
             ) != {"session_id": index}:
                 raise RuntimeError(f"Session {index}: wrong tool call: {call}")
             chats[index].append(message)
+            tool_result = {
+                "marker": f"{args.tag}-SESSION-{index}",
+                "checksum": 42 + index,
+            }
+            if args.tool_words:
+                tool_result = {
+                    "background": " detail" * args.tool_words,
+                    **tool_result,
+                }
             chats[index].append(
                 {
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": json.dumps(
-                        {
-                            "marker": f"{args.tag}-SESSION-{index}",
-                            "checksum": 42 + index,
-                        }
-                    ),
+                    "content": json.dumps(tool_result),
                 }
             )
             chats[index].append(
