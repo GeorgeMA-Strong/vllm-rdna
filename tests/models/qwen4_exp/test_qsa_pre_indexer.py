@@ -288,6 +288,12 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         (num_compressed_blocks, COMP_PAGE, 1, D),
         (compressed_page_elements + 16, D, D, 1),
     )
+    if max(seq_lens) > 32768:
+        # A near-full context has populated historical compressed keys. Leaving
+        # that prefix zero-filled creates degenerate cutoff ties: the unchanged
+        # native selector then changes winners even between two reference calls.
+        fused_compressed.normal_()
+    initial_compressed_storage = fused_compressed_storage.clone()
     unfused_compressed_storage = fused_compressed_storage.clone()
     unfused_compressed = torch.as_strided(
         unfused_compressed_storage, fused_compressed.shape, fused_compressed.stride()
@@ -475,7 +481,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             fused_raw_storage.copy_(initial_raw_storage)
-            fused_compressed_storage.zero_()
+            fused_compressed_storage.copy_(initial_compressed_storage)
             run_fused()
         for factor in (0.5, 1.5):
             projected_qk.mul_(factor)
@@ -483,6 +489,6 @@ def test_qsa_fused_pre_indexer_matches_unfused(
             position_rows.copy_(canonical_qsa_rope_positions(positions))
             graph.replay()
             unfused_raw_storage.copy_(initial_raw_storage)
-            unfused_compressed_storage.zero_()
+            unfused_compressed_storage.copy_(initial_compressed_storage)
             unfused_query = run_unfused()
             compare()
