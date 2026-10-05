@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness tests for the fused QSA pre-indexer."""
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -259,6 +261,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
                         device=device,
                     )
                 )
+    initial_raw_storage = fused_raw_storage.clone()
     unfused_raw_storage = fused_raw_storage.clone()
     unfused_raw = torch.as_strided(
         unfused_raw_storage, fused_raw.shape, fused_raw.stride()
@@ -290,7 +293,8 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         fused_k_weight = (k_weight.float() + 1.0).to(dtype)
 
     fused_query = torch.empty(num_tokens, HQ, D, dtype=dtype, device=device)
-    qsa_pre_indexer(
+    run_fused = partial(
+        qsa_pre_indexer,
         projected_qk[:, : HQ * D],
         projected_qk[:, HQ * D :],
         positions,
@@ -312,95 +316,127 @@ def test_qsa_fused_pre_indexer_matches_unfused(
         rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
     )
 
-    unfused_query = projected_qk[:, : HQ * D].reshape(num_tokens, HQ, D)
-    unfused_query = gemma_rmsnorm(
-        unfused_query.reshape(-1, D), q_weight, EPS
-    ).reshape_as(unfused_query)
-    unfused_query = apply_qsa_rope(rope, positions, unfused_query)
+    run_fused()
 
-    raw_keys = unfused_raw[..., :D]
-    rope_positions = (
-        unfused_raw[..., ROPE_POS_OFFSET:].view(torch.int64)
-        if cache_rope_positions
-        else None
-    )
-    pooled, first_positions = qsa_compress_groups_with_ratio(
-        projected_qk[:, HQ * D :].reshape(-1, 1, D),
-        position_rows,
-        raw_keys,
-        raw_block_table,
-        token_to_req,
-        query_start_loc,
-        logical_positions,
-        compressed_slots,
-        CR,
-        rope_positions,
-    )
-    compressed_rows = gemma_rmsnorm(pooled.reshape(-1, D), k_weight, EPS).reshape(
-        -1, 1, D
-    )
-    if backend == "rocm_fp16":
-        # Identity RoPE isolates the native norm's FP16 rounding boundary.
-        norm_query = torch.empty_like(compressed_rows)
-        qsa_pre_indexer(
-            pooled.reshape(-1, D),
-            pooled.reshape(-1, D),
-            torch.zeros_like(positions),
-            rope.cos_sin_cache,
-            fused_k_weight,
-            fused_k_weight,
-            EPS,
-            norm_query,
-            fused_raw,
-            raw_slots,
+    def run_unfused():
+        unfused_query = projected_qk[:, : HQ * D].reshape(num_tokens, HQ, D)
+        unfused_query = gemma_rmsnorm(
+            unfused_query.reshape(-1, D), q_weight, EPS
+        ).reshape_as(unfused_query)
+        unfused_query = apply_qsa_rope(rope, positions, unfused_query)
+
+        raw_keys = unfused_raw[..., :D]
+        rope_positions = (
+            unfused_raw[..., ROPE_POS_OFFSET:].view(torch.int64)
+            if cache_rope_positions
+            else None
+        )
+        pooled, first_positions = qsa_compress_groups_with_ratio(
+            projected_qk[:, HQ * D :].reshape(-1, 1, D),
+            position_rows,
+            raw_keys,
             raw_block_table,
+            token_to_req,
             query_start_loc,
             logical_positions,
-            fused_compressed,
             compressed_slots,
-            torch.full_like(k_work_metadata, -1),
-            compress_ratio=CR,
-            mrope_section=MROPE_SECTION if mrope else None,
-            rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
+            CR,
+            rope_positions,
         )
-        torch.testing.assert_close(norm_query, compressed_rows, rtol=0, atol=0)
-    group_positions = (
-        first_positions.transpose(0, 1) if mrope else first_positions[:, 0]
-    )
-    compressed_rows = apply_qsa_rope(rope, group_positions, compressed_rows)
-    qsa_store_cache_rows(unfused_compressed, compressed_slots, compressed_rows)
-    qsa_store_cache_rows(raw_keys, raw_slots, projected_qk[:, HQ * D :])
-    if rope_positions is not None:
-        qsa_store_cache_rows(rope_positions, raw_slots, position_rows)
-
-    # Require exact AMD query/cache values, not the donor's BF16 tolerance.
-    tolerance = (
-        {"rtol": 0, "atol": 0}
-        if backend == "rocm_fp16"
-        else {"rtol": RTOL, "atol": ATOL}
-    )
-    torch.testing.assert_close(fused_query, unfused_query, **tolerance)
-    assert torch.equal(fused_raw.view(torch.int16), unfused_raw.view(torch.int16))
-    torch.testing.assert_close(fused_compressed, unfused_compressed, **tolerance)
-    if backend == "rocm_fp16":
-
-        def select(query, cache):
-            return qsa_select_paged_tokens(
-                query,
-                cache,
-                compressed_block_table.to(device),
-                token_to_req,
+        compressed_rows = gemma_rmsnorm(pooled.reshape(-1, D), k_weight, EPS).reshape(
+            -1, 1, D
+        )
+        if backend == "rocm_fp16":
+            # Identity RoPE isolates the native norm's FP16 rounding boundary.
+            norm_query = torch.empty_like(compressed_rows)
+            qsa_pre_indexer(
+                pooled.reshape(-1, D),
+                pooled.reshape(-1, D),
+                torch.zeros_like(positions),
+                rope.cos_sin_cache,
+                fused_k_weight,
+                fused_k_weight,
+                EPS,
+                norm_query,
+                fused_raw,
+                raw_slots,
+                raw_block_table,
+                query_start_loc,
                 logical_positions,
-                torch.tensor(seq_lens, dtype=torch.int32, device=device),
-                12,
-                CR,
-                max_seq_len=max(seq_lens),
+                fused_compressed,
+                compressed_slots,
+                torch.full_like(k_work_metadata, -1),
+                compress_ratio=CR,
+                mrope_section=MROPE_SECTION if mrope else None,
+                rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
+            )
+            torch.testing.assert_close(norm_query, compressed_rows, rtol=0, atol=0)
+        group_positions = (
+            first_positions.transpose(0, 1) if mrope else first_positions[:, 0]
+        )
+        compressed_rows = apply_qsa_rope(rope, group_positions, compressed_rows)
+        qsa_store_cache_rows(unfused_compressed, compressed_slots, compressed_rows)
+        qsa_store_cache_rows(raw_keys, raw_slots, projected_qk[:, HQ * D :])
+        if rope_positions is not None:
+            qsa_store_cache_rows(rope_positions, raw_slots, position_rows)
+        return unfused_query
+
+    unfused_query = run_unfused()
+
+    def compare():
+        # Require exact AMD query/cache values, not the donor's BF16 tolerance.
+        tolerance = (
+            {"rtol": 0, "atol": 0}
+            if backend == "rocm_fp16"
+            else {"rtol": RTOL, "atol": ATOL}
+        )
+        torch.testing.assert_close(fused_query, unfused_query, **tolerance)
+        assert torch.equal(fused_raw.view(torch.int16), unfused_raw.view(torch.int16))
+        torch.testing.assert_close(fused_compressed, unfused_compressed, **tolerance)
+        if backend == "rocm_fp16":
+
+            def select(query, cache):
+                return qsa_select_paged_tokens(
+                    query,
+                    cache,
+                    compressed_block_table.to(device),
+                    token_to_req,
+                    logical_positions,
+                    torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                    12,
+                    CR,
+                    max_seq_len=max(seq_lens),
+                )
+
+            # Native top-k emits threshold-bin winners in atomic arrival order.
+            # Even repeated unfused calls can permute complete blocks; the selected
+            # token set (including the tail and -1 padding) is the public contract.
+            assert torch.equal(
+                select(fused_query, fused_compressed).sort(dim=1).values,
+                select(unfused_query, unfused_compressed).sort(dim=1).values,
             )
 
-        # Native top-k emits threshold-bin winners in atomic arrival order.
-        # Even repeated unfused calls can permute complete blocks; the selected
-        # token set (including the tail and -1 padding) is the public contract.
-        assert torch.equal(
-            select(fused_query, fused_compressed).sort(dim=1).values,
-            select(unfused_query, unfused_compressed).sort(dim=1).values,
-        )
+    compare()
+
+    if (
+        backend == "rocm_fp16"
+        and is_2d_positions
+        and cache_rope_positions
+        and num_tokens in (3, 12, 39, 4097)
+    ):
+        # Replay identical cache addresses with changed keys and MRoPE positions.
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_raw_storage.copy_(initial_raw_storage)
+            fused_compressed_storage.zero_()
+            run_fused()
+        for factor in (0.5, 1.5):
+            projected_qk.mul_(factor)
+            positions.add_(1)
+            position_rows.copy_(canonical_qsa_rope_positions(positions))
+            graph.replay()
+            unfused_raw_storage.copy_(initial_raw_storage)
+            unfused_compressed_storage.zero_()
+            unfused_query = run_unfused()
+            compare()

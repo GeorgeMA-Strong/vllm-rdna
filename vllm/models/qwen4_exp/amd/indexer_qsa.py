@@ -93,6 +93,7 @@ def apply_qsa_rmsnorm(
     if (
         current_platform.is_rocm()
         and tensor.is_cuda
+        and tensor.dtype == torch.float16
         and tensor.is_contiguous()
         and tensor.dim() == 2
     ):

@@ -166,9 +166,10 @@ def test_qsa_rope_uses_platform_dispatch() -> None:
 
 
 def test_qsa_rmsnorm_uses_portable_implementation(default_vllm_config) -> None:
-    norm = GemmaRMSNorm(4, eps=1e-6)
-    norm.weight.data.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4]))
-    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    # The opaque norm is registered for this runtime's GPU dispatch key.
+    norm = GemmaRMSNorm(4, eps=1e-6).to(device="cuda")
+    norm.weight.data.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4], device="cuda"))
+    tensor = torch.arange(8, dtype=torch.float32, device="cuda").reshape(2, 4)
     output = apply_qsa_rmsnorm(norm, tensor)
 
     torch.testing.assert_close(output, norm.forward_native(tensor))
