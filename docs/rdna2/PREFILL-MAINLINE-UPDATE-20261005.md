@@ -103,3 +103,30 @@ new speedup from #59533.
 after profiling. Its only directly demonstrated E2E speedups are on NVIDIA;
 the projection-only M=4096 result is neutral. For the requested *global
 prefill compute* gain on FP16 gfx1030, it is not yet a proven top candidate.
+
+## Local follow-up experiments (not upstream claims)
+
+RDNA base `121af1b4786feb60748afe2fd73c2a49d459dc8b` includes PR36's adaptive
+scheduler. It is incorporated with `VLLM_RDNA_DYNAMIC_PREFILL=0` for these
+compute comparisons. No precision, MTP, KV-capacity or MM-limit changes.
+
+The staged tile8 HIP kernel (`9070cf3f2`) passes24 weighted/reduced GPU cases
+at existing tolerances. Component medians8.424/8.457ms versus prior9.093/9.119ms
+are approximately7.3% faster for that expert helper only. Compiler metadata
+shows115/116VGPRs, zero scratch, versus125 previously. There is no new
+full-model speed result. Native SHA256:
+`204deb40c50a10ca1390d857ec8cf506cae62a581a85a42ab35a64a09bfc4ee9`.
+
+PLE lifetime release, direct packing and single-history layout preserve the
+tested FP16 arithmetic/state. The full14-case AMD PLE suite passed after
+direct packing; the six changed-path CPU/GPU cases pass after single-history
+commit `f83835a7f`, with exact output/state equality. Norm code is unchanged.
+
+None of these changes yet makes an8192 scheduled batch safe under the fixed
+production MTP2,3.75GiB KV/GPU, full MM profiling and64GiB RAM offload settings.
+The16K cold-prefill reproduction fails successively at packing, history and
+convolution output allocation; the last requests160MiB on some ranks120MiB.
+The guarded normal coding benchmark did not run after the last failure.
+**No heavy prefill gain,8192 qualification or production promotion is claimed.**
+Raw local artifacts and detailed experiment history:
+[status](/Users/georgezagraid/Projects/AI/v620-vllm/review-artifacts/prefill-compute-2026-10-04/STATUS.md).
