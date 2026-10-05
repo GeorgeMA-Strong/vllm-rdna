@@ -910,7 +910,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if has_initial_states_p is None:
             raise ValueError("has_initial_states_p is required for prefill short-conv")
 
-        output = torch.empty_like(x_p)
         q_starts = query_start_loc_p.to(torch.int64)
         if state_indices_tensor_p.numel() < num_prefills:
             raise ValueError(
@@ -925,13 +924,13 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"need >= {num_prefills}."
             )
         if num_prefills == 0 or x_p.numel() == 0:
-            return output
+            return torch.empty_like(x_p)
         lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
-            return output
+            return torch.empty_like(x_p)
 
         hidden_size = x_p.shape[1]
         positions = torch.arange(
@@ -940,9 +939,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
         col_indices = positions - q_starts[req_indices]
 
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
+        # Pack directly in convolution layout instead of copying a full transpose.
+        packed_tokens = x_p.new_zeros((num_prefills, hidden_size, max_len))
+        packed_tokens[req_indices, :, col_indices] = x_p
 
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
@@ -973,6 +972,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             history = torch.cat((initial_state, packed_tokens), dim=-1)
         else:
             history = packed_tokens
+        del packed_tokens
 
         conv_output = F.conv1d(
             history,
@@ -988,7 +988,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             num_prefills, 1
         )
         conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
 
         if self.conv_state_len > 0 and conv_state.shape[0] > 0:
             state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
@@ -1014,7 +1013,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
             existing_state[..., : self.conv_state_len] = safe_next_state
             conv_state.index_copy_(0, state_indices, existing_state)
-        return output
+        return conv_output[req_indices, col_indices]
 
     def _short_conv_dilated_spec_batched(
         self,
