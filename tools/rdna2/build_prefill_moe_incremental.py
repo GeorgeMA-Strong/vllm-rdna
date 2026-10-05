@@ -20,12 +20,17 @@ def sha(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument(
+        "--kernel",
+        choices=("moe_q_gemm_rdna2", "moe_resident_decode"),
+        default="moe_q_gemm_rdna2",
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     reference = args.reference.resolve()
     if reference == root:
         raise RuntimeError("Reference must not be the experiment checkout")
-    changed = "csrc/rocm/moe_q_gemm_rdna2.cu"
+    changed = f"csrc/rocm/{args.kernel}.cu"
     tracked = (
         subprocess.check_output(["git", "ls-files", "-z", "csrc"], cwd=root)
         .decode()
@@ -39,7 +44,7 @@ def main():
                 raise RuntimeError(f"Unqualified additional native change: {relative}")
     protected = reference / "vllm/_rocm_C.abi3.so"
     before = sha(protected)
-    build = root / "build-prefill-moe"
+    build = root / f"build-{args.kernel}"
     build.mkdir(exist_ok=True)
     base_build = reference / "build-native"
     ninja = reference / ".venv/bin/ninja"
@@ -78,7 +83,7 @@ def main():
     generated.mkdir(exist_ok=True)
     generated_source = generated / hip_source.name
     shutil.copy2(hip_source, generated_source)
-    obj = "CMakeFiles/_rocm_C.dir/csrc/rocm/moe_q_gemm_rdna2.hip.o"
+    obj = f"CMakeFiles/_rocm_C.dir/csrc/rocm/{args.kernel}.hip.o"
     output_obj = build / obj
     output_obj.parent.mkdir(parents=True, exist_ok=True)
     commands = subprocess.check_output(

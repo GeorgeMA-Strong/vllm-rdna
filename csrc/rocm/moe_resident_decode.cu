@@ -223,7 +223,8 @@ void moe_resident_int4_decode(const at::Tensor& input, const at::Tensor& w13,
   const int64_t M64 = input.size(0), K64 = input.size(1), E64 = w13.size(0);
   const int64_t intermediate64 = w13.size(2) / 2;
   const int64_t hidden64 = output.size(1), topk64 = topk_ids.size(1);
-  TORCH_CHECK(M64 >= 1 && M64 <= 4, "moe_resident_int4_decode: M must be 1..4");
+  TORCH_CHECK(M64 >= 1 && M64 <= 12,
+              "moe_resident_int4_decode: M must be 1..12");
   TORCH_CHECK(E64 > 0 && E64 <= INT_MAX && K64 > 0 && K64 <= INT_MAX &&
                   intermediate64 > 0 && intermediate64 <= INT_MAX &&
                   hidden64 > 0 && hidden64 <= INT_MAX && topk64 > 0 &&

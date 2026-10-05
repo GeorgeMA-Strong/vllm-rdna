@@ -59,7 +59,7 @@ def prepare_resident_layer(layer, group_size: int) -> None:
         torch.ops._rocm_C, "moe_resident_int4_decode"
     )
     if native_layer.skinny_decode:
-        logger.info_once("RDNA2 resident skinny decode enabled for M=1..4")
+        logger.info_once("RDNA2 resident skinny decode enabled for M=1..12")
     elif envs.VLLM_RDNA_MOE_RESIDENT_SKINNY:
         logger.warning_once("Resident skinny op unavailable; using tiled MoE")
     native_layer.group_size = group_size
@@ -88,11 +88,11 @@ def apply_resident(layer, x, topk_weights, topk_ids):
     if not isinstance(activation, MoEActivation):
         activation = MoEActivation.from_str(activation)
     native = layer._rdna2_resident
-    # The sibling kernel reads the same resident weights; larger verification
-    # batches and other activations retain the qualified tiled path.
+    # Each row uses independent CTAs and the same resident weights. Cover
+    # verification batches through four requests with two draft tokens each.
     if (
         getattr(native, "skinny_decode", False)
-        and 1 <= x.shape[0] <= 4
+        and 1 <= x.shape[0] <= 12
         and activation == MoEActivation.SILU
         and not layer.apply_router_weight_on_input
         and x.shape[1] % 32 == 0
