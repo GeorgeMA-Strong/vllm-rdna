@@ -82,6 +82,16 @@ def _make_block_table(block_counts):
         ),
         pytest.param(True, True, True, 4, [37], [37], [0], id="fresh"),
         pytest.param(True, True, True, 4, [4097], [4097], [0], id="tiled"),
+        pytest.param(
+            True,
+            True,
+            True,
+            8,
+            [262132],
+            [4097],
+            [8],
+            id="near-256k-cross-chunk",
+        ),
         pytest.param(True, True, True, 8, [260], [1], [8], id="decode-1"),
         pytest.param(True, True, True, 8, [262], [3], [8], id="decode-3"),
         pytest.param(True, True, True, 8, [262] * 2, [3] * 2, [8] * 2, id="decode-6"),
@@ -149,7 +159,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     with torch.device(device):
         rope = get_rope(
             head_size=256,
-            max_position=32768,
+            max_position=max(32768, max(seq_lens) + 8),
             rope_parameters=rope_params,
             dtype=dtype,
         )
