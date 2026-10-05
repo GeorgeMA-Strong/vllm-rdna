@@ -10,6 +10,7 @@ import json
 
 import torch
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.models.qwen4_exp.amd.indexer_qsa import apply_qsa_rmsnorm, apply_qsa_rope
@@ -153,13 +154,14 @@ def benchmark(tokens: int, requests: int) -> dict:
 
 if __name__ == "__main__":
     torch.manual_seed(42)
-    for tokens, requests in (
-        (1, 1),
-        (3, 1),
-        (6, 2),
-        (9, 3),
-        (12, 4),
-        (1024, 1),
-        (4096, 1),
-    ):
-        print(json.dumps(benchmark(tokens, requests)), flush=True)
+    with set_current_vllm_config(VllmConfig()):
+        for tokens, requests in (
+            (1, 1),
+            (3, 1),
+            (6, 2),
+            (9, 3),
+            (12, 4),
+            (1024, 1),
+            (4096, 1),
+        ):
+            print(json.dumps(benchmark(tokens, requests)), flush=True)

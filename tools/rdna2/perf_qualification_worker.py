@@ -11,6 +11,22 @@ import torch
 
 
 class PerfQualificationWorker:
+    def inspect_qsa_fusion(self):
+        indexers = [
+            module
+            for module in self.model_runner.model.modules()
+            if hasattr(module, "use_fused_pre_indexer")
+        ]
+        enabled = sum(module.use_fused_pre_indexer for module in indexers)
+        expected = os.environ.get("VLLM_RDNA_QSA_FUSED_INDEXER", "0") == "1"
+        if expected and (not indexers or enabled != len(indexers)):
+            raise RuntimeError("QSA fusion requested but some indexers are ineligible")
+        return {
+            "rank": self.rank,
+            "qsa_indexers": len(indexers),
+            "qsa_fusion_enabled": enabled,
+        }
+
     def begin_perf_phase(self, name: str, gpu_timing: bool = False):
         if getattr(self, "_perf_dispatch_original", None) is not None:
             raise RuntimeError("End the previous diagnostic phase first")
@@ -57,6 +73,7 @@ class PerfQualificationWorker:
             "capture_sizes": config.compilation_config.cudagraph_capture_sizes,
             "rdna_ar_active": ar_active,
             "gpu_timing": gpu_timing,
+            **self.inspect_qsa_fusion(),
         }
 
     def end_perf_phase(self):
