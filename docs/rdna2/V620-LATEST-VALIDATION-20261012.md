@@ -22,8 +22,11 @@ library and matching 70-row TunableOp profile are retained.
 Initial state: no model running; `v620-tp4-git.service` is a broken symlink to
 the removed `kv-offload-ram-20260926` checkout. Source, checkpoint and original
 Python environment still exist. No persistent unit/link has been changed.
-Asked the user whether to repair/restore the old default after testing or leave
-the original inactive state. Until answered, do not modify persistent units.
+The user authorized repairing/restoring the original default after testing.
+Both links were repaired to the preserved production base unit at16:31:41UTC;
+the existing Intel-model/64GiB drop-ins remain unchanged. At16:37:57UTC the
+restored default returned health200 and exact READY in0.384s, source7462596a5,
+PID67526, enabled for boot, restart count0. The candidate is stopped, not promoted.
 
 ## Planned qualification
 
@@ -39,7 +42,39 @@ the original inactive state. Until answered, do not modify persistent units.
 6. Report exact environment/commands, PP and decode separately, aggregate vs
    per-chat clearly, memory/errors, and restoration status. No auto-promotion.
 
-No benchmark result or speedup is claimed yet.
+## Qualification outcome so far
+
+The isolated native build completed in11m12s; native SHA256 is
+`441180e95b2523e99e426bc2316949082fa5df156d4c9b66de905087a3ae2bb9`.
+Original native artifacts and dependency environment are unchanged.
+Candidate Hub2.2 initially prevented test collection; the builder now limits
+Hub to<2, matching preserved Transformers5.17.0. Import succeeds with Hub1.33.
+All34 HC and8 AMD PLE tests pass, including PLE graph replay and FP16/BF16 checks.
+
+The unmodified64d candidate nevertheless fails model initialization on all four
+ranks with `Qwen4Exp PLE embedding does not support quantization config INCConfig`.
+The same exception reproduces with only the actual checkpoint configuration
+and `Qwen4ExpPLEEmbeddingMethod.from_quant_config`, without loading weights.
+INC4-bit/group128 is correctly detected; the PLE selector lacks INC support.
+No source, quantization, precision or model workaround was applied.
+
+Candidate benchmarks, quality, tool/prefix and RAM/image gates therefore could
+not run. **No latest-versus-production speedup is established.**
+
+Fresh production-only normal coding measurements (tok/s):
+
+| Workload | PP | TG | Valid groups |
+| --- | ---: | ---: | ---: |
+| 16K C1 | 2022.11 | 73.71 | 3/3 |
+| 64K C1 | invalid | invalid | 0/3 |
+| 128K C1 | 1819.58 | 70.65 | 3/3 |
+| 16K C3 aggregate | 1605.97 | 56.13 | 3/3 |
+
+Initial64K and one separate locked retake both fail the repeated-output guard.
+Canonical production quality: regular8/9, coding3/9, total11/18. This is not a
+quality pass; preserve raw failures and do not relax guards or retry to green.
+Full reports and exact environment/command manifests are preserved under the
+workspace's `review-artifacts/rdna-latest-validation-2026-10-12/` directory.
 
 ## Active collective backend
 
