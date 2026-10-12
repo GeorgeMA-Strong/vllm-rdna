@@ -690,6 +690,44 @@ def test_ple_embedding_respects_inc_layer_config() -> None:
         Qwen4ExpPLEEmbeddingMethod.from_quant_config(quant_config, prefix)
 
 
+@pytest.mark.parametrize("body_dtype", [torch.float16, torch.bfloat16])
+def test_ple_inc_preserves_bf16_storage_for_fp16_body(body_dtype) -> None:
+    prefix = "model.layers.1.ple.ple_embedding.ngram_embedding"
+    config = INCConfig(
+        weight_bits=4,
+        group_size=128,
+        block_name_to_quantize="model.layers",
+        extra_config={".*ple.*": {"bits": 16, "data_type": "float"}},
+    )
+    method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(config, prefix)
+    embedding = Qwen4ExpPLEDeviceEmbedding.__new__(Qwen4ExpPLEDeviceEmbedding)
+    nn.Module.__init__(embedding)
+    method.create_weights(
+        embedding,
+        input_size_per_partition=2,
+        output_partition_sizes=[4],
+        input_size=4,
+        output_size=4,
+        params_dtype=body_dtype,
+        weight_loader=partial(copy_ple_embedding_shard_, tp_start=2, tp_end=6),
+    )
+    assert embedding.weight.dtype == torch.bfloat16
+    embedding.weight.data.fill_(-1)
+    shard = torch.arange(8, dtype=torch.float32).reshape(4, 2).bfloat16()
+    embedding.weight.weight_loader(embedding.weight, shard, checkpoint_start=0)
+    torch.testing.assert_close(embedding.weight[:2], shard[2:])
+    rows = method.dequantize(embedding, embedding.weight[:2], body_dtype)
+    assert rows.dtype == body_dtype
+    torch.testing.assert_close(rows, shard[2:].to(body_dtype))
+    with pytest.raises(ValueError, match="BF16 checkpoint weights"):
+        embedding.weight.weight_loader(
+            embedding.weight, shard.half(), checkpoint_start=4
+        )
+    torch.testing.assert_close(
+        embedding.weight[2:], torch.full_like(embedding.weight[2:], -1)
+    )
+
+
 def test_ple_embedding_dtype_overrides_modelopt_exclusion() -> None:
     prefix = "model.layers.1.ple.ple_embedding.ngram_embedding"
     quant_config = ModelOptNvFp4Config(exclude_modules=[prefix])
