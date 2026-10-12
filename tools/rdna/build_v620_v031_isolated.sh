@@ -40,7 +40,7 @@ if [[ ! -x $uv_dir/uv ]]; then
     tar -xzf "$source_dir/.tools/uv.tar.gz" -C "$source_dir/.tools"
 fi
 "$uv_dir/uv" pip install --python "$source_dir/.venv/bin/python" --no-deps \
-    'huggingface_hub>=1.31.0' 'xgrammar==0.2.7' 'oss-harmony>=0.0.11'
+    'huggingface_hub>=1.31.0,<2.0' 'xgrammar==0.2.7' 'oss-harmony>=0.0.11'
 
 export PATH="$source_dir/.venv/bin:$dependencies/bin:$rocm/bin:$rocm/llvm/bin:$PATH"
 export PYTHONPATH=$source_dir
