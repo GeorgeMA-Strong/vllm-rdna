@@ -40,3 +40,12 @@ the original inactive state. Until answered, do not modify persistent units.
    per-chat clearly, memory/errors, and restoration status. No auto-promotion.
 
 No benchmark result or speedup is claimed yet.
+
+## Active collective backend
+
+The initial production control logs show RCCL fallback, despite its exported
+AR flag1: an existing October8 native-AR timeout marker disables the native
+path. Preserve that original marker and include it in the audit. The first
+candidate run must pass `VLLM_RDNA_AR=0` to the launch wrapper so the backend is
+matched. Any later latest-native-AR trial is a separate arm, not an unlabeled
+source-only gain or a silent reset of production's safety state.

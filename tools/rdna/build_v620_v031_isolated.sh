@@ -53,12 +53,20 @@ export SETUPTOOLS_SCM_PRETEND_VERSION=0.31.0+rdna.validation
 
 # Let this branch fetch its own pinned Triton kernel sources; do not reuse an
 # older installed source directory across the v0.31 rebase.
-"$dependencies/bin/cmake" -S "$source_dir" -B "$source_dir/build-native" -G Ninja \
-    -DVLLM_TARGET_DEVICE=rocm \
-    -DVLLM_PYTHON_EXECUTABLE="$source_dir/.venv/bin/python" \
-    -DCMAKE_HIP_ARCHITECTURES=gfx1030 \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$source_dir"
-"$dependencies/bin/cmake" --build "$source_dir/build-native" --parallel "$jobs"
-"$dependencies/bin/cmake" --install "$source_dir/build-native" --prefix "$source_dir"
-"$source_dir/.venv/bin/python" -c 'import torch,vllm,vllm._custom_ops; print("torch:",torch.__version__,"HIP:",torch.version.hip,"vLLM:",vllm.__file__)'
+if [[ ${V620_BUILD_SKIP_NATIVE:-0} != 1 ]]; then
+    "$dependencies/bin/cmake" -S "$source_dir" -B "$source_dir/build-native" -G Ninja \
+        -DVLLM_TARGET_DEVICE=rocm \
+        -DVLLM_PYTHON_EXECUTABLE="$source_dir/.venv/bin/python" \
+        -DCMAKE_HIP_ARCHITECTURES=gfx1030 \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$source_dir"
+    "$dependencies/bin/cmake" --build "$source_dir/build-native" --parallel "$jobs"
+    "$dependencies/bin/cmake" --install "$source_dir/build-native" --prefix "$source_dir"
+fi
+[[ -f $source_dir/vllm/_rocm_C.abi3.so ]]
+# CMake installs native libraries but not distribution metadata. Generate the
+# normal source-tree egg-info without downloading replacement native wheels
+# or invoking a second C++/Rust build. PYTHONPATH supplies this editable tree.
+env VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE=0.31.0+rdna.rocm100.validation \
+    "$source_dir/.venv/bin/python" "$source_dir/setup.py" egg_info
+"$source_dir/.venv/bin/python" -c 'import importlib.metadata as m; import torch,vllm,vllm._custom_ops; from vllm.platforms import current_platform; assert current_platform.is_rocm(); print("package:",m.version("vllm"),"torch:",torch.__version__,"HIP:",torch.version.hip,"vLLM:",vllm.__file__)'
 sha256sum "$source_dir/vllm/_rocm_C.abi3.so"
