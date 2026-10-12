@@ -211,7 +211,7 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             isinstance(quant_config, INCConfig)
             and not quant_config.config_parser.resolve(None, prefix).quantized
         ):
-            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            return Qwen4ExpPLEINCEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
                 "Qwen4Exp PLE embedding does not support quantization config "
@@ -292,6 +292,50 @@ class Qwen4ExpPLEUnquantizedEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
     ) -> torch.Tensor:
         del layer, output_dtype
         return embeddings
+
+
+class Qwen4ExpPLEINCEmbeddingMethod(Qwen4ExpPLEUnquantizedEmbeddingMethod):
+    """Keep the INC checkpoint's BF16 PLE table independent of body dtype."""
+
+    def create_weights(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del params_dtype
+        weight_loader = extra_weight_attrs["weight_loader"]
+
+        def load_bf16_weight(param, loaded_weight, *args, **kwargs):
+            if loaded_weight.dtype != torch.bfloat16:
+                raise ValueError(
+                    "INC PLE embedding only supports BF16 checkpoint weights; "
+                    f"received {loaded_weight.dtype}"
+                )
+            return weight_loader(param, loaded_weight, *args, **kwargs)
+
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            torch.bfloat16,
+            **{**extra_weight_attrs, "weight_loader": load_bf16_weight},
+        )
+
+    def dequantize(
+        self,
+        layer: nn.Module,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        del layer
+        return embeddings.to(output_dtype)
 
 
 class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
