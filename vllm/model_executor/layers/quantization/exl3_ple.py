@@ -264,6 +264,8 @@ class Exl3NgramRingTable:
         self.path = path
 
         self.head_offsets = self._file.get_tensor(aux["head_offsets"]).long()
+        self.head_vocab_sizes = self._file.get_tensor(aux["head_vocab_sizes"]).long()
+        self.layer_multipliers = self._file.get_tensor(aux["layer_multipliers"]).long()
         self.head_bias = self._file.get_tensor(aux["head_bias"]).float()
         expected = {
             "head_offsets": head_offsets,
@@ -273,11 +275,11 @@ class Exl3NgramRingTable:
         for key, want in expected.items():
             if want is None:
                 continue
-            got = self._file.get_tensor(aux[key]).long()
-            if not torch.equal(got, want.to("cpu", torch.long)):
+            got = getattr(self, key)
+            if not torch.equal(got, torch.as_tensor(want).to("cpu", torch.long)):
                 raise ValueError(
                     f"{path}: {key} does not match the layer's hash layout "
-                    f"(checkpoint {got.tolist()}, layer {want.tolist()})"
+                    f"(checkpoint {got.tolist()}, layer {torch.as_tensor(want).tolist()})"
                 )
 
         self.codebook = mul1_codebook().float()

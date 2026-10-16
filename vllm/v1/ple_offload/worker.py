@@ -1029,18 +1029,32 @@ def _ple_quant_attach(
             Exl3NgramRingTable,
         )
 
-        def _hash(name: str) -> torch.Tensor | None:
+        def _hash(name: str, fallback: str | None = None):
             t = getattr(layer, name, None)
-            return None if t is None or t.is_meta else t
+            if t is not None and not t.is_meta:
+                return t
+            # Sidecar meta build: the layer keeps its layout as Python lists.
+            return getattr(layer, fallback, None) if fallback else None
 
-        owner._ple_quant = Exl3NgramRingTable(
+        table = Exl3NgramRingTable(
             exl3_path,
             rows,
             width,
-            head_offsets=_hash("ngram_heads_offsets"),
-            head_vocab_sizes=_hash("ngram_heads_vocab_sizes"),
+            head_offsets=_hash("ngram_heads_offsets", "_ngram_offsets"),
+            head_vocab_sizes=_hash("ngram_heads_vocab_sizes", "_ngram_sizes"),
             layer_multipliers=_hash("layer_multipliers"),
         )
+        owner._ple_quant = table
+        # The EXL3 index does not carry the hash buffers (the table file
+        # does), so fill any the meta build left unmaterialized.
+        for name, value in (
+            ("layer_multipliers", table.layer_multipliers),
+            ("ngram_heads_offsets", table.head_offsets),
+            ("ngram_heads_vocab_sizes", table.head_vocab_sizes),
+        ):
+            buf = layer._buffers.get(name)
+            if buf is not None and buf.is_meta:
+                layer._buffers[name] = value.clone()
     else:
         owner._ple_quant = _PleQuantTable(quant_dir, rows, width)
     # Stub before anything writes the parameter: the original 95 GB allocation
@@ -1323,7 +1337,7 @@ class PleOffloadRunner:
         elif isinstance(loader, DefaultModelLoader):
             all_weights = loader.get_all_weights(model_config, model)
             loaded_params = model.load_weights(offload_only_iter(all_weights))
-            if matched_checkpoint_tensors == 0:
+            if matched_checkpoint_tensors == 0 and exl3_path is None:
                 raise RuntimeError(
                     "PLE offload checkpoint filter matched no weights for "
                     f"layers: {sorted(offload_layers)}"
