@@ -995,26 +995,13 @@ def _ple_exl3_table_path(vllm_config: VllmConfig) -> str | None:
     in the ``exl3_ngram_trellis`` format, outside the model index, so the
     regular weight iterator never yields it.
     """
-    model_config = vllm_config.model_config
-    quant = getattr(model_config, "quantization", None)
-    if quant != "exl3":
-        return None
-    name = "ngram_embedding.safetensors"
-    model = model_config.model
-    if os.path.isdir(model):
-        path = os.path.join(model, name)
-        return path if os.path.isfile(path) else None
-    try:
-        from huggingface_hub import hf_hub_download
+    from vllm.model_executor.layers.quantization.exl3_ple import exl3_side_file
 
-        return hf_hub_download(
-            model,
-            name,
-            revision=model_config.revision,
-            cache_dir=vllm_config.load_config.download_dir,
-        )
-    except Exception:
-        return None
+    return exl3_side_file(
+        vllm_config.model_config,
+        "ngram_embedding.safetensors",
+        vllm_config.load_config.download_dir,
+    )
 
 
 def _ple_quant_attach(

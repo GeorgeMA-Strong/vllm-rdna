@@ -160,6 +160,41 @@ _MUL1 = 0x83DCD12D
 _logger = logging.getLogger(__name__)
 
 
+def exl3_side_file(model_config, name: str, download_dir: str | None = None):
+    """Path of a file exllamav3 ships beside an EXL3 checkpoint, outside the
+    model index (``ngram_embedding.safetensors``,
+    ``mtp_hyper_connection_mixer_patch.safetensors``); None if absent."""
+    if getattr(model_config, "quantization", None) != "exl3":
+        return None
+    model = model_config.model
+    if os.path.isdir(model):
+        path = os.path.join(model, name)
+        return path if os.path.isfile(path) else None
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(
+            model, name, revision=model_config.revision, cache_dir=download_dir
+        )
+    except Exception:
+        return None
+
+
+def exl3_side_weights(name: str):
+    """(name, tensor) pairs of an EXL3 side file, empty when there is none."""
+    from safetensors import safe_open
+
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config()
+    path = exl3_side_file(config.model_config, name, config.load_config.download_dir)
+    if path is None:
+        return
+    with safe_open(path, framework="pt") as f:
+        for key in f.keys():  # noqa: SIM118 - safe_open is not a dict
+            yield key, f.get_tensor(key)
+
+
 def mul1_codebook() -> torch.Tensor:
     """All 65536 decoded mul1 values (fp16), bit-exact with decode_3inst<2>."""
     s = torch.arange(65536, dtype=torch.int64)
