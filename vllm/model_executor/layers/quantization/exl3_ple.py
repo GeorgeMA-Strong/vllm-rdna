@@ -251,7 +251,9 @@ class Exl3NgramRingTable:
         self._q = [self._file.get_tensor(shards[n]) for n in range(len(shards))]
         rows = sum(t.shape[0] for t in self._q)
         if rows != total_rows:
-            raise ValueError(f"{path}: table has {rows} rows, layer expects {total_rows}")
+            raise ValueError(
+                f"{path}: table has {rows} rows, layer expects {total_rows}"
+            )
         if any(t.shape[0] != self.ROWS_PER_SHARD for t in self._q):
             raise ValueError(f"{path}: shards are not {self.ROWS_PER_SHARD} rows")
         self.words = int(self._q[0].shape[1])
@@ -279,7 +281,8 @@ class Exl3NgramRingTable:
             if not torch.equal(got, torch.as_tensor(want).to("cpu", torch.long)):
                 raise ValueError(
                     f"{path}: {key} does not match the layer's hash layout "
-                    f"(checkpoint {got.tolist()}, layer {torch.as_tensor(want).tolist()})"
+                    f"(checkpoint {got.tolist()}, "
+                    f"layer {torch.as_tensor(want).tolist()})"
                 )
 
         self.codebook = mul1_codebook().float()
@@ -313,7 +316,7 @@ class Exl3NgramRingTable:
         return True
 
     def decode(self, raw: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-        """Packed rings ``raw`` [N, words] int16 of global rows ``ids`` -> [N, width]."""
+        """Packed rings ``raw`` [N, words] int16 of rows ``ids`` -> [N, width]."""
         scales = raw[:, 0].contiguous().view(torch.float16).float()
         stream = raw[:, 1:].to(torch.int64) & 0xFFFF
         window = stream[:, self._w0] | (stream[:, self._w1] << 16)

@@ -64,7 +64,7 @@ def test_ring_rows_match_definition(tmp_path, k):
     save_file(tensors, str(path))
 
     table = _SmallTable(str(path), rows, WIDTH, head_offsets=offsets)
-    assert table.K == k
+    assert k == table.K
 
     ids = torch.tensor([0, 63, 64, 191, 120, 49, 50, 150, 64, 3])
     out = torch.empty(ids.shape[0], WIDTH, dtype=torch.float32)

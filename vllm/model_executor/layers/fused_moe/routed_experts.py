@@ -675,7 +675,9 @@ class RoutedExperts(PluggableLayer):
             return False if return_success else None
         if quant_method_name == "Exl3MoEMethod":
             # EXL3 trellis/suh/svh have their own layout and TP slicing.
-            self.quant_method.absorb(self, loaded_weight, weight_name, shard_id, expert_id)
+            self.quant_method.absorb(
+                self, loaded_weight, weight_name, shard_id, expert_id
+            )
             return True if return_success else None
         # Hereafter, `expert_id` is local physical id
 

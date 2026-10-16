@@ -1247,9 +1247,7 @@ class PleOffloadRunner:
         )
         # A quantized sidecar replaces the checkpoint table outright, so the
         # bf16 disk-paging path is not used when one is configured.
-        disk_dir = (
-            _ple_disk_dir() if quant_dir is None and exl3_path is None else None
-        )
+        disk_dir = _ple_disk_dir() if quant_dir is None and exl3_path is None else None
         disk_attached: dict[str, str] = {}
         disk_complete_params: set[str] = set()
         disk_complete_tables: tuple[str, ...] = ()
@@ -1262,9 +1260,7 @@ class PleOffloadRunner:
             # disk path does for a finished file.
             table_prefixes = []
             for layer_name, layer in offload_layers.items():
-                pname = _ple_quant_attach(
-                    layer_name, layer, quant_dir or "", exl3_path
-                )
+                pname = _ple_quant_attach(layer_name, layer, quant_dir or "", exl3_path)
                 if pname is None:
                     continue
                 full = f"{layer_name}.{pname}"

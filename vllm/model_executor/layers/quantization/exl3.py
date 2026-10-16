@@ -71,6 +71,17 @@ def _exl3_gemm(a, c, b_q_weight, bits, cb):
 def _exl3_mid(
     xh_i: torch.Tensor, trellis_i: torch.Tensor, w_raw: torch.Tensor, bits: int, cb: int
 ) -> torch.Tensor:
+    # The kernels index rows with size(1) as the stride. Inductor may hand a
+    # custom op strided/padded inputs (decode under torch.compile faulted on
+    # GPU pages past the buffer), so make them dense.
+    xh_i = xh_i.contiguous()
+    trellis_i = trellis_i.contiguous()
+    k_ok = trellis_i.size(0) * 16 == xh_i.size(1)
+    if trellis_i.size(1) * 16 != w_raw.shape[1] or not k_ok:
+        raise ValueError(
+            f"exl3_mid: trellis {tuple(trellis_i.shape)} does not match "
+            f"x {tuple(xh_i.shape)} and scratch {tuple(w_raw.shape)}"
+        )
     if xh_i.size(0) > 64:
         torch.ops._rocm_C.exl3_decode_trellis_rdna2(trellis_i, w_raw, bits, cb)
         return torch.nn.functional.linear(xh_i, w_raw.t())
@@ -180,6 +191,32 @@ def exl3_coalesce_suh_groups(suh_parts):
         else:
             groups.append((suh, off, width))
     return groups
+
+
+def exl3_check_groups(layer) -> None:
+    """Fail at load, not with a GPU fault, if a fused group's shapes disagree."""
+    k = layer.trellis.shape[0] * 16
+    k_in = layer._exl3_bufs_xh[0].shape[1]
+    for gi, (suh_i, off, width) in enumerate(layer._exl3_group_meta):
+        tr = layer._exl3_group_trellis[gi]
+        problems = []
+        if tr.shape[1] * 16 != width:
+            problems.append(f"trellis N {tr.shape[1] * 16}")
+        if tr.shape[0] * 16 != k or k != k_in:
+            problems.append(f"trellis K {tr.shape[0] * 16} vs input {k_in}")
+        if layer._exl3_group_mid[gi].shape[1] != width:
+            problems.append(f"mid {tuple(layer._exl3_group_mid[gi].shape)}")
+        if layer.svh[off : off + width].numel() != width:
+            problems.append(f"svh slice {layer.svh[off : off + width].numel()}")
+        if suh_i is not None and suh_i.numel() != k_in:
+            problems.append(f"suh {suh_i.numel()}")
+        if problems:
+            raise ValueError(
+                f"EXL3 {getattr(layer, 'prefix', '?')} group {gi} (off={off}, "
+                f"width={width}): {', '.join(problems)}; trellis "
+                f"{tuple(layer.trellis.shape)}, svh {tuple(layer.svh.shape)}, "
+                f"part_widths {getattr(layer, '_exl3_part_widths', None)}"
+            )
 
 
 def exl3_part_trellis(trellis: torch.Tensor, off: int, width: int) -> torch.Tensor:
@@ -1082,6 +1119,7 @@ class Exl3LinearMethod(LinearMethodBase):
                         torch.zeros(m_max, width, dtype=buf_dtype, device="cuda")
                     )
                     layer._exl3_group_meta.append((suh_i, off, width))
+                exl3_check_groups(layer)
         if (
             self.bits in range(1, 9)
             and not self.fold_weight

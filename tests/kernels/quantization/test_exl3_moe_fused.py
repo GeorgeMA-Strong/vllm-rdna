@@ -106,7 +106,9 @@ def test_fused_apply_is_cudagraph_capturable(tokens):
     torch.manual_seed(100 + tokens)
     global_experts, top_k, hidden, inter, bits = 16, 4, 256, 128, 3
     expert_map = torch.full((global_experts,), -1, dtype=torch.int32, device="cuda")
-    expert_map[::2] = torch.arange(global_experts // 2, dtype=torch.int32, device="cuda")
+    expert_map[::2] = torch.arange(
+        global_experts // 2, dtype=torch.int32, device="cuda"
+    )
     layer = _as_module(_layer(global_experts // 2, hidden, inter, bits, expert_map))
     method = _method(bits)
     method.process_weights_after_loading(layer)
@@ -130,7 +132,10 @@ def test_fused_apply_is_cudagraph_capturable(tokens):
     x.copy_((torch.randn(tokens, hidden, device="cuda") * 0.5).half())
     topk_ids.copy_(
         torch.stack(
-            [torch.randperm(global_experts, device="cuda")[:top_k] for _ in range(tokens)]
+            [
+                torch.randperm(global_experts, device="cuda")[:top_k]
+                for _ in range(tokens)
+            ]
         ).to(torch.int32)
     )
     graph.replay()

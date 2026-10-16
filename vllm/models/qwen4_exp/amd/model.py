@@ -725,8 +725,7 @@ class Qwen4ExpForCausalLM(
         # ship it dense.
         head_quant = (
             self.quant_config
-            if self.quant_config is not None
-            and self.quant_config.get_name() == "exl3"
+            if self.quant_config is not None and self.quant_config.get_name() == "exl3"
             else None
         )
         self.lm_head = ParallelLMHead(

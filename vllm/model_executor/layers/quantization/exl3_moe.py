@@ -13,11 +13,11 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
@@ -248,18 +248,39 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         w13 = layer.w13_trellis
         return w13[slot] if w13.shape[0] == 2 else w13[:, slot]
 
-    def _rows(self, a, suh_rows, svh_rows, trellis, sorted_ids, expert_ids, ntpp,
-              block_m, bits):
+    def _rows(
+        self,
+        a,
+        suh_rows,
+        svh_rows,
+        trellis,
+        sorted_ids,
+        expert_ids,
+        ntpp,
+        block_m,
+        bits,
+    ):
         """Per-pair EXL3 projection: H(a * suh) @ W_e, then H(.) * svh."""
+        a = (a * suh_rows).contiguous()
         xh = torch.empty_like(a)
-        _exl3_hadamard(a * suh_rows, xh, None, None, 1.0)
+        _exl3_hadamard(a, xh, None, None, 1.0)
         mid = torch.zeros(
             a.shape[0], svh_rows.shape[1], dtype=torch.float16, device=a.device
         )
         ops.moe_exl3_gemm_rdna2(
-            xh, mid, trellis, torch.empty(0, dtype=torch.float32, device=a.device),
-            sorted_ids, expert_ids,
-            ntpp, 1, block_m, False, 0, bits, self.cb,
+            xh,
+            mid,
+            trellis,
+            torch.empty(0, dtype=torch.float32, device=a.device),
+            sorted_ids,
+            expert_ids,
+            ntpp,
+            1,
+            block_m,
+            False,
+            0,
+            bits,
+            self.cb,
         )
         out = torch.empty_like(mid)
         _exl3_hadamard(mid, out, None, None, 1.0)
@@ -303,12 +324,26 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         w2_bits = int(self.w2_bits or self.w13_bits or 3)
         xp = x.repeat_interleave(top_k, dim=0)
         gate = self._rows(
-            xp, layer.w13_suh[local, 0], layer.w13_svh[local, 0], self._w13(layer, 0),
-            sorted_ids, expert_ids, ntpp, block_m, w13_bits,
+            xp,
+            layer.w13_suh[local, 0],
+            layer.w13_svh[local, 0],
+            self._w13(layer, 0),
+            sorted_ids,
+            expert_ids,
+            ntpp,
+            block_m,
+            w13_bits,
         )
         up = self._rows(
-            xp, layer.w13_suh[local, 1], layer.w13_svh[local, 1], self._w13(layer, 1),
-            sorted_ids, expert_ids, ntpp, block_m, w13_bits,
+            xp,
+            layer.w13_suh[local, 1],
+            layer.w13_svh[local, 1],
+            self._w13(layer, 1),
+            sorted_ids,
+            expert_ids,
+            ntpp,
+            block_m,
+            w13_bits,
         )
         act = str(getattr(layer, "activation", "silu")).lower()
         if "silu" in act or "swiglu" in act:
@@ -316,8 +351,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         else:
             hidden_p = F.gelu(gate) * up
         down = self._rows(
-            hidden_p, layer.w2_suh[local], layer.w2_svh[local], layer.w2_trellis,
-            sorted_ids, expert_ids, ntpp, block_m, w2_bits,
+            hidden_p,
+            layer.w2_suh[local],
+            layer.w2_svh[local],
+            layer.w2_trellis,
+            sorted_ids,
+            expert_ids,
+            ntpp,
+            block_m,
+            w2_bits,
         )
         w = topk_weights.reshape(-1).to(torch.float16) * valid.to(torch.float16)
         return (down * w[:, None]).view(m, top_k, hidden).sum(dim=1)
