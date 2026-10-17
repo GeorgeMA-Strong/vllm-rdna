@@ -699,3 +699,201 @@ def test_qsa_norm_rope_store3_matches_two_launches(default_vllm_config, n):
     assert torch.equal(b[0].view(-1, 128)[untouched], comp.view(-1, 128)[untouched])
     for x, y in zip(a[1:], b[1:]):
         assert torch.equal(x.view(torch.int16), y.view(torch.int16))
+
+
+# (waves, tile slots, lanes per key, unroll, q in LDS): the policy's shapes
+# (strided small-tile, one tile per block with whole-row loads), a wide-unroll
+# one and the LDS-q group kernel
+_MQA_SHAPES = [
+    (4, 8, 4, 1, False),
+    (8, 0, 16, 2, False),
+    (4, 0, 8, 4, False),
+    (8, 0, 8, 1, True),
+]
+
+
+@pytest.mark.parametrize("group", [1, 2, 3, 4, None])
+@pytest.mark.parametrize("shape", _MQA_SHAPES)
+@pytest.mark.parametrize("width", [1, 3])
+@pytest.mark.parametrize("rows", [1, 3, 8, 24, 130])
+def test_qsa_mqa_matches_triton(group, shape, width, rows):
+    """mono_qsa_mqa_rdna2 (HIP indexer scoring, early exit) gives the Triton
+    kernel's visible_blocks and its logits on [0, visible), for any group
+    size and kernel shape (group None: mqa_config's own choice) against any
+    batch layout: runs of `width` rows per request at consecutive positions,
+    ragged contexts, an unmapped page (-1) and a row with no request."""
+    import math
+
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
+    from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
+
+    if not mono_qsa._has_hip_mqa():
+        pytest.skip("mono_qsa_mqa_rdna2 not built")
+    g = torch.Generator(device=DEV).manual_seed(rows * 13 + width * 5 + (group or 0))
+    ratio, page, cap = 4, 64, 4096
+    reqs = (rows + width - 1) // width
+    ctx = torch.randint(1, cap * ratio, (reqs,), generator=g, device=DEV)
+    live = (ctx // ratio + page - 1) // page
+    table = torch.full((reqs, cap // page), -1, dtype=torch.int32, device=DEV)
+    used = 1
+    for r in range(reqs):
+        n = int(live[r])
+        table[r, :n] = torch.arange(used, used + n, device=DEV)
+        used += n
+    table[0, 0] = -1  # an unmapped page
+    k_cache = torch.randn(used, page, 1, 128, generator=g, device=DEV).half()
+    q = torch.randn(rows, 4, 128, generator=g, device=DEV).half()
+    t2r = (torch.arange(rows, device=DEV) // width).int()
+    if rows > 2:
+        t2r[-1] = -1  # a row with no request
+    off = width - 1 - (torch.arange(rows, device=DEV) % width)
+    pos = (ctx[t2r.clamp(min=0).long()] - 1 - off).clamp(min=0)
+    seq = ctx.int()
+
+    old = qsa_ops.MONO_QSA
+    try:
+        qsa_ops.MONO_QSA = SimpleNamespace(mqa_paged=lambda *a: False)
+        ref_l, ref_v = qsa_ops.qsa_mqa_paged(
+            q, k_cache, table, t2r, pos, seq, ratio, num_columns=cap
+        )
+        if group is None:
+            if shape != _MQA_SHAPES[0]:
+                pytest.skip("the policy picks its own shape")
+            mono_qsa.DECODE_WIDTH = width
+        else:
+            waves, tiles, lanes, unroll, q_lds = shape
+            if q_lds and group == 1:
+                pytest.skip("LDS q is built for groups of 2-4")
+            mono_qsa.FORCE = (group, waves, tiles, max(lanes, group), unroll, q_lds)
+        qsa_ops.MONO_QSA = mono_qsa
+        got_l, got_v = qsa_ops.qsa_mqa_paged(
+            q, k_cache, table, t2r, pos, seq, ratio, num_columns=cap
+        )
+    finally:
+        qsa_ops.MONO_QSA = old
+        mono_qsa.FORCE = None
+        mono_qsa.DECODE_WIDTH = 1
+    torch.testing.assert_close(got_v, ref_v, rtol=0, atol=0)
+    scale = 1.0 / math.sqrt(128)
+    for r in range(rows):
+        n = int(ref_v[r])
+        torch.testing.assert_close(
+            got_l[r, :n], ref_l[r, :n], rtol=2e-3, atol=2e-3 * scale * 16
+        )
+
+
+@pytest.mark.parametrize("width", [1, 3])
+@pytest.mark.parametrize("n_req", [1, 5, 8])
+def test_qsa_epilogue_matches_today(default_vllm_config, width, n_req):
+    """mono_qsa_epilogue_rdna2 (one launch) leaves q, the compressed key
+    cache and the raw-key / RoPE-position ring as today's chain does
+    (norm_rope q, qsa_compress_groups, norm_rope k, store_rows3): q and the
+    compressed keys to rounding, the pooled input and both rings bitwise,
+    with the serve's ring (key + int64 RoPE tail in one fp16 page, size
+    ratio * cdiv(ratio + nspec, ratio)), MRoPE positions, groups whose
+    members come from the ring and from this step's rows, and PAD compressed
+    slots."""
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
+    from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
+    from vllm.models.qwen4_exp.common.qsa_cache import canonical_qsa_rope_positions
+
+    if not mono_qsa._has_hip_epilogue():
+        pytest.skip("mono_qsa_epilogue_rdna2 not built")
+    g = torch.Generator(device=DEV).manual_seed(7 * n_req + width)
+    ratio = 4
+    ring = ratio * -(-(ratio + width - 1) // ratio)
+    rope = get_rope(**FLASH_NEXT_ROPE, dtype=torch.float16).to(DEV)
+    qn = GemmaRMSNorm(128, eps=1e-6).to(device=DEV, dtype=torch.float16)
+    kn = GemmaRMSNorm(128, eps=1e-6).to(device=DEV, dtype=torch.float16)
+    with torch.no_grad():
+        qn.weight.copy_(torch.randn(128, generator=g, device=DEV) * 0.1)
+        kn.weight.copy_(torch.randn(128, generator=g, device=DEV) * 0.1)
+
+    n = n_req * width
+    ctx = torch.randint(ratio + width, 5000, (n_req,), generator=g, device=DEV)
+    ctx[0] = ratio * 37  # request 0's last row closes a group
+    t2r = (torch.arange(n, device=DEV) // width).int()
+    off = width - 1 - (torch.arange(n, device=DEV) % width)
+    end = (ctx[t2r.long()] - 1 - off).long()
+    qsl = torch.arange(0, n + 1, width, device=DEV).int()
+    blocks = 2 * n_req + 1
+    state_table = torch.randperm(blocks, generator=g, device=DEV)[:n_req]
+    state_table = state_table.int().view(-1, 1)
+    r_slots = state_table[t2r.long(), 0].long() * ring + end % ring
+    pages, page = 64, 64
+    c_slots = torch.randperm(pages * page, generator=g, device=DEV)[:n].long()
+    c_slots[(end + 1) % ratio != 0] = -1  # tokens that close no group
+    # [3, n] MRoPE positions: t = logical position, h / w offset
+    pos = torch.stack((end, end + 3, end + 7))
+
+    kv = torch.randn(blocks, ring, 1, 140, generator=g, device=DEV).half()
+    rope_ring = kv[..., 128:].view(torch.int64)
+    rope_ring.copy_(torch.randint(0, 100000, rope_ring.shape, generator=g, device=DEV))
+    comp = torch.randn(pages, page, 1, 128, generator=g, device=DEV).half()
+    qk = torch.randn(n, 640, generator=g, device=DEV).half()
+    raw_md = SimpleNamespace(
+        block_table=state_table,
+        token_to_req=t2r,
+        query_start_loc=qsl,
+        logical_positions=end,
+        slot_mapping=r_slots,
+        max_query_len=width,
+    )
+    comp_md = SimpleNamespace(slot_mapping=c_slots)
+
+    # today's chain
+    kv_a, comp_a = kv.clone(), comp.clone()
+    q_a = mono_qsa.norm_rope(qn, rope, pos, qk[:, :512].view(n, 4, 128))
+    token_k = qk[:, 512:].reshape(n, 1, 128)
+    rows = canonical_qsa_rope_positions(pos)
+    pooled, first = qsa_ops.qsa_compress_groups_with_ratio(
+        token_k,
+        rows,
+        kv_a[..., :128],
+        state_table,
+        t2r,
+        qsl,
+        end,
+        c_slots,
+        ratio,
+        kv_a[..., 128:].view(torch.int64),
+    )
+    normed = mono_qsa.norm_rope(kn, rope, first.transpose(0, 1), pooled)
+    old = mono_qsa._has_hip_store3
+    try:
+        mono_qsa._has_hip_store3 = lambda: False
+        assert mono_qsa.store_rows3(
+            comp_a,
+            c_slots,
+            normed,
+            kv_a[..., :128],
+            r_slots,
+            token_k,
+            kv_a[..., 128:].view(torch.int64),
+            rows,
+        )
+    finally:
+        mono_qsa._has_hip_store3 = old
+
+    # one launch
+    kv_b, comp_b = kv.clone(), comp.clone()
+    q_b = mono_qsa.epilogue(
+        qn,
+        kn,
+        rope,
+        qk,
+        pos,
+        raw_md,
+        comp_md,
+        ratio,
+        comp_b,
+        kv_b[..., :128],
+        kv_b[..., 128:].view(torch.int64),
+    )
+    assert q_b is not None
+    torch.testing.assert_close(q_b, q_a, rtol=0, atol=4e-3)
+    torch.testing.assert_close(comp_b, comp_a, rtol=0, atol=4e-3)
+    assert torch.equal(kv_b.view(torch.int16), kv_a.view(torch.int16))
+    assert (c_slots >= 0).any()
