@@ -295,6 +295,24 @@ class QSAIndexer(nn.Module):
             self.compress_ratio,
             rope_position_cache,
         )
+        if (
+            self._mono_qsa is not None
+            and rope_position_cache is not None
+            and self._mono_qsa.norm_rope_store3(
+                self.k_layernorm,
+                self.rotary_emb,
+                first_positions,
+                pooled,
+                self.compressed_key_cache.kv_cache,
+                compressed_metadata.slot_mapping,
+                raw_key_cache,
+                raw_metadata.slot_mapping,
+                token_k[:num_tokens],
+                rope_position_cache,
+                position_rows,
+            )
+        ):
+            return
         normalized = self.normalize_compressed_keys(pooled, first_positions)
         if (
             self._mono_qsa is not None

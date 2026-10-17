@@ -402,3 +402,311 @@ void mono_qsa_decode_rdna2(const torch::Tensor& q, const torch::Tensor& k_cache,
   // clang-format on
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// ---------------------------------------------------------------------------
+// mono_qsa_store3_rdna2: the QSA indexer's three per-token cache stores
+// (compressed keys at the compressed slots, raw keys and the int64 RoPE
+// positions at the raw slots) in one launch. HIP replacement for the Triton
+// _store_rows3_kernel in mono/rdna2/qsa.py; same masking (a slot is stored
+// only when 0 <= slot < num_blocks * page, so PAD = -1 is skipped).
+// Row mapping follows qsa_store_cache_rows_kernel (Waldecir Santos): every
+// lane moves one 16-byte vector of a dense row, instead of one row per block.
+// One lane group per token: the low half stores the compressed row (+ the
+// RoPE row), the high half the raw row. Decode widths (<= 64 tokens) use
+// 64-lane groups (more lanes per token, ~3.1 us at 1-24 tokens); wider
+// batches use 32-lane groups (16 lanes per 16-vector row, 8 tokens per
+// block).
+// ---------------------------------------------------------------------------
+namespace qsa_store3 {
+
+constexpr int kThreads = 256;
+
+struct Store {
+  char* cache;
+  const int64_t* slots;
+  const char* rows;
+  int64_t s_block, s_token, s_dim;  // cache strides, bytes
+  int64_t r_row, r_dim;             // row strides, bytes
+  int64_t limit;                    // num_blocks * page
+  int page, width, esz;
+  bool dense;  // both last dims contiguous and width*esz a multiple of 16
+};
+
+__device__ __forceinline__ void store_row(const Store& s, int64_t row,
+                                          int lane, int lanes) {
+  const int64_t slot = s.slots[row];
+  if (slot < 0 || slot >= s.limit) return;
+  char* dst = s.cache + (slot / s.page) * s.s_block + (slot % s.page) * s.s_token;
+  const char* src = s.rows + row * s.r_row;
+  if (s.dense) {
+    const int vecs = s.width * s.esz / 16;
+    for (int v = lane; v < vecs; v += lanes)
+      *reinterpret_cast<uint4*>(dst + (int64_t)v * 16) =
+          *reinterpret_cast<const uint4*>(src + (int64_t)v * 16);
+    return;
+  }
+  for (int i = lane; i < s.width; i += lanes) {
+    const char* e = src + (int64_t)i * s.r_dim;
+    char* o = dst + (int64_t)i * s.s_dim;
+    if (s.esz == 8)
+      *reinterpret_cast<int64_t*>(o) = *reinterpret_cast<const int64_t*>(e);
+    else if (s.esz == 4)
+      *reinterpret_cast<int32_t*>(o) = *reinterpret_cast<const int32_t*>(e);
+    else
+      *reinterpret_cast<int16_t*>(o) = *reinterpret_cast<const int16_t*>(e);
+  }
+}
+
+template <int GROUP>
+__global__ void __launch_bounds__(kThreads)
+    store3_k(Store c, Store r, Store p, int64_t num_rows) {
+  constexpr int kHalf = GROUP / 2;
+  const int64_t row =
+      (int64_t)blockIdx.x * (kThreads / GROUP) + threadIdx.x / GROUP;
+  if (row >= num_rows) return;
+  const int lane = threadIdx.x % GROUP;
+  if (lane < kHalf) {
+    store_row(c, row, lane, kHalf);
+    store_row(p, row, lane, kHalf);
+  } else {
+    store_row(r, row, lane - kHalf, kHalf);
+  }
+}
+
+Store make(const torch::Tensor& cache, const torch::Tensor& slots,
+           const torch::Tensor& rows, const char* what) {
+  TORCH_CHECK(cache.dim() == 4 && cache.size(2) == 1,
+              "mono_qsa_store3_rdna2: ", what, " cache must be [blocks, page, 1, W]");
+  TORCH_CHECK(rows.dim() == 2 && rows.size(1) == cache.size(3),
+              "mono_qsa_store3_rdna2: ", what, " rows must be [n, W]");
+  TORCH_CHECK(slots.scalar_type() == torch::kInt64 && slots.dim() == 1 &&
+                  slots.size(0) == rows.size(0),
+              "mono_qsa_store3_rdna2: ", what, " slots must be int64 [n]");
+  TORCH_CHECK(rows.scalar_type() == cache.scalar_type(),
+              "mono_qsa_store3_rdna2: ", what, " dtype mismatch");
+  Store s;
+  s.esz = (int)cache.element_size();
+  TORCH_CHECK(s.esz == 2 || s.esz == 4 || s.esz == 8,
+              "mono_qsa_store3_rdna2: unsupported element size");
+  s.cache = reinterpret_cast<char*>(cache.data_ptr());
+  s.slots = slots.data_ptr<int64_t>();
+  s.rows = reinterpret_cast<const char*>(rows.data_ptr());
+  s.s_block = cache.stride(0) * s.esz;
+  s.s_token = cache.stride(1) * s.esz;
+  s.s_dim = cache.stride(3) * s.esz;
+  s.r_row = rows.stride(0) * s.esz;
+  s.r_dim = rows.stride(1) * s.esz;
+  s.page = (int)cache.size(1);
+  s.width = (int)cache.size(3);
+  s.limit = cache.size(0) * cache.size(1);
+  const auto aligned = [](const void* ptr, int64_t stride) {
+    return (reinterpret_cast<uintptr_t>(ptr) % 16 == 0) && (stride % 16 == 0);
+  };
+  s.dense = s.s_dim == s.esz && s.r_dim == s.esz &&
+            (s.width * s.esz) % 16 == 0 && aligned(s.rows, s.r_row) &&
+            aligned(s.cache, s.s_token) && s.s_block % 16 == 0;
+  return s;
+}
+
+}  // namespace qsa_store3
+
+void mono_qsa_store3_rdna2(torch::Tensor& c_cache, const torch::Tensor& c_slots,
+                           const torch::Tensor& c_rows, torch::Tensor& r_cache,
+                           const torch::Tensor& r_slots,
+                           const torch::Tensor& r_rows, torch::Tensor& p_cache,
+                           const torch::Tensor& p_rows) {
+  const int64_t n = c_rows.size(0);
+  TORCH_CHECK(r_rows.size(0) == n && p_rows.size(0) == n,
+              "mono_qsa_store3_rdna2: the three stores need the same row count");
+  if (n == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(c_cache));
+  const auto c = qsa_store3::make(c_cache, c_slots, c_rows, "compressed");
+  const auto r = qsa_store3::make(r_cache, r_slots, r_rows, "raw");
+  const auto p = qsa_store3::make(p_cache, r_slots, p_rows, "rope");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto launch = [&](auto kernel, int group) {
+    const int per_block = qsa_store3::kThreads / group;
+    const dim3 grid((unsigned)((n + per_block - 1) / per_block));
+    hipLaunchKernelGGL(kernel, grid, dim3(qsa_store3::kThreads), 0, stream, c,
+                       r, p, n);
+  };
+  if (n <= 64)
+    launch(qsa_store3::store3_k<64>, 64);
+  else
+    launch(qsa_store3::store3_k<32>, 32);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---------------------------------------------------------------------------
+// mono_qsa_k_store_rdna2: the QSA indexer's compressed-key epilogue fused with
+// its three cache stores. GemmaRMSNorm (weight + norm_beta) + NeoX RoPE or
+// interleaved 3-section MRoPE on the pooled compressed keys (same math as the
+// key side of fused_qk_rmsnorm_rope_gate: the normed value is rounded to the
+// input dtype before the rotation), written straight into the compressed key
+// cache, plus the raw-key and RoPE-position rows at the raw slots. Replaces
+// norm_rope + store_rows3 (two launches and an intermediate tensor) on decode.
+// Tokens that close no compressed group (slot PAD = -1) skip the norm/RoPE.
+// One 64-lane group per token: lanes 0-31 (one wave32) do the compressed key,
+// lanes 32-63 the raw row and the RoPE row. head_dim 128, one head, fp16.
+// ---------------------------------------------------------------------------
+namespace qsa_kstore {
+
+constexpr int kThreads = 256;
+constexpr int kGroup = 64;
+constexpr int kHD = 128;
+
+struct Args {
+  // compressed-key epilogue
+  const half* pooled;  // [n, 128]
+  int64_t pooled_row;
+  const half* weight;  // [128]
+  const half* cos_sin; // [max_pos, rotary_dim]
+  int64_t cache_row;
+  const char* pos;     // [n] or [3, n]
+  int64_t pos_m, pos_t;
+  int pos_esz;
+  int has_mrope, sec_h, sec_w;
+  int rotary_dim;
+  float eps, beta;
+  qsa_store3::Store c;  // destination: compressed key cache (rows unused)
+  qsa_store3::Store r;  // raw keys
+  qsa_store3::Store p;  // RoPE positions
+  int64_t n;
+};
+
+__device__ __forceinline__ int64_t load_pos(const Args& a, int m, int64_t t) {
+  const char* ptr = a.pos + m * a.pos_m + t * a.pos_t;
+  return a.pos_esz == 8 ? *reinterpret_cast<const int64_t*>(ptr)
+                        : (int64_t)*reinterpret_cast<const int32_t*>(ptr);
+}
+
+__global__ void __launch_bounds__(kThreads) kstore_k(Args a) {
+  __shared__ float s_x[kThreads / kGroup][kHD];
+  const int g = threadIdx.x / kGroup;
+  const int64_t row = (int64_t)blockIdx.x * (kThreads / kGroup) + g;
+  if (row >= a.n) return;
+  const int lane = threadIdx.x % kGroup;
+  if (lane >= 32) {
+    qsa_store3::store_row(a.r, row, lane - 32, 32);
+    qsa_store3::store_row(a.p, row, lane - 32, 32);
+    return;
+  }
+  const int64_t slot = a.c.slots[row];
+  if (slot < 0 || slot >= a.c.limit) return;  // whole wave: same row
+  // RMSNorm: each lane holds elements lane + 32 * j.
+  const half* x = a.pooled + row * a.pooled_row;
+  float v[4];
+  float ss = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] = __half2float(x[lane + 32 * j]);
+    ss += v[j] * v[j];
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off, 32);
+  const float inv_rms = rsqrtf(ss / kHD + a.eps);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int i = lane + 32 * j;
+    const float w = __half2float(a.weight[i]) + a.beta;
+    // round to the input dtype before the rotation, like the Triton kernel
+    s_x[g][i] = __half2float(__float2half_rn(v[j] * inv_rms * w));
+  }
+  __builtin_amdgcn_wave_barrier();
+  __builtin_amdgcn_s_waitcnt(0);
+  half* dst = reinterpret_cast<half*>(a.c.cache + (slot / a.c.page) * a.c.s_block +
+                                      (slot % a.c.page) * a.c.s_token);
+  const int half_rot = a.rotary_dim / 2;
+  const int64_t pt = load_pos(a, 0, row);
+  const int64_t ph = a.has_mrope ? load_pos(a, 1, row) : pt;
+  const int64_t pw = a.has_mrope ? load_pos(a, 2, row) : pt;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int i = lane + 32 * j;
+    float out;
+    if (i >= a.rotary_dim) {
+      out = s_x[g][i];  // pass-through tail (partial rotary)
+    } else {
+      const int r = i < half_rot ? i : i - half_rot;
+      int64_t pos = pt;
+      if (a.has_mrope) {
+        if ((r % 3 == 1) && (r < 3 * a.sec_h))
+          pos = ph;
+        else if ((r % 3 == 2) && (r < 3 * a.sec_w))
+          pos = pw;
+      }
+      const half* cs = a.cos_sin + pos * a.cache_row;
+      const float c = __half2float(cs[r]);
+      const float s = __half2float(cs[half_rot + r]);
+      const float x1 = s_x[g][r];
+      const float x2 = s_x[g][half_rot + r];
+      out = i < half_rot ? x1 * c - x2 * s : x2 * c + x1 * s;
+    }
+    dst[(int64_t)i * (a.c.s_dim / 2)] = __float2half_rn(out);
+  }
+}
+
+}  // namespace qsa_kstore
+
+void mono_qsa_k_store_rdna2(
+    const torch::Tensor& pooled, const torch::Tensor& weight,
+    const torch::Tensor& cos_sin_cache, const torch::Tensor& positions,
+    double eps, double norm_beta, int64_t rotary_dim, int64_t mrope_h,
+    int64_t mrope_w, torch::Tensor& c_cache, const torch::Tensor& c_slots,
+    torch::Tensor& r_cache, const torch::Tensor& r_slots,
+    const torch::Tensor& r_rows, torch::Tensor& p_cache,
+    const torch::Tensor& p_rows) {
+  const int64_t n = pooled.size(0);
+  TORCH_CHECK(pooled.dim() == 2 && pooled.size(1) == qsa_kstore::kHD &&
+                  pooled.scalar_type() == torch::kHalf && pooled.stride(1) == 1,
+              "mono_qsa_k_store_rdna2: pooled must be fp16 [n, 128], dense rows");
+  TORCH_CHECK(weight.numel() == qsa_kstore::kHD &&
+                  weight.scalar_type() == torch::kHalf && weight.is_contiguous(),
+              "mono_qsa_k_store_rdna2: weight must be fp16 [128]");
+  TORCH_CHECK(cos_sin_cache.scalar_type() == torch::kHalf &&
+                  cos_sin_cache.dim() == 2 && cos_sin_cache.stride(1) == 1 &&
+                  cos_sin_cache.size(1) == rotary_dim,
+              "mono_qsa_k_store_rdna2: cos_sin_cache must be fp16 [max_pos, rotary_dim]");
+  TORCH_CHECK(rotary_dim > 0 && rotary_dim <= qsa_kstore::kHD && rotary_dim % 2 == 0,
+              "mono_qsa_k_store_rdna2: rotary_dim must be even and <= 128");
+  TORCH_CHECK(c_cache.scalar_type() == torch::kHalf,
+              "mono_qsa_k_store_rdna2: compressed cache must be fp16");
+  TORCH_CHECK(r_rows.size(0) == n && p_rows.size(0) == n && c_slots.numel() == n,
+              "mono_qsa_k_store_rdna2: row counts must match");
+  const bool mrope = positions.dim() == 2;
+  TORCH_CHECK((mrope && positions.size(0) == 3 && positions.size(1) == n) ||
+                  (!mrope && positions.dim() == 1 && positions.size(0) == n),
+              "mono_qsa_k_store_rdna2: positions must be [n] or [3, n]");
+  TORCH_CHECK(positions.scalar_type() == torch::kInt64 ||
+                  positions.scalar_type() == torch::kInt32,
+              "mono_qsa_k_store_rdna2: positions must be int32/int64");
+  if (n == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(pooled));
+  qsa_kstore::Args a;
+  a.pooled = reinterpret_cast<const half*>(pooled.data_ptr());
+  a.pooled_row = pooled.stride(0);
+  a.weight = reinterpret_cast<const half*>(weight.data_ptr());
+  a.cos_sin = reinterpret_cast<const half*>(cos_sin_cache.data_ptr());
+  a.cache_row = cos_sin_cache.stride(0);
+  a.pos = reinterpret_cast<const char*>(positions.data_ptr());
+  a.pos_esz = (int)positions.element_size();
+  a.pos_m = mrope ? positions.stride(0) * a.pos_esz : 0;
+  a.pos_t = positions.stride(mrope ? 1 : 0) * a.pos_esz;
+  a.has_mrope = mrope ? 1 : 0;
+  a.sec_h = (int)mrope_h;
+  a.sec_w = (int)mrope_w;
+  a.rotary_dim = (int)rotary_dim;
+  a.eps = (float)eps;
+  a.beta = (float)norm_beta;
+  // The compressed Store only needs its slots/cache geometry; rows = pooled.
+  a.c = qsa_store3::make(c_cache, c_slots, pooled, "compressed");
+  a.r = qsa_store3::make(r_cache, r_slots, r_rows, "raw");
+  a.p = qsa_store3::make(p_cache, r_slots, p_rows, "rope");
+  a.n = n;
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int per_block = qsa_kstore::kThreads / qsa_kstore::kGroup;
+  const dim3 grid((unsigned)((n + per_block - 1) / per_block));
+  hipLaunchKernelGGL(qsa_kstore::kstore_k, grid, dim3(qsa_kstore::kThreads), 0,
+                     stream, a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}

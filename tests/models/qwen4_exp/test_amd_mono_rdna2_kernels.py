@@ -594,13 +594,22 @@ def test_qsa_norm_rope_matches_today(default_vllm_config, heads, n):
     assert (ref.float() - fused.float()).abs().max().item() < 4e-3
 
 
+@pytest.mark.parametrize("backend", ["hip", "triton"])
 @pytest.mark.parametrize("n", [1, 3, 24, 2048])
-def test_qsa_store_rows3_is_bitwise_three_stores(n):
-    """One launch leaves the three indexer caches bit-identical to three
-    qsa_store_cache_rows calls, PAD (-1) slots included, with the serve's
-    layouts (rope rows int64 in a view of an fp16 page)."""
+def test_qsa_store_rows3_is_bitwise_three_stores(n, backend, monkeypatch):
+    """One launch (HIP mono_qsa_store3_rdna2, or the Triton fallback) leaves the
+    three indexer caches bit-identical to three qsa_store_cache_rows calls, PAD
+    (-1) slots included, with the serve's layouts (rope rows int64 in a view of
+    an fp16 page)."""
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
     from vllm.models.qwen4_exp.amd.mono.rdna2.qsa import store_rows3
     from vllm.models.qwen4_exp.amd.ops.qsa import qsa_store_cache_rows
+
+    if backend == "hip":
+        if not mono_qsa._has_hip_store3():
+            pytest.skip("mono_qsa_store3_rdna2 not built")
+    else:
+        monkeypatch.setattr(mono_qsa, "_has_hip_store3", lambda: False)
 
     g = torch.Generator(device=DEV).manual_seed(3 + n)
     pages, page = 64, 64
@@ -623,4 +632,70 @@ def test_qsa_store_rows3_is_bitwise_three_stores(n):
     )
     torch.accelerator.synchronize()
     for x, y in zip(a, b):  # bitwise: int64 rows read as fp16 can be NaN patterns
+        assert torch.equal(x.view(torch.int16), y.view(torch.int16))
+
+
+@pytest.mark.parametrize("n", [1, 3, 24, 2048])
+def test_qsa_norm_rope_store3_matches_two_launches(default_vllm_config, n):
+    """mono_qsa_k_store_rdna2 (norm+rope fused with the three indexer stores)
+    leaves the caches as norm_rope + store_rows3 would: the compressed keys to
+    rounding (summation order), the raw and RoPE rows bitwise, PAD (-1)
+    compressed slots untouched, with the serve's layouts (first positions
+    [n, 3] int64, rope rows int64 in a view of an fp16 page)."""
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.models.qwen4_exp.amd.mono.rdna2 import qsa as mono_qsa
+
+    if not mono_qsa._has_hip_k_store():
+        pytest.skip("mono_qsa_k_store_rdna2 not built")
+    g = torch.Generator(device=DEV).manual_seed(11 + n)
+    rope = get_rope(**FLASH_NEXT_ROPE, dtype=torch.float16).to(DEV)
+    norm = GemmaRMSNorm(128, eps=1e-6).to(device=DEV, dtype=torch.float16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(128, generator=g, device=DEV) * 0.1)
+    pages, page = 64, 64
+    comp = torch.randn(pages, page, 1, 128, generator=g, device=DEV).half()
+    raw = torch.randn(pages, page, 1, 128, generator=g, device=DEV).half()
+    rope_store = torch.zeros(pages, page, 1, 12, device=DEV, dtype=torch.float16)
+    c_slots = torch.randperm(pages * page, generator=g, device=DEV)[:n].long()
+    c_slots[::3] = -1  # most tokens close no group
+    r_slots = torch.randperm(pages * page, generator=g, device=DEV)[:n].long()
+    pooled = torch.randn(n, 1, 128, generator=g, device=DEV).half()
+    first = torch.randint(0, 20000, (n, 3), generator=g, device=DEV)
+    rrow = torch.randn(n, 1, 128, generator=g, device=DEV).half()
+    prow = torch.randint(0, 1 << 40, (3, n), generator=g, device=DEV).t().unsqueeze(1)
+
+    a = [t.clone() for t in (comp, raw, rope_store)]
+    normalized = mono_qsa.norm_rope(norm, rope, first.transpose(0, 1), pooled)
+    assert normalized is not None
+    assert mono_qsa.store_rows3(
+        a[0],
+        c_slots,
+        normalized,
+        a[1],
+        r_slots,
+        rrow,
+        a[2].view(torch.int64)[..., :3],
+        prow,
+    )
+    b = [t.clone() for t in (comp, raw, rope_store)]
+    assert mono_qsa.norm_rope_store3(
+        norm,
+        rope,
+        first,
+        pooled,
+        b[0],
+        c_slots,
+        b[1],
+        r_slots,
+        rrow,
+        b[2].view(torch.int64)[..., :3],
+        prow,
+    )
+    torch.accelerator.synchronize()
+    assert (a[0].float() - b[0].float()).abs().max().item() < 4e-3
+    untouched = torch.ones(pages * page, dtype=torch.bool, device=DEV)
+    untouched[c_slots[c_slots >= 0]] = False
+    assert torch.equal(b[0].view(-1, 128)[untouched], comp.view(-1, 128)[untouched])
+    for x, y in zip(a[1:], b[1:]):
         assert torch.equal(x.view(torch.int16), y.view(torch.int16))

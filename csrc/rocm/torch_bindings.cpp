@@ -145,6 +145,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("mono_qsa_decode_rdna2", torch::kCUDA, &mono_qsa_decode_rdna2);
   rocm_ops.def("mono_qsa_decode_rdna2_splits(int M, int KVH, int W) -> int");
   rocm_ops.impl("mono_qsa_decode_rdna2_splits", &mono_qsa_decode_rdna2_splits);
+  rocm_ops.def(
+      "mono_qsa_store3_rdna2(Tensor! c_cache, Tensor c_slots, Tensor c_rows, "
+      "Tensor! r_cache, Tensor r_slots, Tensor r_rows, Tensor! p_cache, "
+      "Tensor p_rows) -> ()");
+  rocm_ops.impl("mono_qsa_store3_rdna2", torch::kCUDA, &mono_qsa_store3_rdna2);
+  rocm_ops.def(
+      "mono_qsa_k_store_rdna2(Tensor pooled, Tensor weight, Tensor cos_sin_cache, "
+      "Tensor positions, float eps, float norm_beta, int rotary_dim, int mrope_h, "
+      "int mrope_w, Tensor! c_cache, Tensor c_slots, Tensor! r_cache, "
+      "Tensor r_slots, Tensor r_rows, Tensor! p_cache, Tensor p_rows) -> ()");
+  rocm_ops.impl("mono_qsa_k_store_rdna2", torch::kCUDA, &mono_qsa_k_store_rdna2);
   #endif
   rocm_ops.def(
       "rdna_se_gate_up_silu(Tensor x, Tensor w, Tensor? scale) -> Tensor");

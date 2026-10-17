@@ -21,8 +21,6 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ...ops import qsa_rdna2
-
 logger = init_logger(__name__)
 
 MIN_ROWS = 3  # HIP (plain-load merge) wins from 3 rows at long context
@@ -146,6 +144,82 @@ def norm_rope(
     return out.view(num_tokens, num_heads, head_dim)
 
 
+def _has_hip_k_store() -> bool:
+    return hasattr(torch.ops, "_rocm_C") and hasattr(
+        torch.ops._rocm_C, "mono_qsa_k_store_rdna2"
+    )
+
+
+def norm_rope_store3(
+    norm: nn.Module,
+    rotary_emb: nn.Module,
+    first_positions: torch.Tensor,
+    pooled: torch.Tensor,
+    c_cache: torch.Tensor,
+    c_slots: torch.Tensor,
+    r_cache: torch.Tensor,
+    r_slots: torch.Tensor,
+    r_rows: torch.Tensor,
+    p_cache: torch.Tensor,
+    p_rows: torch.Tensor,
+) -> bool:
+    """The compressed-key epilogue (norm_rope) fused with the three indexer
+    stores (store_rows3) in one HIP launch; False when the layout is not one
+    the kernel covers (the caller then runs norm_rope + store_rows3)."""
+    if not _has_hip_k_store():
+        return False
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
+    if mrope_section:
+        if not (
+            len(mrope_section) == 3 and getattr(rotary_emb, "mrope_interleaved", False)
+        ):
+            return False
+        positions = first_positions.transpose(0, 1)
+        sec_h, sec_w = int(mrope_section[1]), int(mrope_section[2])
+    else:
+        positions = first_positions[:, 0]
+        sec_h = sec_w = 0
+    if not getattr(rotary_emb, "is_neox_style", False):
+        return False
+    pooled = pooled.reshape(-1, pooled.shape[-1])
+    r_rows = r_rows[:, 0] if r_rows.ndim == 3 else r_rows
+    p_rows = p_rows[:, 0] if p_rows.ndim == 3 else p_rows
+    weight = norm.weight
+    cache = rotary_emb._match_cos_sin_cache_dtype(pooled)  # noqa: SLF001
+    if (
+        pooled.dtype != torch.float16
+        or pooled.shape[1] != 128
+        or pooled.stride(1) != 1
+        or weight.dtype != torch.float16
+        or cache.dtype != torch.float16
+        or c_cache.ndim != 4
+        or c_cache.shape[2] != 1
+        or c_cache.shape[3] != 128
+        or cache.shape[1] != rotary_emb.rotary_dim
+    ):
+        return False
+    torch.ops._rocm_C.mono_qsa_k_store_rdna2(
+        pooled,
+        weight,
+        cache,
+        positions,
+        float(norm.variance_epsilon),
+        1.0,  # GemmaRMSNorm scales by (1 + w)
+        int(rotary_emb.rotary_dim),
+        sec_h,
+        sec_w,
+        c_cache,
+        c_slots,
+        r_cache,
+        r_slots,
+        r_rows,
+        p_cache,
+        p_rows,
+    )
+    _log_once("norm+rope+store (HIP)", pooled.shape[0], True)
+    return True
+
+
 @triton.jit
 def _store_rows3_kernel(
     c_cache_ptr,
@@ -230,6 +304,12 @@ def _store_rows3_kernel(
     )
 
 
+def _has_hip_store3() -> bool:
+    return hasattr(torch.ops, "_rocm_C") and hasattr(
+        torch.ops._rocm_C, "mono_qsa_store3_rdna2"
+    )
+
+
 def store_rows3(
     c_cache: torch.Tensor,
     c_slots: torch.Tensor,
@@ -241,8 +321,12 @@ def store_rows3(
     p_rows: torch.Tensor,
 ) -> bool:
     """One launch for the three indexer stores; False when the shapes are not
-    the one-head, same-row-count case (the caller then stores one by one)."""
-    if qsa_rdna2.qsa_use_rdna2() or not HAS_TRITON:
+    the one-head, same-row-count case (the caller then stores one by one).
+
+    HIP (``_rocm_C::mono_qsa_store3_rdna2``) when built, else the Triton
+    kernel below."""
+    hip = _has_hip_store3()
+    if not hip and not HAS_TRITON:
         return False
     rows = []
     for cache, slots, r in (
@@ -265,6 +349,12 @@ def store_rows3(
     if n == 0:
         return True
     cr, rr, pr = rows
+    if hip:
+        torch.ops._rocm_C.mono_qsa_store3_rdna2(
+            c_cache, c_slots, cr, r_cache, r_slots, rr, p_cache, pr
+        )
+        _log_once("indexer store (HIP)", n, True)
+        return True
     _store_rows3_kernel[(n,)](
         c_cache,
         c_slots,
