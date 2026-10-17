@@ -149,7 +149,8 @@ TUNED_CONFIG=${TUNED_CONFIG:-0}
 # (~95 GB host RAM); int4 = INT4 table from PLE_QUANT_DIR in pinned RAM (~30 GB);
 # int4-disk = same INT4 table memory-mapped from disk, served by the CPU sidecar
 # (page cache only). PLE_QUANT_DIR is a ples_int4 directory from
-# primitive-ai/Qwen3.8-Flash-Next-PLE-quant.
+# primitive-ai/Qwen3.8-Flash-Next-PLE-quant. exl3 = the exllamav3 table shipped
+# with an EXL3 checkpoint (ngram_embedding.safetensors), served by the sidecar.
 PLE_QUANT_DIR=${PLE_QUANT_DIR:-${VLLM_PLE_QUANT_DIR:-}}
 if [[ -z ${PLE:-} ]]; then
     # Default follows the raw env vars when set the old way.
@@ -201,7 +202,15 @@ case $PLE in
             unset VLLM_PLE_CPU_OFFLOAD
         fi
         ;;
-    *) rdna_die "PLE must be bf16, int4 or int4-disk (got '$PLE')." ;;
+    exl3)
+        # exllamav3 checkpoints ship the table as ngram_embedding.safetensors;
+        # the CPU sidecar mmaps and decodes it (no PLE_QUANT_DIR).
+        unset VLLM_PLE_QUANT_DIR
+        PLE_QUANT_DIR=
+        export VLLM_PLE_CPU_OFFLOAD=1
+        export VLLM_PLE_OFFLOAD_READY_TIMEOUT=${VLLM_PLE_OFFLOAD_READY_TIMEOUT:-3600}
+        ;;
+    *) rdna_die "PLE must be bf16, int4, int4-disk or exl3 (got '$PLE')." ;;
 esac
 
 if [[ $TUNED_CONFIG == 1 ]]; then

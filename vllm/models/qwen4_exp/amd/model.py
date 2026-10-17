@@ -142,6 +142,9 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_v_scale",
     "_weight_scale",
     "_input_scale",
+    # EXL3 codebook markers (empty tensors); the codebook comes from the config.
+    ".mul1",
+    ".mcg",
 ]
 
 # The checkpoint keeps down and injection projections separate; runtime packs
@@ -718,9 +721,17 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # EXL3 checkpoints quantize the head (trellis/suh/svh); other formats
+        # ship it dense.
+        head_quant = (
+            self.quant_config
+            if self.quant_config is not None and self.quant_config.get_name() == "exl3"
+            else None
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=head_quant,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
