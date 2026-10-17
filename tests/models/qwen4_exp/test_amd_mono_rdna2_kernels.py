@@ -897,3 +897,42 @@ def test_qsa_epilogue_matches_today(default_vllm_config, width, n_req):
     torch.testing.assert_close(comp_b, comp_a, rtol=0, atol=4e-3)
     assert torch.equal(kv_b.view(torch.int16), kv_a.view(torch.int16))
     assert (c_slots >= 0).any()
+
+
+@pytest.mark.parametrize("n", [1, 3, 24, 2048])
+@pytest.mark.parametrize("kind", ["key", "rope"])
+def test_qsa_hip_store_cache_rows_matches_triton(n, kind):
+    """The HIP QSA path's store (qsa_store_cache_rows_rdna2, VLLM_RDNA_QSA_HIP=1)
+    writes the same cache bytes as the Triton store: dense fp16 key rows, and
+    the serve's transposed int64 RoPE rows into a padded fp16 page view, with
+    PAD (-1) slots skipped."""
+    from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
+    from vllm.models.qwen4_exp.amd.ops import qsa_rdna2
+    from vllm.models.qwen4_exp.common.qsa_cache import canonical_qsa_rope_positions
+
+    if not hasattr(torch.ops._rocm_C, "qsa_store_cache_rows_rdna2"):
+        pytest.skip("qsa_store_cache_rows_rdna2 not built")
+    g = torch.Generator(device=DEV).manual_seed(n * 2 + (kind == "rope"))
+    pages, page = 64, 64
+    slots = torch.randperm(pages * page, generator=g, device=DEV)[:n].long()
+    slots[::5] = -1
+    if kind == "key":
+        store = torch.randn(pages, page, 1, 140, generator=g, device=DEV).half()
+        rows = torch.randn(n, 1, 128, generator=g, device=DEV).half()
+
+        def view(t):
+            return t[..., :128]
+    else:
+        store = torch.randn(pages, page, 1, 140, generator=g, device=DEV).half()
+        pos = torch.randint(0, 1 << 40, (3, n), generator=g, device=DEV)
+        rows = canonical_qsa_rope_positions(pos)  # [n, 1, 3], stride(-1) = n
+
+        def view(t):
+            return t[..., 128:].view(torch.int64)
+
+    if qsa_rdna2.qsa_use_rdna2():
+        pytest.skip("run with VLLM_RDNA_QSA_HIP unset (Triton reference)")
+    a, b = store.clone(), store.clone()
+    qsa_ops.qsa_store_cache_rows(view(a), slots, rows)
+    qsa_rdna2.qsa_store_cache_rows_compat(view(b), slots, rows)
+    assert torch.equal(a.view(torch.int16), b.view(torch.int16))
