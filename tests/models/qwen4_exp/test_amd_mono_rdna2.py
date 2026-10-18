@@ -212,6 +212,33 @@ def test_moe_not_symmetric_w4a16_rdna2_is_refused(
 # ---- parameters -----------------------------------------------------------
 
 
+def test_attention_only_parts_never_access_moe(monkeypatch, deployment):
+    """GDN/QSA-only mode must leave an unsupported INC FFN untouched."""
+    cfg = _config(knobs={"k1": False, "k2": False, "timing": False})
+    opts = md.options(cfg)
+    OPTS.assign(opts)
+
+    def unexpected_moe_access(*args, **kwargs):
+        pytest.fail("attention-only mode accessed the MoE layout")
+
+    monkeypatch.setattr(md, "moe_refusal", unexpected_moe_access)
+    assert opts.gdn and opts.qsa
+    assert md.layer_hook(SimpleNamespace(), cfg, "model.layers.3", True) == (
+        None,
+        None,
+    )
+    assert not cfg.compilation_config.static_forward_context
+
+
+@pytest.mark.parametrize("knob", ["k1", "k2", "timing"])
+def test_attention_only_does_not_weaken_moe_refusal(deployment, knob):
+    knobs = {"k1": False, "k2": False, "timing": False, knob: True}
+    cfg = _config(knobs=knobs)
+    OPTS.assign(md.options(cfg))
+    with pytest.raises(ValueError, match="got SimpleNamespace"):
+        md.layer_hook(_Layer(SimpleNamespace()), cfg, "model.layers.3", True)
+
+
 def _state(m: nn.Module):
     return {k: v.clone() for k, v in m.state_dict().items()}
 

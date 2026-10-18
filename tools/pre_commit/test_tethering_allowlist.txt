@@ -72,6 +72,13 @@ tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platform
 tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job
 
 # RDNA fork (gfx10/gfx11) tests: upstream Buildkite has no RDNA runners.
+tests/models/qwen4_exp/test_amd_mono_rdna2.py  # fork-only MonoKernel switch and ROCm checkpoint checks; validated manually on V620
+tests/models/qwen4_exp/test_amd_mono_rdna2_kernels.py  # fork-only MonoKernel GPU checks; upstream CI has no RDNA runner
+tests/models/qwen4_exp/test_hc_prefill_rdna2.py  # fork-only HIP HC prefill checks; upstream CI has no RDNA runner
+tests/models/qwen4_exp/test_ple_pp.py  # fork-only PLE pipeline partition tests; no upstream job collects this path
+tests/models/qwen4_exp/test_ple_prefill_conv.py  # fork-only PLE convolution regression; no upstream job collects this path
+tests/tools/test_quant_mtp_experts.py  # fork-only MTP checkpoint tool; no upstream job collects this path
+tests/v1/ple_offload/test_exl3_ngram_ring.py  # fork-only EXL3 PLE sidecar; no upstream job collects this path
 tests/distributed/test_rdna_ar.py  # fork-only RDNA all-reduce, CPU unit test; not in CI
 tests/distributed/test_rdna_ar_gpu.py  # requires RDNA (gfx10/11) GPU, not in CI
 tests/distributed/test_rdna_p2p.py  # fork-only RDNA P2P topology, CPU unit test; not in CI
